@@ -81,9 +81,85 @@ describe('IntuneUploader.createWin32App (accessed via private-method cast)', () 
     const rules = (body as { rules: unknown[] }).rules;
     expect(Array.isArray(rules)).toBe(true);
     expect(rules.length).toBeGreaterThan(0);
-    expect(rules[0]).toMatchObject({
-      '@odata.type': '#microsoft.graph.win32LobAppRegistryDetectionRule',
+    // The unified `rules` collection takes win32LobAppRule types with an
+    // explicit ruleType and operationType/comparisonValue - not the
+    // win32LobApp*DetectionRule names or detectionType/detectionValue fields
+    // of the deprecated `detectionRules` property. Same shape as
+    // convertToGraphDetectionRule() in lib/intune-api.ts.
+    expect(rules[0]).toEqual({
+      '@odata.type': '#microsoft.graph.win32LobAppRegistryRule',
+      ruleType: 'detection',
       keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Mozilla_Firefox',
+      valueName: 'Version',
+      check32BitOn64System: false,
+      operationType: 'version',
+      operator: 'greaterThanOrEqual',
+      comparisonValue: '152.0.5',
+    });
+  });
+
+  it('maps notExists to the doesNotExist operation type Graph expects', async () => {
+    const postMock = vi.fn().mockResolvedValue({ id: 'app-3' });
+    const graphClientStub = { post: postMock };
+
+    const uploader = new IntuneUploader(makeConfig());
+    const uploaderInternal = uploader as unknown as {
+      fetchLargeIcon: (job: PackagingJob) => Promise<unknown>;
+      createWin32App: (
+        graphClient: typeof graphClientStub,
+        job: PackagingJob
+      ) => Promise<{ id: string }>;
+    };
+    vi.spyOn(uploaderInternal, 'fetchLargeIcon').mockResolvedValue(null);
+
+    const job = makeJob({
+      detection_rules: [
+        {
+          type: 'file',
+          path: 'C:\\Program Files\\Mozilla Firefox',
+          fileOrFolderName: 'firefox.exe',
+          detectionType: 'notExists',
+        },
+      ],
+    });
+    await uploaderInternal.createWin32App(graphClientStub, job);
+
+    const [, body] = postMock.mock.calls[0];
+    expect((body as { rules: unknown[] }).rules[0]).toMatchObject({
+      '@odata.type': '#microsoft.graph.win32LobAppFileSystemRule',
+      ruleType: 'detection',
+      operationType: 'doesNotExist',
+      operator: 'notConfigured',
+    });
+  });
+
+  it('base64-encodes script detection rules and marks them notConfigured', async () => {
+    const postMock = vi.fn().mockResolvedValue({ id: 'app-4' });
+    const graphClientStub = { post: postMock };
+
+    const uploader = new IntuneUploader(makeConfig());
+    const uploaderInternal = uploader as unknown as {
+      fetchLargeIcon: (job: PackagingJob) => Promise<unknown>;
+      createWin32App: (
+        graphClient: typeof graphClientStub,
+        job: PackagingJob
+      ) => Promise<{ id: string }>;
+    };
+    vi.spyOn(uploaderInternal, 'fetchLargeIcon').mockResolvedValue(null);
+
+    const job = makeJob({
+      detection_rules: [{ type: 'script', scriptContent: 'Write-Output "ok"' }],
+    });
+    await uploaderInternal.createWin32App(graphClientStub, job);
+
+    const [, body] = postMock.mock.calls[0];
+    expect((body as { rules: unknown[] }).rules[0]).toEqual({
+      '@odata.type': '#microsoft.graph.win32LobAppPowerShellScriptRule',
+      ruleType: 'detection',
+      scriptContent: Buffer.from('Write-Output "ok"').toString('base64'),
+      enforceSignatureCheck: false,
+      runAs32Bit: false,
+      operationType: 'notConfigured',
     });
   });
 
@@ -107,8 +183,15 @@ describe('IntuneUploader.createWin32App (accessed via private-method cast)', () 
     const [, body] = postMock.mock.calls[0];
     const rules = (body as { rules: unknown[] }).rules;
     expect(rules.length).toBeGreaterThan(0);
-    expect(rules[0]).toMatchObject({
-      '@odata.type': '#microsoft.graph.win32LobAppFileSystemDetectionRule',
+    expect(rules[0]).toEqual({
+      '@odata.type': '#microsoft.graph.win32LobAppFileSystemRule',
+      ruleType: 'detection',
+      path: '%ProgramFiles%',
+      fileOrFolderName: 'Firefox',
+      check32BitOn64System: false,
+      operationType: 'exists',
+      operator: 'notConfigured',
+      comparisonValue: null,
     });
   });
 });
