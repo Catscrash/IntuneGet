@@ -276,10 +276,10 @@ export class IntuneUploader {
     await this.commitContentVersion(graphClient, app.id, contentVersion.id);
     this.logger.info('Content version committed');
 
-    // Step 9: Add detection rules (98%)
-    await onProgress?.(98, 'Adding detection rules...');
-    await this.addDetectionRules(graphClient, app.id, job);
-    this.logger.info('Detection rules added');
+    // Step 9: Add requirement rules, if any (98%)
+    await onProgress?.(98, 'Adding requirement rules...');
+    await this.addRequirementRules(graphClient, app.id, job);
+    this.logger.info('Requirement rules added');
 
     // Step 10: Apply assignment configuration (99%)
     await onProgress?.(99, 'Applying assignments...');
@@ -349,6 +349,11 @@ export class IntuneUploader {
       ? baseDescription
       : `${baseDescription}\n${INTUNE_APP_SOURCE_MARKER}`;
     const largeIcon = await this.fetchLargeIcon(job);
+    // Graph rejects the create call with "The Win32LobApp must have at least
+    // one detection rule specified" if `rules` is empty at creation time, so
+    // detection rules must be sent here rather than added via a later PATCH
+    // (addRequirementRules still runs afterwards, for requirement rules only).
+    const detectionRules = this.buildDetectionRules(job);
     const appBody: Record<string, unknown> = {
       '@odata.type': '#microsoft.graph.win32LobApp',
       displayName: job.display_name,
@@ -372,7 +377,7 @@ export class IntuneUploader {
         { returnCode: 1641, type: 'hardReboot' },
         { returnCode: 1618, type: 'retry' },
       ],
-      rules: [], // Will add detection/requirement rules later
+      rules: detectionRules,
     };
 
     if (largeIcon) {
@@ -671,24 +676,16 @@ export class IntuneUploader {
   }
 
   /**
-   * Add detection rules (and requirement rules if present) to the app
+   * Add requirement rules (for "Update Only" mode), if present, to the app.
+   * Detection rules are set at creation time in createWin32App() - Graph
+   * rejects an app created with an empty rules array.
    */
-  private async addDetectionRules(
+  private async addRequirementRules(
     graphClient: GraphClient,
     appId: string,
     job: PackagingJob
   ): Promise<void> {
-    const detectionRules = this.buildDetectionRules(job);
     const requirementRules = this.extractRequirementRules(job);
-
-    // Set detection rules using the detectionRules property (old format,
-    // compatible with the win32LobAppDetection type names used by buildDetectionRules)
-    if (detectionRules.length > 0) {
-      await graphClient.patch(`/deviceAppManagement/mobileApps/${appId}`, {
-        '@odata.type': '#microsoft.graph.win32LobApp',
-        detectionRules: detectionRules,
-      });
-    }
 
     // If requirement rules exist (for "Update Only" mode), read the current
     // unified rules array (which now includes the detection rules set above,
