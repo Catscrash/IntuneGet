@@ -188,6 +188,7 @@ export class IntuneUploader {
     encryptedContentPath: string,
     encryptionInfo: EncryptionInfo,
     sizes: { unencryptedSize: number; encryptedSize: number },
+    packageFileName: string,
     onProgress?: ProgressCallback
   ): Promise<IntuneAppResult> {
     const graphClient = new GraphClient(this.config, job.tenant_id);
@@ -203,7 +204,7 @@ export class IntuneUploader {
 
     // Step 1: Create Win32 LOB App (5%)
     await onProgress?.(5, 'Creating app in Intune...');
-    const app = await this.createWin32App(graphClient, job);
+    const app = await this.createWin32App(graphClient, job, packageFileName);
     this.logger.info('Created Win32 LOB App', { appId: app.id });
 
     // Step 2: Create content version (10%)
@@ -334,7 +335,8 @@ export class IntuneUploader {
    */
   private async createWin32App(
     graphClient: GraphClient,
-    job: PackagingJob
+    job: PackagingJob,
+    packageFileName: string
   ): Promise<{ id: string }> {
     const commands = this.buildCommandLines(job);
     const baseDescription = extractPackageDescription(
@@ -365,6 +367,11 @@ export class IntuneUploader {
       applicableArchitectures: this.mapArchitecture(job.architecture),
       minimumSupportedWindowsRelease: 'v10_1903',
       runAs32Bit: false,
+      // Graph rejects the create call with "FileName for Win32 LOB app cannot
+      // be empty" when this is missing. It is the name of the uploaded package
+      // file (the .intunewin we just built) and is distinct from
+      // setupFilePath, which names the entry point inside that package.
+      fileName: packageFileName,
       setupFilePath: 'Invoke-AppDeployToolkit.exe',
       installExperience: {
         runAsAccount: job.install_scope === 'user' ? 'user' : 'system',
