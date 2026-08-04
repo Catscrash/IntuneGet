@@ -36,6 +36,7 @@ type UserSettingsContextValue = {
   setOnboardingCompleted: (completed: boolean) => Promise<void>;
   setCarryOverAssignments: (enabled: boolean) => Promise<void>;
   setSupersedePreviousApp: (enabled: boolean) => Promise<void>;
+  setAllowAvailableUninstall: (enabled: boolean) => Promise<void>;
 };
 
 const UserSettingsContext = createContext<UserSettingsContextValue | null>(null);
@@ -49,6 +50,7 @@ const QUICK_START_DISMISSED_KEY = "intuneget-quick-start-dismissed";
 const ONBOARDING_COMPLETED_KEY = "intuneget-onboarding-completed";
 const CARRY_OVER_ASSIGNMENTS_KEY = "intuneget-carry-over-assignments";
 const SUPERSEDE_PREVIOUS_APP_KEY = "intuneget-supersede-previous-app";
+const ALLOW_AVAILABLE_UNINSTALL_KEY = "intuneget-allow-available-uninstall";
 
 function isThemeMode(value: unknown): value is ThemeMode {
   return value === "light" || value === "dark";
@@ -131,6 +133,7 @@ function readLegacyUserSettings(): {
   const onboardingCompletedValue = readBooleanStorageValue(ONBOARDING_COMPLETED_KEY);
   const carryOverAssignmentsValue = readBooleanStorageValue(CARRY_OVER_ASSIGNMENTS_KEY);
   const supersedePreviousAppValue = readBooleanStorageValue(SUPERSEDE_PREVIOUS_APP_KEY);
+  const allowAvailableUninstallValue = readBooleanStorageValue(ALLOW_AVAILABLE_UNINSTALL_KEY);
 
   const hasTheme = isThemeMode(themeValue);
   const hasSidebarCollapsed = sidebarValue !== null;
@@ -141,6 +144,7 @@ function readLegacyUserSettings(): {
   const hasOnboardingCompleted = onboardingCompletedValue !== null;
   const hasCarryOverAssignments = carryOverAssignmentsValue !== null;
   const hasSupersedePreviousApp = supersedePreviousAppValue !== null;
+  const hasAllowAvailableUninstall = allowAvailableUninstallValue !== null;
 
   return {
     settings: {
@@ -154,6 +158,9 @@ function readLegacyUserSettings(): {
       ...(hasOnboardingCompleted ? { onboardingCompleted: onboardingCompletedValue === true } : {}),
       ...(hasCarryOverAssignments ? { carryOverAssignments: carryOverAssignmentsValue === true } : {}),
       ...(hasSupersedePreviousApp ? { supersedePreviousApp: supersedePreviousAppValue === true } : {}),
+      ...(hasAllowAvailableUninstall
+        ? { allowAvailableUninstall: allowAvailableUninstallValue === true }
+        : {}),
     },
     hasTheme,
     hasSidebarCollapsed,
@@ -247,6 +254,10 @@ function persistLocally(update: UserSettingsUpdate) {
 
   if (update.supersedePreviousApp !== undefined) {
     writeBooleanSetting(SUPERSEDE_PREVIOUS_APP_KEY, update.supersedePreviousApp);
+  }
+
+  if (update.allowAvailableUninstall !== undefined) {
+    writeBooleanSetting(ALLOW_AVAILABLE_UNINSTALL_KEY, update.allowAvailableUninstall);
   }
 }
 
@@ -453,6 +464,13 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
     [updateSettings]
   );
 
+  const setAllowAvailableUninstall = useCallback(
+    async (allowAvailableUninstall: boolean) => {
+      await updateSettings({ allowAvailableUninstall });
+    },
+    [updateSettings]
+  );
+
   const value = useMemo<UserSettingsContextValue>(
     () => ({
       settings,
@@ -469,6 +487,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setOnboardingCompleted,
       setCarryOverAssignments,
       setSupersedePreviousApp,
+      setAllowAvailableUninstall,
     }),
     [
       hasStoredSettings,
@@ -484,6 +503,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setOnboardingCompleted,
       setCarryOverAssignments,
       setSupersedePreviousApp,
+      setAllowAvailableUninstall,
       syncError,
     ]
   );
