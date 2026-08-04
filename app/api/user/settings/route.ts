@@ -63,6 +63,10 @@ function sanitizeSettings(payload: Record<string, unknown>): UserSettingsUpdate 
     updates.supersedePreviousApp = payload.supersedePreviousApp;
   }
 
+  if (isBoolean(payload.allowAvailableUninstall)) {
+    updates.allowAvailableUninstall = payload.allowAvailableUninstall;
+  }
+
   return updates;
 }
 

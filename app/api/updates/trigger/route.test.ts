@@ -674,6 +674,24 @@ describe('POST /api/updates/trigger', () => {
       expect(job.package_config.supersedenceType).toBeUndefined();
     });
 
+    it('passes the allow-available-uninstall setting to the packager', async () => {
+      // The setting is global rather than per assignment, so it rides along in
+      // package_config and the packager stamps it onto available assignments.
+      getUserSettingsMock.mockResolvedValue({ allowAvailableUninstall: true });
+
+      await POST(triggerRequest());
+
+      expect(createJobMock.mock.calls[0][0].package_config.allowAvailableUninstall).toBe(true);
+    });
+
+    it('defaults allow-available-uninstall to false when never saved', async () => {
+      getUserSettingsMock.mockResolvedValue(null);
+
+      await POST(triggerRequest());
+
+      expect(createJobMock.mock.calls[0][0].package_config.allowAvailableUninstall).toBe(false);
+    });
+
     it('passes the carry-over setting into the deployment config builder', async () => {
       getUserSettingsMock.mockResolvedValue({ carryOverAssignments: true });
 

@@ -165,6 +165,18 @@ export async function POST(request: NextRequest) {
     // Get database adapter (SQLite or Supabase)
     const db = getDatabase();
 
+    // "Allow available uninstall" is a global operator setting rather than a
+    // per-cart choice, so it is stamped onto every item once here. The whole
+    // item becomes the job's package_config further down, so each of the job
+    // creation paths below inherits it without repeating the lookup.
+    const allowAvailableUninstall = Boolean(
+      (await db.userSettings.get(userId))?.allowAvailableUninstall
+    );
+    for (const item of items) {
+      (item as { allowAvailableUninstall?: boolean }).allowAvailableUninstall =
+        allowAvailableUninstall;
+    }
+
     // Partition items into store apps and win32 apps
     const storeItems: StoreCartItem[] = [];
     const win32Items: Win32CartItem[] = [];

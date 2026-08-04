@@ -122,6 +122,7 @@ export async function POST(request: NextRequest) {
     const userSettings = (userSettingsRow?.settings as Record<string, unknown> | null) || null;
     const globalCarryOver = Boolean(userSettings?.carryOverAssignments);
     const supersedePrevious = Boolean(userSettings?.supersedePreviousApp);
+    const allowAvailableUninstall = Boolean(userSettings?.allowAvailableUninstall);
 
     for (const req of updateRequests) {
       let restorePolicyState: {
@@ -458,6 +459,7 @@ async function triggerWithoutSupabase(
   const storedSettings = (await db.userSettings.get(user.userId)) ?? {};
   const globalCarryOver = Boolean(storedSettings.carryOverAssignments);
   const supersedePrevious = Boolean(storedSettings.supersedePreviousApp);
+  const allowAvailableUninstall = Boolean(storedSettings.allowAvailableUninstall);
 
   const response: TriggerUpdateResponse = {
     success: true,
@@ -579,6 +581,7 @@ async function triggerWithoutSupabase(
           sourceIntuneAppId,
           autoSupersede,
           supersedenceType: autoSupersede ? 'update' : undefined,
+          allowAvailableUninstall,
           // The current setting wins over whatever the original deployment
           // stored, matching how the Supabase path re-reads it per run.
           assignmentMigration: {

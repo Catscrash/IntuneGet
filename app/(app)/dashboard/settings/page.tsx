@@ -31,7 +31,7 @@ import { useCartStore } from '@/stores/cart-store';
 import { clearConsentPending, isConsentPending } from '@/components/AdminConsentBanner';
 
 type SettingsTab = 'general' | 'permissions' | 'notifications' | 'exports' | 'data';
-type PreferenceKey = 'theme' | 'cart' | 'assignments' | 'supersedence';
+type PreferenceKey = 'theme' | 'cart' | 'assignments' | 'supersedence' | 'availableUninstall';
 
 type PermissionErrorType =
   | 'missing_credentials'
@@ -78,7 +78,7 @@ export default function SettingsPage() {
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [activePreferenceSave, setActivePreferenceSave] = useState<PreferenceKey | null>(null);
   const [lastUpdatedPreference, setLastUpdatedPreference] = useState<PreferenceKey | null>(null);
-  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp } = useUserSettings();
+  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp, setAllowAvailableUninstall } = useUserSettings();
   const autoOpenOnAdd = userSettings.cartAutoOpenOnAdd;
   const setAutoOpenOnAddStore = useCartStore((state) => state.setAutoOpenOnAdd);
   const { theme, setTheme } = useTheme();
@@ -134,6 +134,19 @@ export default function SettingsPage() {
       }
     },
     [setSupersedePreviousApp]
+  );
+
+  const handleAvailableUninstallToggle = useCallback(
+    async (value: boolean) => {
+      setActivePreferenceSave('availableUninstall');
+      setLastUpdatedPreference('availableUninstall');
+      try {
+        await setAllowAvailableUninstall(value);
+      } finally {
+        setActivePreferenceSave(null);
+      }
+    },
+    [setAllowAvailableUninstall]
   );
 
   const handleCheckPermissions = async () => {
@@ -545,6 +558,34 @@ export default function SettingsPage() {
                           <span className="text-xs text-text-muted"><T>Saving...</T></span>
                         )}
                         {!isSaving && syncError && lastUpdatedPreference === 'supersedence' && (
+                          <span className="text-xs text-status-warning"><T>Saved locally</T></span>
+                        )}
+                      </div>
+                    </div>
+                  </motion.section>
+
+                  {/* Allow available uninstall card */}
+                  <motion.section
+                    variants={itemVariants}
+                    className="glass-light rounded-xl p-6 border border-overlay/5 hover:border-accent-cyan/20 transition-colors"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-text-primary font-medium"><T>Allow available uninstall</T></p>
+                        <p className="text-sm text-text-muted">
+                          <T>Let end users uninstall the app themselves from the Company Portal. Applies to assignments made available to users; required assignments stay in place either way.</T>
+                        </p>
+                      </div>
+                      <div className="flex min-w-28 flex-col items-end gap-1">
+                        <ToggleSwitch
+                          checked={userSettings.allowAvailableUninstall}
+                          onChange={(value) => void handleAvailableUninstallToggle(value)}
+                          disabled={isSaving && activePreferenceSave !== 'availableUninstall'}
+                        />
+                        {isSaving && activePreferenceSave === 'availableUninstall' && (
+                          <span className="text-xs text-text-muted"><T>Saving...</T></span>
+                        )}
+                        {!isSaving && syncError && lastUpdatedPreference === 'availableUninstall' && (
                           <span className="text-xs text-status-warning"><T>Saved locally</T></span>
                         )}
                       </div>

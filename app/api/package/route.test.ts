@@ -6,6 +6,7 @@ const {
   getDatabaseMock,
   getByUserIdMock,
   getByIdMock,
+  getUserSettingsMock,
   updateMock,
   createMock,
   parseAccessTokenMock,
@@ -17,6 +18,7 @@ const {
   getFeatureFlagsMock,
   enforceInstallerPreflightMock,
 } = vi.hoisted(() => ({
+  getUserSettingsMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getByUserIdMock: vi.fn(),
   getByIdMock: vi.fn(),
@@ -131,7 +133,9 @@ describe('GET /api/package (userId listing)', () => {
         getById: getByIdMock,
         update: updateMock,
       },
+      userSettings: { get: getUserSettingsMock },
     });
+    getUserSettingsMock.mockResolvedValue(null);
     updateMock.mockImplementation(async (id: string, data: Partial<PackagingJob>) =>
       makeJob({ id, ...data })
     );
@@ -267,7 +271,9 @@ describe('POST /api/package (workflow dispatch)', () => {
         create: createMock,
         update: updateMock,
       },
+      userSettings: { get: getUserSettingsMock },
     });
+    getUserSettingsMock.mockResolvedValue(null);
     createMock.mockImplementation(async (data: Record<string, unknown>) => ({
       ...data,
       created_at: new Date().toISOString(),
@@ -494,5 +500,45 @@ describe('POST /api/package (workflow dispatch)', () => {
     }));
     expect(createMock).not.toHaveBeenCalled();
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('stamps the allow-available-uninstall setting onto every queued item', async () => {
+    // The setting is global rather than a per-cart choice, so the job carries
+    // it and the packager applies it to available assignments.
+    getUserSettingsMock.mockResolvedValue({ allowAvailableUninstall: true });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+    await POST(request);
+
+    const job = createMock.mock.calls[0][0];
+    expect(
+      (job.package_config as Record<string, unknown>).allowAvailableUninstall
+    ).toBe(true);
+  });
+
+  it('defaults allow-available-uninstall to false when never saved', async () => {
+    getUserSettingsMock.mockResolvedValue(null);
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+    await POST(request);
+
+    const job = createMock.mock.calls[0][0];
+    expect(
+      (job.package_config as Record<string, unknown>).allowAvailableUninstall
+    ).toBe(false);
   });
 });

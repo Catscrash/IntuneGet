@@ -356,7 +356,11 @@ export class AutoUpdateTrigger {
    */
   private async getUserUpdateSettings(
     userId: string
-  ): Promise<{ carryOverAssignments: boolean; supersedePreviousApp: boolean }> {
+  ): Promise<{
+    carryOverAssignments: boolean;
+    supersedePreviousApp: boolean;
+    allowAvailableUninstall: boolean;
+  }> {
     const { data, error } = await this.supabase
       .from('user_settings')
       .select('settings')
@@ -367,13 +371,18 @@ export class AutoUpdateTrigger {
       console.warn(
         `Failed to read user_settings for ${userId}: ${error.message}`
       );
-      return { carryOverAssignments: false, supersedePreviousApp: false };
+      return {
+        carryOverAssignments: false,
+        supersedePreviousApp: false,
+        allowAvailableUninstall: false,
+      };
     }
 
     const settings = data?.settings as Record<string, unknown> | null;
     return {
       carryOverAssignments: Boolean(settings?.carryOverAssignments),
       supersedePreviousApp: Boolean(settings?.supersedePreviousApp),
+      allowAvailableUninstall: Boolean(settings?.allowAvailableUninstall),
     };
   }
 
@@ -458,8 +467,11 @@ export class AutoUpdateTrigger {
     // Always re-read the user's current global settings instead of trusting
     // the stored policy values, which may be stale if the user toggled the
     // settings after the policy was created.
-    const { carryOverAssignments: globalCarryOver, supersedePreviousApp } =
-      await this.getUserUpdateSettings(policy.user_id);
+    const {
+      carryOverAssignments: globalCarryOver,
+      supersedePreviousApp,
+      allowAvailableUninstall,
+    } = await this.getUserUpdateSettings(policy.user_id);
     const assignmentMigration = {
       carryOverAssignments: globalCarryOver,
       removeAssignmentsFromPreviousApp: globalCarryOver,
@@ -507,6 +519,7 @@ export class AutoUpdateTrigger {
         sourceIntuneAppId,
         autoSupersede,
         supersedenceType: autoSupersede ? 'update' : undefined,
+        allowAvailableUninstall,
         assignmentMigration: {
           carryOverAssignments: Boolean(assignmentMigration.carryOverAssignments),
           removeAssignmentsFromPreviousApp: Boolean(
