@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { IntuneUploader } from '../src/intune-uploader';
+import { IntuneUploader, extractAllowAvailableUninstall } from '../src/intune-uploader';
 import type { PackagingJob } from '../src/job-poller';
 import type { PackagerConfig } from '../src/config';
 
@@ -276,5 +276,56 @@ describe('IntuneUploader.createWin32App (accessed via private-method cast)', () 
       operator: 'notConfigured',
       comparisonValue: null,
     });
+  });
+});
+
+describe('extractAllowAvailableUninstall', () => {
+  it('reads the flag the web app stamped onto package_config', () => {
+    expect(extractAllowAvailableUninstall({ allowAvailableUninstall: true })).toBe(true);
+  });
+
+  it('defaults to false for absent, malformed or non-boolean input', () => {
+    expect(extractAllowAvailableUninstall({})).toBe(false);
+    expect(extractAllowAvailableUninstall(null)).toBe(false);
+    expect(extractAllowAvailableUninstall('yes')).toBe(false);
+    expect(extractAllowAvailableUninstall({ allowAvailableUninstall: 'true' })).toBe(false);
+  });
+});
+
+describe('createWin32App and allowAvailableUninstall', () => {
+  async function bodyFor(packageConfig: unknown): Promise<Record<string, unknown>> {
+    const postMock = vi.fn().mockResolvedValue({ id: 'app-1' });
+    const graphClientStub = { post: postMock };
+    const uploader = new IntuneUploader(makeConfig());
+    const internal = uploader as unknown as {
+      fetchLargeIcon: (job: PackagingJob) => Promise<unknown>;
+      createWin32App: (
+        g: typeof graphClientStub,
+        job: PackagingJob,
+        packageFileName: string
+      ) => Promise<{ id: string }>;
+    };
+    vi.spyOn(internal, 'fetchLargeIcon').mockResolvedValue(null);
+    await internal.createWin32App(
+      graphClientStub,
+      makeJob({ package_config: packageConfig as PackagingJob['package_config'] }),
+      'Invoke-AppDeployToolkit.intunewin'
+    );
+    return postMock.mock.calls[0]?.[1] as Record<string, unknown>;
+  }
+
+  it('sends the flag on the app, which is where Graph declares it', async () => {
+    // Graph rejects it on win32LobAppAssignmentSettings:
+    //   ModelValidationFailure - The property 'allowAvailableUninstall' does
+    //   not exist on type '...win32LobAppAssignmentSettings'.
+    // It belongs to win32LobApp and only takes effect for available
+    // assignments, which Intune resolves on its side.
+    const body = await bodyFor({ allowAvailableUninstall: true });
+    expect(body.allowAvailableUninstall).toBe(true);
+  });
+
+  it('defaults to false, matching Intune', async () => {
+    const body = await bodyFor({});
+    expect(body.allowAvailableUninstall).toBe(false);
   });
 });

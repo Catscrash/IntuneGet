@@ -61,6 +61,20 @@ export function extractForceCreate(packageConfig: unknown): boolean {
   return false;
 }
 
+/**
+ * Whether end users may uninstall the app themselves from the Company Portal.
+ *
+ * A global operator setting, stamped onto the job's package_config by the web
+ * app. Graph carries it on the app itself; it only takes effect for
+ * assignments made available to users, which Intune resolves on its side.
+ */
+export function extractAllowAvailableUninstall(packageConfig: unknown): boolean {
+  if (typeof packageConfig === 'object' && packageConfig !== null) {
+    return (packageConfig as Record<string, unknown>).allowAvailableUninstall === true;
+  }
+  return false;
+}
+
 interface GraphMimeContent {
   '@odata.type': '#microsoft.graph.mimeContent';
   type: string;
@@ -373,6 +387,10 @@ export class IntuneUploader {
       // Matches package-intunewin.yml, which creates the app the same way.
       minimumSupportedWindowsRelease: '1903',
       runAs32Bit: false,
+      // Graph declares this on win32LobApp, not on the assignment settings
+      // (which reject it): "uninstall is supported from the company portal
+      // for the Win32 app with an available assignment". Default is false.
+      allowAvailableUninstall: extractAllowAvailableUninstall(job.package_config),
       // Graph rejects the create call with "FileName for Win32 LOB app cannot
       // be empty" when this is missing. It is the name of the uploaded package
       // file (the .intunewin we just built) and is distinct from
