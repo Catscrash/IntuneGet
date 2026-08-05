@@ -75,6 +75,26 @@ export function extractAllowAvailableUninstall(packageConfig: unknown): boolean 
   return false;
 }
 
+/**
+ * Whether the app supersedes the version it replaces.
+ *
+ * Also decides the assignment's auto-update setting: Intune only auto-installs
+ * a superseding app over one the user installed themselves when the assignment
+ * asks for it, so superseding without that leaves Company Portal installs on
+ * the old version indefinitely.
+ */
+export function extractAutoSupersede(packageConfig: unknown): boolean {
+  if (typeof packageConfig === 'object' && packageConfig !== null) {
+    const config = packageConfig as Record<string, unknown>;
+    return (
+      config.autoSupersede === true &&
+      typeof config.sourceIntuneAppId === 'string' &&
+      config.sourceIntuneAppId.length > 0
+    );
+  }
+  return false;
+}
+
 interface GraphMimeContent {
   '@odata.type': '#microsoft.graph.mimeContent';
   type: string;
@@ -168,6 +188,9 @@ interface GraphMobileAppAssignment {
   // exclusion assignments (it stores settings: null for them).
   settings?: {
     '@odata.type': '#microsoft.graph.win32LobAppAssignmentSettings';
+  autoUpdateSettings?: {
+    autoUpdateSupersededAppsState: 'enabled' | 'notConfigured';
+  };
     notifications: 'showAll' | 'showReboot' | 'hideAll';
     deliveryOptimizationPriority: 'notConfigured' | 'foreground';
   };
@@ -748,7 +771,10 @@ export class IntuneUploader {
   ): Promise<void> {
     const explicitAssignments = this.extractExplicitAssignments(job);
     const migrationConfig = this.extractAssignmentMigrationConfig(job);
-    let graphAssignments = this.toGraphAssignments(explicitAssignments);
+    let graphAssignments = this.toGraphAssignments(
+      explicitAssignments,
+      extractAutoSupersede(job.package_config)
+    );
 
     if (
       graphAssignments.length === 0 &&
@@ -1077,7 +1103,10 @@ export class IntuneUploader {
     };
   }
 
-  private toGraphAssignments(assignments: PackageAssignment[]): GraphMobileAppAssignment[] {
+  private toGraphAssignments(
+    assignments: PackageAssignment[],
+    autoUpdateSupersededApps = false
+  ): GraphMobileAppAssignment[] {
     const graphAssignments: GraphMobileAppAssignment[] = [];
 
     for (const assignment of assignments) {
@@ -1138,6 +1167,12 @@ export class IntuneUploader {
           '@odata.type': '#microsoft.graph.win32LobAppAssignmentSettings',
           notifications: assignment.notifications ?? 'showAll',
           deliveryOptimizationPriority: assignment.deliveryOptimizationPriority ?? 'notConfigured',
+          // Only meaningful on an available assignment: it governs apps the
+          // user installed themselves from Company Portal. A required app is
+          // pushed regardless, so the setting is left off there.
+          ...(autoUpdateSupersededApps && graphIntent === 'available'
+            ? { autoUpdateSettings: { autoUpdateSupersededAppsState: 'enabled' as const } }
+            : {}),
         };
       }
 

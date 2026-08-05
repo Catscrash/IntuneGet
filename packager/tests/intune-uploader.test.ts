@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { IntuneUploader, extractAllowAvailableUninstall } from '../src/intune-uploader';
+import {
+  IntuneUploader,
+  extractAllowAvailableUninstall,
+  extractAutoSupersede,
+} from '../src/intune-uploader';
 import type { PackagingJob } from '../src/job-poller';
 import type { PackagerConfig } from '../src/config';
 
@@ -327,5 +331,67 @@ describe('createWin32App and allowAvailableUninstall', () => {
   it('defaults to false, matching Intune', async () => {
     const body = await bodyFor({});
     expect(body.allowAvailableUninstall).toBe(false);
+  });
+});
+
+describe('assignment auto-update for superseded apps', () => {
+  function assignmentsFor(
+    assignments: unknown[],
+    autoUpdateSupersededApps?: boolean
+  ): Array<Record<string, unknown>> {
+    const uploader = new IntuneUploader(makeConfig());
+    const internal = uploader as unknown as {
+      toGraphAssignments: (a: unknown[], auto?: boolean) => Array<Record<string, unknown>>;
+    };
+    return internal.toGraphAssignments(assignments, autoUpdateSupersededApps);
+  }
+
+  it('enables auto-update on available assignments when the app supersedes', () => {
+    // Without this, a superseding app never replaces one the user installed
+    // themselves from Company Portal - it just sits alongside it.
+    const [assignment] = assignmentsFor(
+      [{ type: 'group', intent: 'available', groupId: 'g-1' }],
+      true
+    );
+
+    expect(assignment.settings).toMatchObject({
+      autoUpdateSettings: { autoUpdateSupersededAppsState: 'enabled' },
+    });
+  });
+
+  it('leaves it off on required assignments, which install regardless', () => {
+    const [assignment] = assignmentsFor(
+      [{ type: 'group', intent: 'required', groupId: 'g-1' }],
+      true
+    );
+
+    expect(assignment.settings).not.toHaveProperty('autoUpdateSettings');
+  });
+
+  it('leaves it off when the app supersedes nothing', () => {
+    const [assignment] = assignmentsFor(
+      [{ type: 'group', intent: 'available', groupId: 'g-1' }],
+      false
+    );
+
+    expect(assignment.settings).not.toHaveProperty('autoUpdateSettings');
+  });
+});
+
+describe('extractAutoSupersede', () => {
+  it('requires both the flag and an app to supersede', () => {
+    expect(
+      extractAutoSupersede({ autoSupersede: true, sourceIntuneAppId: 'app-1' })
+    ).toBe(true);
+  });
+
+  it('is false without a source app, since there is nothing to supersede', () => {
+    expect(extractAutoSupersede({ autoSupersede: true })).toBe(false);
+    expect(extractAutoSupersede({ autoSupersede: true, sourceIntuneAppId: '' })).toBe(false);
+  });
+
+  it('is false when the operator did not ask for supersedence', () => {
+    expect(extractAutoSupersede({ sourceIntuneAppId: 'app-1' })).toBe(false);
+    expect(extractAutoSupersede(null)).toBe(false);
   });
 });
