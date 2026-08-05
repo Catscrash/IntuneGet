@@ -14,6 +14,7 @@ import {
   generateDetectionRules,
   generateInstallCommand,
   generateUninstallCommand,
+  retargetDetectionRulesToVersion,
 } from '@/lib/detection-rules';
 import type { DeploymentConfig } from '@/types/update-policies';
 import type { IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
@@ -414,7 +415,13 @@ export async function buildDeploymentConfigForApp(
       installCommand: packagingJob.install_command || '',
       uninstallCommand: packagingJob.uninstall_command || '',
       installScope: packagingJob.install_scope || 'system',
-      detectionRules: parseDetectionRules(packagingJob.detection_rules),
+      // The stored rules name the version the previous deployment installed;
+      // point them at the version being deployed now, or the new app object
+      // would detect its predecessor and never report as installed.
+      detectionRules: retargetDetectionRulesToVersion(
+        parseDetectionRules(packagingJob.detection_rules),
+        latestVersion
+      ),
       assignments: parsedAssignments,
       categories: parsedCategories,
       requirementRules: parsedRequirementRules,

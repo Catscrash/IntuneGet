@@ -122,7 +122,11 @@ function generateRegistryMarkerDetectionRules(
       valueName: 'Version',
       check32BitOn64System: false,
       detectionType: 'version',
-      operator: 'greaterThanOrEqual',
+      // Equal, not greaterThanOrEqual: the marker records the version this
+      // package installed, so each app object must detect only itself. With
+      // >= the previous app keeps detecting as installed after an update to a
+      // newer version, and Intune reports both versions present on the device.
+      operator: 'equal',
       detectionValue: version,
     } as RegistryDetectionRule,
   ];
@@ -155,7 +159,8 @@ function generateMsiDetectionRules(
       {
         type: 'msi',
         productCode: installer.productCode,
-        productVersionOperator: 'greaterThanOrEqual',
+        // Same reasoning as the registry marker: detect this version only.
+        productVersionOperator: 'equal',
       } as MsiDetectionRule,
     ];
   }
@@ -448,4 +453,43 @@ export function validateDetectionRules(rules: DetectionRule[]): {
     valid: errors.length === 0,
     errors,
   };
+}
+
+/**
+ * Re-target a previous deployment's detection rules at a new version.
+ *
+ * An update reuses the original deployment's configuration, but its detection
+ * rules still name the version that deployment installed. Left alone, the new
+ * app object would detect the old version - so Intune reports the update as
+ * not installed on every device, forever.
+ *
+ * Only rules that describe the app's own version are touched: the IntuneGet
+ * registry marker (a version comparison on a value named "Version") and an
+ * MSI product version. Anything else - file existence, scripts, a custom
+ * registry value the operator chose deliberately - is passed through
+ * untouched, since its value is not a version this function can reason about.
+ */
+export function retargetDetectionRulesToVersion(
+  rules: DetectionRule[],
+  version: string
+): DetectionRule[] {
+  if (!version) {
+    return rules;
+  }
+
+  return rules.map((rule) => {
+    if (
+      rule.type === 'registry' &&
+      rule.detectionType === 'version' &&
+      rule.valueName === 'Version'
+    ) {
+      return { ...rule, detectionValue: version };
+    }
+
+    if (rule.type === 'msi' && rule.productVersion) {
+      return { ...rule, productVersion: version };
+    }
+
+    return rule;
+  });
 }

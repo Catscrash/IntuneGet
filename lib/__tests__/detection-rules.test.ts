@@ -4,8 +4,10 @@ import {
   generateInstallCommand,
   generateUninstallCommand,
   validateDetectionRules,
+  retargetDetectionRulesToVersion,
 } from '../detection-rules';
 import type { NormalizedInstaller } from '@/types/winget';
+import type { DetectionRule } from '@/types/intune';
 import type {
   MsiDetectionRule,
   FileDetectionRule,
@@ -32,7 +34,9 @@ describe('generateDetectionRules', () => {
       expect(regRule.keyPath).toBe('HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Google_Chrome');
       expect(regRule.valueName).toBe('Version');
       expect(regRule.detectionType).toBe('version');
-      expect(regRule.operator).toBe('greaterThanOrEqual');
+      // Equal, not >=: each app object must detect only the version it
+      // installed, or the old app keeps detecting after an update.
+      expect(regRule.operator).toBe('equal');
       expect(regRule.detectionValue).toBe('120.0.6099.130');
     });
 
@@ -84,7 +88,7 @@ describe('generateDetectionRules', () => {
       expect(rules[0].type).toBe('msi');
       const msiRule = rules[0] as MsiDetectionRule;
       expect(msiRule.productCode).toBe('{12345678-1234-1234-1234-123456789012}');
-      expect(msiRule.productVersionOperator).toBe('greaterThanOrEqual');
+      expect(msiRule.productVersionOperator).toBe('equal');
     });
 
     it('should fall back to folder detection when product code is missing', () => {
@@ -138,7 +142,7 @@ describe('generateDetectionRules', () => {
       expect(regRule.keyPath).toBe('HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Publisher_TestApp');
       expect(regRule.valueName).toBe('Version');
       expect(regRule.detectionType).toBe('version');
-      expect(regRule.operator).toBe('greaterThanOrEqual');
+      expect(regRule.operator).toBe('equal');
       expect(regRule.detectionValue).toBe('1.0.0');
     });
 
@@ -790,5 +794,93 @@ describe('validateDetectionRules', () => {
 
     expect(result.valid).toBe(false);
     expect(result.errors.length).toBeGreaterThan(1);
+  });
+});
+
+describe('retargetDetectionRulesToVersion', () => {
+  it('points the IntuneGet registry marker at the version being deployed', () => {
+    // An update reuses the previous deployment's config, whose marker rule
+    // still names the old version. Left alone the new app object detects its
+    // predecessor and never reports as installed.
+    const [rule] = retargetDetectionRulesToVersion(
+      [
+        {
+          type: 'registry',
+          keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Mozilla_Firefox',
+          valueName: 'Version',
+          check32BitOn64System: false,
+          detectionType: 'version',
+          operator: 'equal',
+          detectionValue: '152.0.1',
+        },
+      ] as DetectionRule[],
+      '152.0.5'
+    );
+
+    expect((rule as RegistryDetectionRule).detectionValue).toBe('152.0.5');
+  });
+
+  it('updates an MSI product version', () => {
+    const [rule] = retargetDetectionRulesToVersion(
+      [
+        {
+          type: 'msi',
+          productCode: '{12345678-1234-1234-1234-123456789012}',
+          productVersionOperator: 'equal',
+          productVersion: '1.0.0',
+        },
+      ] as DetectionRule[],
+      '2.0.0'
+    );
+
+    expect((rule as MsiDetectionRule).productVersion).toBe('2.0.0');
+  });
+
+  it('leaves rules alone whose value is not a version', () => {
+    // A file existence check, a script, and a registry value the operator
+    // chose deliberately: none describe the app version, so rewriting them
+    // would corrupt a working rule.
+    const rules = [
+      {
+        type: 'file',
+        path: 'C:\\Program Files\\App',
+        fileOrFolderName: 'app.exe',
+        check32BitOn64System: false,
+        detectionType: 'exists',
+      },
+      {
+        type: 'script',
+        scriptContent: 'Write-Output 0',
+        enforceSignatureCheck: false,
+        runAs32Bit: false,
+      },
+      {
+        type: 'registry',
+        keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Vendor\\App',
+        valueName: 'InstallState',
+        check32BitOn64System: false,
+        detectionType: 'string',
+        operator: 'equal',
+        detectionValue: 'installed',
+      },
+    ] as DetectionRule[];
+
+    expect(retargetDetectionRulesToVersion(rules, '2.0.0')).toEqual(rules);
+  });
+
+  it('returns the rules untouched when no version is known', () => {
+    const rules = [
+      {
+        type: 'registry',
+        keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\App',
+        valueName: 'Version',
+        check32BitOn64System: false,
+        detectionType: 'version',
+        operator: 'equal',
+        detectionValue: '1.0.0',
+      },
+    ] as DetectionRule[];
+
+    expect(retargetDetectionRulesToVersion(rules, '')).toEqual(rules);
   });
 });

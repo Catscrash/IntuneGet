@@ -268,6 +268,57 @@ describe('POST /api/update-policies', () => {
     expect(body.created).toBe(true);
   });
 
+  it('re-targets the prior deployment detection rules at the new version', async () => {
+    // The stored rules name the version the previous deployment installed. If
+    // they are carried over unchanged, the new app object detects its
+    // predecessor and never reports as installed on any device.
+    const { supabase, insertPayloads } = createSupabaseMock({
+      update_check_results: { current_version: '1.0.0', latest_version: '2.0.0' },
+      upload_history: {
+        id: 'upload-1',
+        packaging_job_id: 'job-1',
+        winget_id: 'Microsoft.Edge',
+      },
+      packaging_jobs: {
+        id: 'job-1',
+        display_name: 'Microsoft Edge',
+        publisher: 'Microsoft',
+        architecture: 'x64',
+        installer_type: 'exe',
+        install_command: 'setup.exe /silent',
+        uninstall_command: 'setup.exe /uninstall',
+        install_scope: 'system',
+        detection_rules: [
+          {
+            type: 'registry',
+            keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Microsoft_Edge',
+            valueName: 'Version',
+            check32BitOn64System: false,
+            detectionType: 'version',
+            operator: 'equal',
+            detectionValue: '1.0.0',
+          },
+        ],
+        package_config: { assignments: [], categories: [] },
+      },
+      existing_policy: null,
+    });
+    createServerClientMock.mockReturnValue(supabase);
+
+    const response = await POST(
+      makeRequest({
+        winget_id: 'Microsoft.Edge',
+        tenant_id: 'tenant-1',
+        policy_type: 'auto_update',
+      })
+    );
+
+    expect(response.status).toBe(200);
+    const config = insertPayloads[0].deployment_config as Record<string, unknown>;
+    const rules = config.detectionRules as Array<Record<string, unknown>>;
+    expect(rules[0].detectionValue).toBe('2.0.0');
+  });
+
   it('returns 400 for auto_update with no prior deployment and not in catalog', async () => {
     const { supabase } = createSupabaseMock({
       update_check_results: { current_version: '1.0.0', latest_version: '2.0.0' },
