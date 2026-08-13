@@ -29,9 +29,88 @@ Skip the manual packaging workflow and deploy Winget apps to Intune in seconds.
 
 <div align="center">
 
-**[Features](#features)** | **[Quick Start](#quick-start)** | **[Architecture](#architecture)** | **[How It Compares](#how-it-compares)** | **[Documentation](#documentation)**
+**[About This Fork](#about-this-fork)** | **[Features](#features)** | **[Quick Start](#quick-start)** | **[Architecture](#architecture)** | **[How It Compares](#how-it-compares)** | **[Documentation](#documentation)**
 
 </div>
+
+---
+
+## About This Fork
+
+This is a fork of [ugurkocde/IntuneGet](https://github.com/ugurkocde/IntuneGet). Everything here came out of running one real air-gapped deployment end to end: self-hosted Docker, `DATABASE_MODE=sqlite`, no Supabase, local Windows packager, behind a corporate proxy. That combination is documented as supported, but several paths through it did not work — see [issue #167](https://github.com/ugurkocde/IntuneGet/issues/167).
+
+Each fix is a separate branch and, where it is ready, a pull request upstream. The intent is for all of this to land upstream and for the fork to become unnecessary.
+
+### Branch layout
+
+| Branch | Contents |
+|--------|----------|
+| `main` | Plain mirror of `ugurkocde/IntuneGet:main`. No changes of our own. |
+| `fork-main` | Default branch. All the work below, merged and kept current with upstream. |
+
+### Proposed upstream
+
+| PR | Area | What it fixes |
+|----|------|---------------|
+| [#220](https://github.com/ugurkocde/IntuneGet/pull/220) | Web app | Supabase-less SQLite self-hosting |
+| [#221](https://github.com/ugurkocde/IntuneGet/pull/221) | Local packager | `HTTP(S)_PROXY` support |
+| [#222](https://github.com/ugurkocde/IntuneGet/pull/222) | Local packager | Win32 app creation payload |
+
+**Supabase-less SQLite self-hosting.** `createServerClient()` throws when Supabase is not configured, and it was being called unconditionally on paths that either do not need Supabase at all or need it only for MSP tenant resolution — neither of which exists in a single-tenant self-hosted install. Deployment failed with a bare 500, and the dashboard, reports, update checking and the Update button were affected in the same way. Tenant resolution now falls back to the token's own tenant, and features with no SQLite equivalent report plainly (an empty list for reads, 503 for writes) instead of crashing.
+
+**Proxy support.** The local packager's `node-fetch` calls and its `msal-node` token requests both ignored `HTTP_PROXY`/`HTTPS_PROXY`, so packaging never completed on a network that requires one.
+
+**Win32 app creation payload.** Three Graph validation errors on the same `POST /deviceAppManagement/mobileApps` call, each only reachable once the previous one was fixed: detection rules were sent via a later `PATCH` rather than at creation (`The Win32LobApp must have at least one detection rule specified`), in the shape of the deprecated `detectionRules` property rather than the unified `rules` collection; `fileName` was missing; and `minimumSupportedWindowsRelease` was sent as `v10_1903` instead of the bare release string `1903`.
+
+### Fork-only, not yet proposed upstream
+
+<details>
+<summary><b>Detection rules detect the exact deployed version</b></summary>
+
+<br>
+
+IntuneGet creates **one Intune app object per deployed version**, and the PSADT package writes a registry marker recording the version it installed. The generated detection rule compared that marker with `greaterThanOrEqual`, so after an update the old app object's rule was satisfied too:
+
+```
+Deploy 152.0.1  -> app object A, rule: marker >= 152.0.1
+Update  152.0.5 -> app object B, rule: marker >= 152.0.5   (marker now reads 152.0.5)
+
+A: 152.0.5 >= 152.0.1 -> "installed"   <- wrong, A is gone
+B: 152.0.5 >= 152.0.5 -> "installed"
+```
+
+Intune then reports both versions present on the same device, and the old object's install count never drops. With one object per version, detection has to be an identity check, so the comparison is now `equal`. The MSI product version fallback had the same problem and gets the same treatment.
+
+A second defect only shows on updates: an update reuses the previous deployment's configuration, whose detection rules still name the *previous* version — so the new app object shipped looking for its predecessor and would never report as installed anywhere. The rules are now re-targeted at the version being deployed. That re-targeting is deliberately narrow: it touches the IntuneGet marker and an MSI product version, and passes everything else through, since a file check or a script has a meaning it cannot infer.
+
+</details>
+
+<details>
+<summary><b>"Allow available uninstall" setting</b></summary>
+
+<br>
+
+Every deployed app landed in Intune with *Allow available uninstall: No*, because the property was never set and Graph defaults it to false — with no way to change it short of editing each app afterwards. It is now a global operator setting alongside carry-over and supersedence, since the ask is a house rule ("our users may remove apps they installed themselves") rather than a per-app choice.
+
+The property lives on `win32LobApp` itself, not on the assignment settings; Intune applies it to available assignments on its own.
+
+Not covered: the GitHub Actions packager builds the app body in PowerShell and would need the same property to stay consistent.
+
+</details>
+
+<details>
+<summary><b>Auto-update apps the user installed, when superseding them</b></summary>
+
+<br>
+
+Superseding an app does not by itself replace one a user installed from Company Portal — Intune only does that when the assignment asks for it. So a superseded app sat on the old version indefinitely: the relationship was recorded and had no effect on those devices.
+
+Available assignments now carry `autoUpdateSettings.autoUpdateSupersededAppsState: 'enabled'` whenever the job supersedes a previous app. It is tied to supersedence rather than exposed separately, because the two are useless apart. Required apps are pushed regardless, so only available assignments get it.
+
+</details>
+
+> [!NOTE]
+> `fork-main` is kept merged with upstream, so it carries fixes the pull requests above do not yet have — including guards for two newer Supabase-only features on the deploy path (the catalog retirement blocklist and QA gating), which fail the same way in a SQLite install.
 
 ---
 
