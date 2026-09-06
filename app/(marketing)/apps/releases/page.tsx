@@ -37,13 +37,22 @@ export async function generateMetadata({
 const loadHistory = unstable_cache(
   (filters: ReleaseHistoryFilters) =>
     getCatalogSource().getReleaseHistory(filters),
-  ["catalog-release-history-v1"],
+  ["catalog-release-history-v2"],
   { revalidate: 300 },
 );
 const dateFormat = new Intl.DateTimeFormat("en-GB", {
   day: "numeric",
   month: "short",
   year: "numeric",
+  timeZone: "UTC",
+});
+const syncDateFormat = new Intl.DateTimeFormat("en-GB", {
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
   timeZone: "UTC",
 });
 function dateLabel(value: string) {
@@ -67,9 +76,11 @@ export default async function CatalogReleasesPage({ searchParams }: Props) {
       ? "Last run completed successfully"
       : sync?.status === "running"
         ? "Catalog sync in progress"
-        : sync
-          ? "Latest sync is incomplete"
-          : "History from the catalog snapshot";
+        : sync?.status === "partial"
+          ? "Completed with unavailable packages"
+          : sync
+            ? "Latest sync failed"
+            : "History from the catalog snapshot";
 
   return (
     <div className="flex min-h-screen flex-col bg-bg-deepest">
@@ -111,23 +122,34 @@ export default async function CatalogReleasesPage({ searchParams }: Props) {
                 </T>
               </p>
               <p className="mt-3 leading-relaxed text-text-secondary">
-                <T>Last successful full sync:</T>{" "}
+                <T>Last completed catalog check:</T>{" "}
                 {sync?.lastSuccessfulAt ? (
                   <time dateTime={sync.lastSuccessfulAt}>
-                    {dateLabel(sync.lastSuccessfulAt)} (UTC)
+                    {syncDateFormat.format(new Date(sync.lastSuccessfulAt))}{" "}
+                    (UTC)
                   </time>
                 ) : (
                   <T>Not yet recorded</T>
                 )}
               </p>
-              {sync?.completedAt && (
-                <p className="mt-2 text-xs text-text-muted">
-                  <T>Last attempt:</T>{" "}
-                  <time dateTime={sync.completedAt}>
-                    {dateLabel(sync.completedAt)} (UTC)
-                  </time>
+              {sync?.status === "partial" && (
+                <p className="mt-3 text-xs leading-relaxed text-text-secondary">
+                  <T>
+                    The check completed, but some manifests were unavailable
+                    from WinGet. Existing records are retained and retried on
+                    the next sync.
+                  </T>
                 </p>
               )}
+              {sync?.completedAt &&
+                sync.completedAt !== sync.lastSuccessfulAt && (
+                  <p className="mt-2 text-xs text-text-muted">
+                    <T>Last attempt:</T>{" "}
+                    <time dateTime={sync.completedAt}>
+                      {syncDateFormat.format(new Date(sync.completedAt))} (UTC)
+                    </time>
+                  </p>
+                )}
             </aside>
           )}
         </header>
@@ -311,15 +333,11 @@ export default async function CatalogReleasesPage({ searchParams }: Props) {
                             {row.name}
                             <span className="sr-only"> {row.winget_id}</span>
                           </Link>
-                          <span
-                            className={`rounded-md px-2 py-1 text-xs ${row.previous_version ? "bg-accent-cyan/10 text-accent-cyan" : "bg-overlay/5 text-text-secondary"}`}
-                          >
-                            {row.previous_version ? (
-                              <T>Version change</T>
-                            ) : (
+                          {!row.previous_version && (
+                            <span className="rounded-md bg-overlay/5 px-2 py-1 text-xs text-text-secondary">
                               <T>First tracked</T>
-                            )}
-                          </span>
+                            </span>
+                          )}
                         </div>
                         <p className="mt-2 break-all text-xs text-text-muted">
                           {row.winget_id}
@@ -348,6 +366,82 @@ export default async function CatalogReleasesPage({ searchParams }: Props) {
                         <span className="break-all font-semibold text-text-primary">
                           {row.version}
                         </span>
+                      </div>
+                      <div className="min-w-0 space-y-3 text-xs text-text-muted sm:col-span-2">
+                        {row.detailsUnavailable ? (
+                          <p>
+                            <T>
+                              Release notes and scan details are temporarily
+                              unavailable.
+                            </T>
+                          </p>
+                        ) : (
+                          <>
+                            <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                              <span className="font-medium text-text-secondary">
+                                VirusTotal:
+                              </span>
+                              {row.virusTotal ? (
+                                <>
+                                  <a
+                                    href={`https://www.virustotal.com/gui/file/${row.virusTotal.hash}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-accent-cyan hover:underline"
+                                  >
+                                    {[
+                                      "clean",
+                                      "flagged",
+                                      "suspicious",
+                                    ].includes(row.virusTotal.status) &&
+                                    row.virusTotal.total != null &&
+                                    row.virusTotal.total > 0 &&
+                                    row.virusTotal.malicious != null &&
+                                    row.virusTotal.suspicious != null ? (
+                                      <T>
+                                        <Var>{row.virusTotal.malicious}</Var>/
+                                        <Var>{row.virusTotal.total}</Var>{" "}
+                                        malicious,{" "}
+                                        <Var>{row.virusTotal.suspicious}</Var>{" "}
+                                        suspicious
+                                      </T>
+                                    ) : row.virusTotal.status ===
+                                      "not_found" ? (
+                                      <T>No report found</T>
+                                    ) : (
+                                      <T>Scan unavailable</T>
+                                    )}
+                                  </a>
+                                  {row.virusTotal.architecture && (
+                                    <span>({row.virusTotal.architecture})</span>
+                                  )}
+                                  {row.virusTotal.scannedAt && (
+                                    <time dateTime={row.virusTotal.scannedAt}>
+                                      <T>Checked</T>{" "}
+                                      {dateLabel(row.virusTotal.scannedAt)}
+                                    </time>
+                                  )}
+                                </>
+                              ) : (
+                                <T>Not scanned for this installer</T>
+                              )}
+                            </p>
+                            {row.release_notes ? (
+                              <details className="group">
+                                <summary className="w-fit cursor-pointer rounded-sm py-1 font-medium text-accent-cyan focus-visible:outline-2 focus-visible:outline-accent-cyan">
+                                  <T>Release notes</T>
+                                </summary>
+                                <p className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-overlay/10 bg-bg-deepest p-4 text-sm leading-relaxed text-text-secondary">
+                                  {row.release_notes}
+                                </p>
+                              </details>
+                            ) : (
+                              <p>
+                                <T>Release notes not provided</T>
+                              </p>
+                            )}
+                          </>
+                        )}
                       </div>
                     </li>
                   ))}
@@ -390,7 +484,9 @@ export default async function CatalogReleasesPage({ searchParams }: Props) {
           </h2>
           <p className="mt-2">
             <T>
-              This is an observation history, not a complete archive of
+              VirusTotal results apply to the exact installer hash shown and
+              reflect the recorded scan date. Zero detections do not guarantee
+              safety. This is an observation history, not a complete archive of
               publisher releases. First tracked means the earliest version we
               have recorded for an app, including apps imported when tracking
               began. It does not necessarily mean a newly released product.
