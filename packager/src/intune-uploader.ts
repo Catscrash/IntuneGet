@@ -222,10 +222,10 @@ export class IntuneUploader {
    */
   async uploadToIntune(
     job: PackagingJob,
+    packageFileName: string,
     encryptedContentPath: string,
     encryptionInfo: EncryptionInfo,
     sizes: { unencryptedSize: number; encryptedSize: number },
-    packageFileName: string,
     onProgress?: ProgressCallback
   ): Promise<IntuneAppResult> {
     const graphClient = new GraphClient(this.config, job.tenant_id);
@@ -730,7 +730,7 @@ export class IntuneUploader {
   }
 
   /**
-   * Add requirement rules (for "Update Only" mode), if present, to the app.
+   * Append requirement rules to the detection rules supplied at creation time.
    * Detection rules are set at creation time in createWin32App() - Graph
    * rejects an app created with an empty rules array.
    */
@@ -1299,7 +1299,7 @@ export class IntuneUploader {
             path: ruleObj.path,
             fileOrFolderName: ruleObj.fileOrFolderName,
             check32BitOn64System: ruleObj.check32BitOn64System || false,
-            operationType: this.mapFileDetectionType(ruleObj.detectionType as string),
+            operationType: this.mapFileDetectionType(String(ruleObj.detectionType || 'exists')),
             operator: ruleObj.operator || 'notConfigured',
             comparisonValue: ruleObj.detectionValue ?? null,
           });
@@ -1310,7 +1310,7 @@ export class IntuneUploader {
             keyPath: ruleObj.keyPath,
             valueName: ruleObj.valueName,
             check32BitOn64System: ruleObj.check32BitOn64System || false,
-            operationType: this.mapRegistryDetectionType(ruleObj.detectionType as string),
+            operationType: this.mapRegistryDetectionType(String(ruleObj.detectionType || 'exists')),
             operator: ruleObj.operator || 'notConfigured',
             comparisonValue: ruleObj.detectionValue ?? null,
           });

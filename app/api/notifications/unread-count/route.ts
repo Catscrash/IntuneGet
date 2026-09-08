@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import { parseAccessToken } from '@/lib/auth-utils';
 
 /**
@@ -22,14 +22,14 @@ export async function GET(request: NextRequest) {
     }
 
     // Notifications live in user_notifications, a Supabase-only table with no
-    // SQLite equivalent. Report an empty badge rather than crashing on
-    // createServerClient(), which throws without Supabase config and made this
-    // route answer 500 on every dashboard load in a self-hosted install.
-    if (!isSupabaseConfigured()) {
+    // SQLite equivalent, so an empty badge is the honest answer in a
+    // self-hosted install rather than the 500 createServerClient() used to
+    // throw here. Same `unread_count` key as the success path - NotificationBell
+    // and NotificationCenter read that field and nothing else.
+    const supabase = getServerClientOrNull();
+    if (!supabase) {
       return NextResponse.json({ unread_count: 0 });
     }
-
-    const supabase = createServerClient();
 
     const { count, error } = await supabase
       .from('user_notifications')

@@ -1,3 +1,4 @@
+import type { ReleaseHistoryFilters, ReleaseHistoryResult } from './release-history';
 /**
  * Catalog Source abstraction
  *
@@ -156,6 +157,7 @@ export type SccmMappingResult = SccmMatchResult;
  * The catalog read surface. Every method maps 1:1 to a former direct query.
  */
 export interface CatalogSource {
+  getReleaseHistory(filters: ReleaseHistoryFilters): Promise<ReleaseHistoryResult>;
   // --- search / discovery ---
 
   /** RPC search_curated_apps. Returns the raw rows + error so each caller keeps
@@ -171,6 +173,7 @@ export interface CatalogSource {
     offset: number;
     category?: string | null;
     sort: SearchSort;
+    verifiedOnly?: boolean;
   }): Promise<PopularPackagesResult | null>;
 
   /** RPC get_popular_curated_apps (normalized in winget-api). */
@@ -182,13 +185,20 @@ export interface CatalogSource {
   /** RPC get_curated_categories. */
   getCategories(): Promise<CategoryCount[]>;
 
+  /** Verified, canonical app ids for prerendering and segmented sitemaps.
+   *  updated_at carries the row's last catalog update when the store has one
+   *  (the snapshot only records created_at). */
+  getVerifiedAppIds(
+    limit?: number
+  ): Promise<{ winget_id: string; updated_at?: string | null }[]>;
+
   /** curated_apps count(head) with optional is_verified filter. */
   getCategoryCount(opts: { verifiedOnly: boolean }): Promise<number | null>;
 
   // --- app detail ---
 
   /** curated_apps select('*') + version_history versions + get_locale_variants. */
-  getAppByWingetId(wingetId: string): Promise<CuratedAppWithDetails | null>;
+  getAppByWingetId(wingetId: string, options?: { presentationOnly?: boolean }): Promise<CuratedAppWithDetails | null>;
 
   /** version_history select('version') ordered by created_at desc. */
   getVersions(wingetId: string): Promise<string[]>;

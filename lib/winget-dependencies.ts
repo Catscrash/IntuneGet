@@ -22,6 +22,8 @@ const VC_REDISTRIBUTABLE_PACKAGE_PATTERN =
   /^Microsoft\.VCRedist\.[A-Za-z0-9+.-]+\.(?:x86|x64|arm64)$/i;
 const DOTNET_DESKTOP_RUNTIME_PACKAGE_PATTERN =
   /^Microsoft\.DotNet\.DesktopRuntime\.\d+$/i;
+const DOTNET_ASPNETCORE_RUNTIME_PACKAGE_PATTERN =
+  /^Microsoft\.DotNet\.AspNetCore\.\d+$/i;
 const VCLIBS_DESKTOP_PACKAGE_PATTERN = /^Microsoft\.VCLibs\.Desktop\.14$/i;
 
 interface PackageDependencyReference {
@@ -57,6 +59,10 @@ const REVIEWED_DEPENDENCY_POLICIES: readonly ReviewedDependencyPolicy[] = [
     installerTypes: new Set<WingetInstallerType>(['exe', 'burn']),
   },
   {
+    packagePattern: DOTNET_ASPNETCORE_RUNTIME_PACKAGE_PATTERN,
+    installerTypes: new Set<WingetInstallerType>(['exe', 'burn']),
+  },
+  {
     packagePattern: /^Microsoft\.PowerShell$/i,
     installerTypes: new Set<WingetInstallerType>(['msi', 'wix']),
   },
@@ -67,11 +73,21 @@ const REVIEWED_DEPENDENCY_POLICIES: readonly ReviewedDependencyPolicy[] = [
 ];
 
 export class WingetDependencyCompatibilityError extends Error {
-  readonly blockCode: 'user_scope_machine_dependencies';
+  readonly blockCode:
+    | 'user_scope_machine_dependencies'
+    | 'user_scope_elevation_required'
+    | 'trusted_installer_tuple_unavailable'
+    | 'unsupported_dependency_shape'
+    | 'unreviewed_dependency';
 
   constructor(
     message: string,
-    blockCode: 'user_scope_machine_dependencies' = 'user_scope_machine_dependencies'
+    blockCode:
+      | 'user_scope_machine_dependencies'
+      | 'user_scope_elevation_required'
+      | 'trusted_installer_tuple_unavailable'
+      | 'unsupported_dependency_shape'
+      | 'unreviewed_dependency' = 'user_scope_machine_dependencies'
   ) {
     super(message);
     this.name = 'WingetDependencyCompatibilityError';
@@ -167,8 +183,9 @@ function ensureSupportedDependencyShape(
     ...(installer.externalDependencies || []).map((value) => `external dependency ${value}`),
   ];
   if (unsupported.length > 0) {
-    throw new Error(
-      `${packageIdentifier} declares unsupported dependencies: ${unsupported.join(', ')}`
+    throw new WingetDependencyCompatibilityError(
+      `${packageIdentifier} declares unsupported dependencies: ${unsupported.join(', ')}`,
+      'unsupported_dependency_shape'
     );
   }
 }
@@ -251,11 +268,22 @@ export async function resolveWingetPackageDependencies(
   );
   const rootInstaller = chooseInstaller(rootCandidates, targetArchitecture);
   if (!rootInstaller) {
-    throw new Error(
-      `The trusted WinGet installer tuple for ${input.wingetId} ${input.version} could not be resolved.`
+    throw new WingetDependencyCompatibilityError(
+      `The trusted WinGet installer tuple for ${input.wingetId} ${input.version} could not be resolved.`,
+      'trusted_installer_tuple_unavailable'
     );
   }
   ensureSupportedDependencyShape(input.wingetId, rootInstaller);
+  const rootScope = (input.installScope || rootInstaller.scope || '').trim().toLowerCase();
+  if (
+    rootScope === 'user' &&
+    rootInstaller.elevationRequirement === 'elevationRequired'
+  ) {
+    throw new WingetDependencyCompatibilityError(
+      `${input.wingetId} declares a user-scope installer that requires elevation and cannot run under the supported Intune user-install contract.`,
+      'user_scope_elevation_required'
+    );
+  }
   const rootDependencies = rootPackageDependencies(
     input.wingetId,
     rootInstaller.packageDependencies
@@ -286,8 +314,9 @@ export async function resolveWingetPackageDependencies(
     }
     const dependencyPolicy = reviewedDependencyPolicy(packageIdentifier);
     if (!dependencyPolicy) {
-      throw new Error(
-        `WinGet dependency ${packageIdentifier} is not in the reviewed redistribution allowlist.`
+      throw new WingetDependencyCompatibilityError(
+        `WinGet dependency ${packageIdentifier} is not in the reviewed redistribution allowlist.`,
+        'unreviewed_dependency'
       );
     }
 

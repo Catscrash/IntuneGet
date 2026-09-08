@@ -4,13 +4,18 @@ import { getLiveInstallers } from '@/lib/manifest-api';
 import {
   hashRemoteInstaller,
   hashesEqual,
+  InstallerDownloadDeadlineError,
   isLikelyMutableInstallerUrl,
 } from '@/lib/installer-download';
+import { normalizeQaInstallerType } from '@/lib/qa/candidate';
+import { resolveApplicationInstallerSelectionScope } from '@/lib/packaging-adapters';
 import type { NormalizedInstaller } from '@/types/winget';
 
 const HEALTHY_MUTABLE_TTL_MS = 5 * 60 * 1000;
 const HEALTHY_VERSIONED_TTL_MS = 6 * 60 * 60 * 1000;
 const ERROR_TTL_MS = 60 * 1000;
+const MANIFEST_CHANGED_TTL_MS = 6 * 60 * 60 * 1000;
+const PREFLIGHT_CACHE_SCHEMA_VERSION = '4';
 const LEASE_SECONDS = 240;
 const WAIT_FOR_CLAIM_MS = 240_000;
 const POLL_INTERVAL_MS = 1_500;
@@ -38,6 +43,7 @@ export interface InstallerPreflightRequest {
   version: string;
   architecture?: string;
   installerUrl: string;
+  manifestInstallerUrl?: string;
   installerSha256: string;
   installerType?: string;
   installScope?: 'machine' | 'user';
@@ -95,17 +101,34 @@ function isHostedRuntime(): boolean {
 }
 
 export function createInstallerHealthKey(input: InstallerPreflightRequest): string {
+  const executionScope = normalizedRequestedScope(input.installScope);
+  const manifestScope = executionScope
+    ? resolveApplicationInstallerSelectionScope(input.wingetId, executionScope)
+    : undefined;
   return createHash('sha256')
     .update([
+      PREFLIGHT_CACHE_SCHEMA_VERSION,
       input.wingetId.trim().toLowerCase(),
       input.version.trim(),
       (input.architecture || 'x64').trim().toLowerCase(),
-      (input.installerType || '').trim().toLowerCase(),
-      (input.installScope || '').trim().toLowerCase(),
+      normalizePreflightInstallerType(input.installerType),
+      executionScope || '',
+      manifestScope || '',
       input.installerUrl.trim(),
       input.installerSha256.trim().toUpperCase(),
     ].join('\0'))
     .digest('hex');
+}
+
+function normalizedRequestedScope(
+  scope?: InstallerPreflightRequest['installScope']
+): 'machine' | 'user' | undefined {
+  const normalized = scope?.trim().toLowerCase();
+  return normalized === 'machine' || normalized === 'user' ? normalized : undefined;
+}
+
+function normalizePreflightInstallerType(type?: string): string {
+  return type?.trim() ? normalizeQaInstallerType(type) : '';
 }
 
 function assertTrustedInput(input: InstallerPreflightRequest): void {
@@ -128,7 +151,7 @@ function throwForRow(row: InstallerHealthRow): never {
   throw new InstallerPreflightError(
     row.reason_code || 'INSTALLER_QUARANTINED',
     row.reason_message || 'This installer tuple is quarantined and cannot be dispatched',
-    row.status === 'error',
+    row.status === 'error' && row.reason_code !== 'MANIFEST_CHANGED',
     row.actual_sha256 || undefined,
   );
 }
@@ -228,9 +251,12 @@ function installerExistsInManifest(
 ): boolean {
   const expectedHash = input.installerSha256.toUpperCase();
   const requestedArchitecture = (input.architecture || 'x64').toLowerCase();
-  const requestedType = input.installerType?.toLowerCase();
-  const requestedScope = input.installScope?.toLowerCase();
-  const requestedUrl = input.installerUrl.trim();
+  const requestedType = normalizePreflightInstallerType(input.installerType);
+  const executionScope = normalizedRequestedScope(input.installScope);
+  const requestedScope = executionScope
+    ? resolveApplicationInstallerSelectionScope(input.wingetId, executionScope)
+    : undefined;
+  const requestedUrl = (input.manifestInstallerUrl || input.installerUrl).trim();
 
   return installers.some((installer) => {
     if (!hashesEqual(installer.sha256 || '', expectedHash)) return false;
@@ -240,7 +266,8 @@ function installerExistsInManifest(
       installer.architecture.toLowerCase() !== requestedArchitecture &&
       installer.architecture.toLowerCase() !== 'neutral'
     ) return false;
-    if (requestedType && installer.type && installer.type.toLowerCase() !== requestedType) return false;
+    const manifestType = normalizePreflightInstallerType(installer.type);
+    if (requestedType && manifestType && manifestType !== requestedType) return false;
     if (requestedScope && installer.scope && installer.scope.toLowerCase() !== requestedScope) return false;
     return true;
   });
@@ -296,9 +323,10 @@ async function performLivePreflight(
         'MANIFEST_CHANGED',
         `The selected installer for ${input.wingetId} ${input.version} no longer matches the trusted WinGet manifest`,
       );
-      await writeHealth(buildHealthRow(cacheKey, input, 'quarantined', {
+      await writeHealth(buildHealthRow(cacheKey, input, 'error', {
         reason_code: error.code,
         reason_message: error.message,
+        expires_at: new Date(Date.now() + MANIFEST_CHANGED_TTL_MS).toISOString(),
       }));
       throw error;
     }
@@ -324,6 +352,12 @@ async function performLivePreflight(
       : HEALTHY_VERSIONED_TTL_MS;
     await writeHealth(buildHealthRow(cacheKey, input, 'healthy', {
       actual_sha256: downloaded.sha256,
+      reason_code: downloaded.verificationMethod === 'publisher-checksum'
+        ? 'PUBLISHER_CHECKSUM_ATTESTED'
+        : null,
+      reason_message: downloaded.verificationMethod === 'publisher-checksum'
+        ? 'The trusted WinGet SHA256 matched the publisher checksum and the installer source passed bounded byte-range probes. The packager will still hash the complete downloaded payload.'
+        : null,
       expires_at: new Date(Date.now() + ttl).toISOString(),
     }));
 
@@ -339,7 +373,13 @@ async function performLivePreflight(
 
     const normalized = error instanceof InstallerPreflightError
       ? error
-      : new InstallerPreflightError(
+      : error instanceof InstallerDownloadDeadlineError
+        ? new InstallerPreflightError(
+            'PREFLIGHT_DEADLINE_EXCEEDED',
+            error.message,
+            true,
+          )
+        : new InstallerPreflightError(
           'PREFLIGHT_UNAVAILABLE',
           error instanceof Error ? error.message : 'Installer verification failed',
           true,

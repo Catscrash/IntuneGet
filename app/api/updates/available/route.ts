@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { compareVersions } from '@/lib/version-compare';
@@ -34,7 +34,7 @@ export async function GET(request: NextRequest) {
 
     // Detected updates live in the db abstraction, so this works in both
     // backends. Auto-update policies below are Supabase-only.
-    const supabase = isSupabaseConfigured() ? createServerClient() : null;
+    const supabase = isSupabaseServerConfigured() ? createServerClient() : null;
 
     let updates;
     try {

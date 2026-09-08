@@ -180,8 +180,14 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     if (!result.ok) throw new Error('Expected installer resolution to succeed');
     expect(result.info).toMatchObject({
       installCommand: '"Vivaldi.8.1.4087.62.x64.exe" --vivaldi-silent --do-not-launch-chrome',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Vivaldi',
       silentSwitches: '--vivaldi-silent --do-not-launch-chrome',
       installScope: 'user',
+      detectionRules: [expect.objectContaining({
+        type: 'registry',
+        detectionValue: '8.1.4087.62',
+        keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\Vivaldi_Vivaldi',
+      })],
     });
   });
 
@@ -442,7 +448,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     const supabase = createSupabaseMock({});
     const trigger = makeTrigger(supabase);
     const storedConfig: DeploymentConfig = {
-      displayName: 'Elgato Stream Deck',
+      displayName: 'Elgato Camera Hub',
       publisher: 'Elgato',
       architecture: 'x64',
       installerType: 'msi',
@@ -460,35 +466,106 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
     vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
     vi.spyOn(trigger as never, 'createHistoryRecord' as never)
-      .mockResolvedValue({ id: 'history-elgato' } as never);
+      .mockResolvedValue({ id: 'history-camera-hub' } as never);
     const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
-      .mockResolvedValue({ id: 'job-elgato' } as never);
+      .mockResolvedValue({ id: 'job-camera-hub' } as never);
     vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
     vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
 
     const result = await trigger.triggerAutoUpdate(policy, {
       ...UPDATE_INFO,
-      wingetId: 'elgato.streamdeck',
-      displayName: 'Elgato Stream Deck',
+      wingetId: 'elgato.camerahub',
+      displayName: 'Elgato Camera Hub',
       installerType: 'msi',
       nestedInstallerType: undefined,
       nestedInstallerPath: undefined,
     }, { skipRateLimits: true });
 
-    expect(result).toMatchObject({ success: true, packagingJobId: 'job-elgato' });
+    expect(result).toMatchObject({ success: true, packagingJobId: 'job-camera-hub' });
     const qaInput = ensureQaDemandMock.mock.calls[0][1] as {
       psadtConfig: string;
     };
     expect(JSON.parse(qaInput.psadtConfig).processesToClose).toEqual([
-      { name: 'StreamDeck', description: 'Elgato Stream Deck' },
+      { name: 'Camera Hub', description: 'Elgato Camera Hub' },
     ]);
     const effectivePolicy = createPackagingJobSpy.mock.calls[0][0] as AppUpdatePolicy;
     expect(
       (effectivePolicy.deployment_config as DeploymentConfig).psadtConfig?.processesToClose
     ).toEqual([
-      { name: 'StreamDeck', description: 'Elgato Stream Deck' },
+      { name: 'Camera Hub', description: 'Elgato Camera Hub' },
     ]);
     expect(storedConfig.psadtConfig?.processesToClose).toEqual([]);
+  });
+
+  it('replaces stale installer-family detection for QA and customer packaging', async () => {
+    const supabase = createSupabaseMock({});
+    const trigger = makeTrigger(supabase);
+    const staleMsixDetection = {
+      type: 'script' as const,
+      scriptContent: 'Get-AppxPackage -Name OldPackage',
+      enforceSignatureCheck: false,
+      runAs32Bit: false,
+    };
+    const currentExeDetection = {
+      type: 'registry' as const,
+      keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\Anthropic_Claude',
+      valueName: 'Version',
+      detectionType: 'version' as const,
+      detectionValue: '1.30096.1',
+      operator: 'greaterThanOrEqual' as const,
+      check32BitOn64System: false,
+    };
+    const storedConfig: DeploymentConfig = {
+      displayName: 'Claude',
+      publisher: 'Anthropic',
+      architecture: 'x64',
+      installerType: 'msix',
+      installCommand: 'Add-AppxPackage old.msix',
+      uninstallCommand: 'MSIX_UNINSTALL:Claude',
+      installScope: 'user',
+      detectionRules: [staleMsixDetection],
+      psadtConfig: { ...DEFAULT_PSADT_CONFIG, detectionRules: [staleMsixDetection] },
+    };
+    const policy = makePolicy(storedConfig);
+    policy.original_upload_history_id = 'prior-upload';
+    policy.consecutive_failures = 0;
+
+    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
+      .mockResolvedValue({ id: 'history-claude' } as never);
+    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
+      .mockResolvedValue({ id: 'job-claude' } as never);
+    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+
+    const result = await trigger.triggerAutoUpdate(policy, {
+      ...UPDATE_INFO,
+      wingetId: 'Anthropic.Claude',
+      latestVersion: '1.30096.1',
+      installerType: 'exe',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Claude',
+      detectionRules: [currentExeDetection],
+      nestedInstallerType: undefined,
+      nestedInstallerPath: undefined,
+    }, { skipRateLimits: true });
+
+    expect(result).toMatchObject({ success: true, packagingJobId: 'job-claude' });
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        uninstallCommand: 'REGISTRY_UNINSTALL:Claude',
+        detectionRules: JSON.stringify([currentExeDetection]),
+      })
+    );
+    const effectivePolicy = createPackagingJobSpy.mock.calls[0][0] as AppUpdatePolicy;
+    expect((effectivePolicy.deployment_config as DeploymentConfig)).toMatchObject({
+      uninstallCommand: 'REGISTRY_UNINSTALL:Claude',
+      detectionRules: [currentExeDetection],
+    });
+    expect(storedConfig.uninstallCommand).toBe('MSIX_UNINSTALL:Claude');
+    expect(storedConfig.detectionRules).toEqual([staleMsixDetection]);
   });
 
   it('uses a reviewed user scope for both auto-update QA and the packaging job', async () => {
@@ -528,6 +605,55 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     }, { skipRateLimits: true });
 
     expect(result).toMatchObject({ success: true, packagingJobId: 'job-zalo' });
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ installScope: 'user' })
+    );
+    const effectivePolicy = createPackagingJobSpy.mock.calls[0][0] as AppUpdatePolicy;
+    expect((effectivePolicy.deployment_config as DeploymentConfig).installScope).toBe('user');
+    const effectiveUpdate = createPackagingJobSpy.mock.calls[0][1] as { installScope?: string };
+    expect(effectiveUpdate.installScope).toBe('user');
+    expect(storedConfig.installScope).toBe('machine');
+  });
+
+  it('uses Notesnook user scope for auto-update QA and packaging without mutating stored configuration', async () => {
+    const supabase = createSupabaseMock({});
+    const trigger = makeTrigger(supabase);
+    const storedConfig: DeploymentConfig = {
+      displayName: 'Notesnook',
+      publisher: 'Streetwriters',
+      architecture: 'x64',
+      installerType: 'nullsoft',
+      installCommand: 'notesnook_win_x64.exe /S',
+      uninstallCommand:
+        'REGISTRY_UNINSTALL_PRODUCT:{A05A6719-4910-5E6C-A2AA-9AF71CD1063B}:Notesnook',
+      installScope: 'machine',
+      detectionRules: [],
+      psadtConfig: DEFAULT_PSADT_CONFIG,
+    };
+    const policy = makePolicy(storedConfig);
+    policy.original_upload_history_id = 'prior-upload';
+    policy.consecutive_failures = 0;
+
+    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
+      .mockResolvedValue({ id: 'history-notesnook' } as never);
+    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
+      .mockResolvedValue({ id: 'job-notesnook' } as never);
+    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+
+    const result = await trigger.triggerAutoUpdate(policy, {
+      ...UPDATE_INFO,
+      wingetId: 'Streetwriters.Notesnook',
+      displayName: 'Notesnook',
+      installerType: 'nullsoft',
+      installScope: 'machine',
+    }, { skipRateLimits: true });
+
+    expect(result).toMatchObject({ success: true, packagingJobId: 'job-notesnook' });
     expect(ensureQaDemandMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ installScope: 'user' })

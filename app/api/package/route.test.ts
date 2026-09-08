@@ -20,6 +20,7 @@ const {
   getLiveInstallersMock,
   ensureQaDemandMock,
   getPackageEligibilityBlocksMock,
+  isSupabaseServerConfiguredMock,
 } = vi.hoisted(() => ({
   getUserSettingsMock: vi.fn(),
   getDatabaseMock: vi.fn(),
@@ -38,6 +39,7 @@ const {
   getLiveInstallersMock: vi.fn(),
   ensureQaDemandMock: vi.fn(),
   getPackageEligibilityBlocksMock: vi.fn(),
+  isSupabaseServerConfiguredMock: vi.fn(),
 }));
 
 vi.mock('@/lib/manifest-api', () => ({
@@ -94,6 +96,7 @@ vi.mock('@/lib/package-eligibility', async (importOriginal) => {
 vi.mock('@/lib/supabase', () => ({
   createServerClient: vi.fn(),
   isSupabaseConfigured: vi.fn(() => true),
+  isSupabaseServerConfigured: isSupabaseServerConfiguredMock,
 }));
 
 vi.mock('@/lib/msp/tenant-resolution', () => ({
@@ -141,6 +144,8 @@ function minutesAgo(minutes: number): string {
 describe('GET /api/package (userId listing)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.QA_MAINTENANCE_MODE;
+    delete process.env.QA_DEFERRED_CUSTOMER_UPLOADS_UNTIL;
     // The list path now authenticates and uses the token's userId.
     parseAccessTokenMock.mockResolvedValue({
       userId: 'user-1',
@@ -287,10 +292,13 @@ describe('POST /api/package (workflow dispatch)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.QA_MAINTENANCE_MODE;
+    delete process.env.QA_DEFERRED_CUSTOMER_UPLOADS_UNTIL;
     // Re-established per test because clearAllMocks() drops call history but
     // keeps implementations, so a test that flips this must not leak into the
     // next one.
     vi.mocked(isSupabaseConfigured).mockReturnValue(true);
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
     getDatabaseMock.mockReturnValue({
       jobs: {
         create: createMock,
@@ -329,6 +337,28 @@ describe('POST /api/package (workflow dispatch)', () => {
           type: 'exe',
           scope: 'user',
           silentArgs: '/S',
+        }];
+      }
+      if (wingetId === 'TeamSpeakSystems.TeamSpeakClient.Beta.6') {
+        return [{
+          architecture: 'x64',
+          url: 'https://example.com/teamspeak-client.msi',
+          sha256: 'A'.repeat(64),
+          type: 'wix',
+          scope: 'user',
+          silentArgs: '/qn /norestart ALLUSERS=1',
+          productCode: '{7BC5AB94-97F7-480C-A8A0-3D334A3A56DC}',
+        }];
+      }
+      if (wingetId === 'Igneus.SimpleHydraulicCalculator') {
+        return [{
+          architecture: 'x86',
+          url: 'https://example.com/shc2_setup.exe',
+          sha256: 'A'.repeat(64),
+          type: 'nullsoft',
+          scope: 'machine',
+          silentArgs: '/S',
+          productCode: 'Simple Hydraulic Calculator',
         }];
       }
       if (wingetId === 'Opera.Opera') {
@@ -370,6 +400,38 @@ describe('POST /api/package (workflow dispatch)', () => {
       },
     });
     getPackageEligibilityBlocksMock.mockResolvedValue([]);
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
+  });
+
+  it('creates a queued local-packager job without Supabase or QA', async () => {
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    ensureQaDemandMock.mockResolvedValue({
+      state: 'waiting',
+      candidateId: 'candidate-1',
+      identity: {
+        executionProfileSha256: 'A'.repeat(64),
+        packageProfileSha256: 'A'.repeat(64),
+        presentationProfileSha256: 'B'.repeat(64),
+      },
+    });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(getPackageEligibilityBlocksMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
   it('blocks a retired catalog app before QA or customer packaging begins', async () => {
@@ -396,7 +458,7 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(response.status).toBe(409);
     expect(body).toMatchObject({
       error: 'App unavailable',
-      message: 'This app is no longer available for deployment.',
+      message: 'This app is not available for automated deployment.',
       code: 'PACKAGE_UNAVAILABLE',
       package: { wingetId: 'Autodesk.DesktopApp' },
     });
@@ -404,6 +466,102 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(ensureQaDemandMock).not.toHaveBeenCalled();
     expect(createMock).not.toHaveBeenCalled();
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('preflights Blender through its official mirror while preserving manifest identity', async () => {
+    const manifestUrl =
+      'https://download.blender.org/release/Blender4.2/blender-4.2.16-windows-x64.msi';
+    const mirrorUrl =
+      'https://mirror.blender.org/release/Blender4.2/blender-4.2.16-windows-x64.msi';
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: manifestUrl,
+      sha256: 'A'.repeat(64),
+      type: 'wix',
+      scope: 'machine',
+      silentArgs: '',
+      productCode: '{3CA82049-A4E1-4EFC-B529-4ED32AEF3F4F}',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'BlenderFoundation.Blender.LTS.4.2',
+          displayName: 'Blender 4.2 LTS',
+          version: '4.2.16',
+          installerType: 'wix',
+          installerUrl: manifestUrl,
+          installerSha256: 'A'.repeat(64),
+          installCommand: '',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'BlenderFoundation.Blender.LTS.4.2',
+        installerUrl: mirrorUrl,
+        manifestInstallerUrl: manifestUrl,
+        installerSha256: 'A'.repeat(64),
+      }),
+      expect.any(Array),
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledOnce();
+  });
+
+  it('preflights ImageGlass through its renamed official asset while preserving manifest identity', async () => {
+    const manifestUrl =
+      'https://github.com/d2phap/ImageGlass/releases/download/10.0.4.819/ImageGlass_10.0.4.819_win-x64.msi';
+    const releaseAssetUrl =
+      'https://github.com/d2phap/ImageGlass/releases/download/10.0.4.819/ImageGlass_10.0.4.819_win-x64_pro-business.msi';
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: manifestUrl,
+      sha256: 'D'.repeat(64),
+      type: 'wix',
+      scope: 'machine',
+      silentArgs: 'ALLUSERS=1',
+      productCode: '{6D0C2C70-3535-5F89-AC42-194E255ED60E}',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'DuongDieuPhap.ImageGlass',
+          displayName: 'ImageGlass',
+          version: '10.0.4.819',
+          installerType: 'wix',
+          installerUrl: manifestUrl,
+          installerSha256: 'D'.repeat(64),
+          installCommand: 'ALLUSERS=1',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'DuongDieuPhap.ImageGlass',
+        installerUrl: releaseAssetUrl,
+        manifestInstallerUrl: manifestUrl,
+        installerSha256: 'D'.repeat(64),
+      }),
+      expect.any(Array),
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledOnce();
   });
 
   it('does not apply catalog retirement policy to a custom package', async () => {
@@ -459,6 +617,7 @@ describe('POST /api/package (workflow dispatch)', () => {
     // Not `Once`: the route asks several times (tenant resolution, the
     // retirement blocklist, QA gating) and all of them must see it unset.
     vi.mocked(isSupabaseConfigured).mockReturnValue(false);
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
 
     const request = new NextRequest('http://localhost:3000/api/package', {
       method: 'POST',
@@ -540,6 +699,337 @@ describe('POST /api/package (workflow dispatch)', () => {
     );
   });
 
+  it('uses Notesnook user scope consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://github.com/streetwriters/notesnook/releases/download/v3.4.5/notesnook_win_x64.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+      productCode: 'a05a6719-4910-5e6c-a2aa-9af71cd1063b',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'Streetwriters.Notesnook',
+          displayName: 'Notesnook',
+          version: '3.4.5',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'Streetwriters.Notesnook',
+        installScope: 'user',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'user' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'user' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'Streetwriters.Notesnook',
+        installScope: 'user',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('uses Ente Photos user scope consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://example.com/setup.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+      productCode: 'fb682768-51c6-5397-92da-171dc1777808',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'ente-io.photos-desktop',
+          displayName: 'Ente Photos',
+          version: '1.7.27',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'ente-io.photos-desktop',
+        installScope: 'user',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'user' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'user' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'ente-io.photos-desktop',
+        installScope: 'user',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('uses Arvis user scope consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://example.com/arvis-setup.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'jopemachine.Arvis',
+          displayName: 'Arvis',
+          version: '0.14.6',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'jopemachine.Arvis',
+        installScope: 'user',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'user' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'user' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'jopemachine.Arvis',
+        installScope: 'user',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('uses zyfun all-users mode consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://example.com/zyfun-setup.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+      productCode: '1cf4e394-3cb1-57f9-a0e2-d9add46ad139',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'HiramWong.zyfun',
+          displayName: 'zyfun',
+          version: '3.4.7',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'HiramWong.zyfun',
+        installScope: 'machine',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'machine' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'machine' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'HiramWong.zyfun',
+        installScope: 'machine',
+        silentSwitches: '/S',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+    const expectedAdapter = { reviewedInstallArguments: ['/allusers'] };
+    expect(
+      JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)
+    ).toMatchObject(expectedAdapter);
+    expect(
+      JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)
+    ).toMatchObject(expectedAdapter);
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      psadtConfig: expectedAdapter,
+    });
+  });
+
+  it('uses TeamSpeak 6 Beta all-users MSI scope for QA and customer packaging', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'TeamSpeakSystems.TeamSpeakClient.Beta.6',
+          displayName: 'TeamSpeak 6 Beta',
+          version: '6.0.0-beta4.1',
+          installerType: 'wix',
+          installerUrl: 'https://example.com/teamspeak-client.msi',
+          installerSha256: 'A'.repeat(64),
+          installScope: 'user',
+          installCommand:
+            'msiexec /i "teamspeak-client.msi" /qn /norestart ALLUSERS=1',
+          uninstallCommand:
+            'msiexec /x "{7BC5AB94-97F7-480C-A8A0-3D334A3A56DC}" /qn /norestart',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({ installScope: 'machine' }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({
+        installScope: 'machine',
+        silentSwitches: '/qn /norestart ALLUSERS=1',
+      })
+    );
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      install_scope: 'machine',
+      install_command:
+        'msiexec /i "teamspeak-client.msi" /qn /norestart ALLUSERS=1',
+    }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        installScope: 'machine',
+        silentSwitches: '/qn /norestart ALLUSERS=1',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('applies the Simple Hydraulic Calculator NSIS removal to QA and customer packaging', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'Igneus.SimpleHydraulicCalculator',
+          displayName: 'Simple Hydraulic Calculator',
+          publisher: 'Igneus',
+          version: '2.3.9',
+          architecture: 'x86',
+          installerType: 'nullsoft',
+          installerUrl: 'https://example.com/shc2_setup.exe',
+          installCommand: 'shc2_setup.exe /S',
+          uninstallCommand:
+            'REGISTRY_UNINSTALL_KEY:Simple Hydraulic Calculator:Simple Hydraulic Calculator',
+          psadtConfig: { ...DEFAULT_PSADT_CONFIG },
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    const expectedAdapter = {
+      reviewedExactUninstall: {
+        executablePath:
+          '%ProgramFiles(x86)%\\Igneus\\SHC\\shc2uninstall.exe',
+        arguments: ['/S _?=%ProgramFiles(x86)%\\Igneus\\SHC'],
+        completionTimeoutMinutes: 5,
+      },
+      reviewedUninstallWindowAutomation: {
+        processName: 'shc2uninstall.exe',
+        steps: [
+          {
+            windowText: 'Simple Hydraulic Calculator',
+            buttonIndex: 1,
+            timeoutSeconds: 60,
+          },
+        ],
+      },
+    };
+    expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)).toMatchObject(
+      expectedAdapter
+    );
+    expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)).toMatchObject(
+      expectedAdapter
+    );
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      psadtConfig: expectedAdapter,
+    });
+  });
+
   it('rebuilds machine-scope commands before both QA and customer packaging', async () => {
     const request = new NextRequest('http://localhost:3000/api/package', {
       method: 'POST',
@@ -582,7 +1072,16 @@ describe('POST /api/package (workflow dispatch)', () => {
     );
   });
 
-  it('uses the reviewed app adapter for both QA and customer packaging', async () => {
+  it('passes trusted vendor MSI properties to both QA and customer packaging', async () => {
+    const installerUrl = 'https://downloads.example.com/Macabacus-9.9.2.msi';
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: installerUrl,
+      sha256: 'A'.repeat(64),
+      type: 'wix',
+      silentArgs: '/qn /norestart OFFICE2016X64FOUND=1 EULA=1',
+      productCode: '{0B0CCAB5-2957-4FB4-9F55-EAEE1A613023}',
+    }]);
     const request = new NextRequest('http://localhost:3000/api/package', {
       method: 'POST',
       headers: {
@@ -591,9 +1090,16 @@ describe('POST /api/package (workflow dispatch)', () => {
       },
       body: JSON.stringify({
         items: [makeWin32Item({
-          wingetId: 'Elgato.StreamDeck',
-          displayName: 'Elgato Stream Deck',
-          psadtConfig: { ...DEFAULT_PSADT_CONFIG, processesToClose: [] },
+          wingetId: 'Macabacus.Macabacus',
+          displayName: 'Macabacus',
+          version: '9.9.2',
+          installerType: 'wix',
+          installerUrl,
+          installerSha256: 'A'.repeat(64),
+          installScope: 'machine',
+          installCommand: 'msiexec /i "Macabacus-9.9.2.msi" /qn ALLUSERS=1 /norestart',
+          uninstallCommand:
+            'msiexec /x "{0B0CCAB5-2957-4FB4-9F55-EAEE1A613023}" /qn /norestart',
         })],
       }),
     });
@@ -601,18 +1107,21 @@ describe('POST /api/package (workflow dispatch)', () => {
     const response = await POST(request);
 
     expect(response.status).toBe(200);
-    const expectedProcesses = [
-      { name: 'StreamDeck', description: 'Elgato Stream Deck' },
-    ];
-    expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)).toMatchObject({
-      processesToClose: expectedProcesses,
-    });
-    expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)).toMatchObject({
-      processesToClose: expectedProcesses,
-    });
-    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
-      psadtConfig: { processesToClose: expectedProcesses },
-    });
+    const expectedSilentSwitches =
+      '/qn /norestart OFFICE2016X64FOUND=1 EULA=1 ALLUSERS=1';
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ silentSwitches: expectedSilentSwitches })
+    );
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      install_command:
+        'msiexec /i "Macabacus-9.9.2.msi" /qn /norestart OFFICE2016X64FOUND=1 EULA=1 ALLUSERS=1',
+    }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({ silentSwitches: expectedSilentSwitches }),
+      undefined,
+      expect.any(Object)
+    );
   });
 
   it('applies the reviewed Opera immediate-uninstall contract to QA and customer packaging', async () => {
@@ -636,7 +1145,107 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(response.status).toBe(200);
     const expectedAdapter = {
       processesToClose: [{ name: 'opera', description: 'Opera browser' }],
-      reviewedUninstallArguments: ['--runimmediately'],
+      reviewedExactUninstall: {
+        executablePath: '%ProgramFiles%\\Opera\\opera.exe',
+        arguments: ['--uninstall', '--runimmediately', '--deleteuserprofile=0'],
+        completionTimeoutMinutes: 5,
+      },
+    };
+    expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)).toMatchObject(
+      expectedAdapter
+    );
+    expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)).toMatchObject(
+      expectedAdapter
+    );
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      psadtConfig: expectedAdapter,
+    });
+  });
+
+  it('applies the reviewed Teradata archive uninstall to QA and customer packaging', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'Teradata.TTUOdbc',
+          displayName: 'Teradata ODBC Driver',
+          installerType: 'zip',
+          installerUrl: 'https://example.com/TeradataODBC.zip',
+          installCommand: 'TeradataODBC\\TTUSuiteSilent.exe /silent',
+          uninstallCommand:
+            'REGISTRY_UNINSTALL_PRODUCT:{F075B63A-C629-41F8-BA56-33D9940F2000}:Teradata ODBC Driver',
+          nestedInstallerType: 'exe',
+          nestedInstallerPath: 'TeradataODBC\\TTUSuiteSilent.exe',
+          psadtConfig: { ...DEFAULT_PSADT_CONFIG },
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    const expectedContract = {
+      reviewedArchiveUninstall: {
+        relativePath: 'TeradataODBC\\silent_uninstall.bat',
+        arguments: ['ALL'],
+        completionTimeoutMinutes: 15,
+      },
+    };
+    expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)).toMatchObject(
+      expectedContract
+    );
+    expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)).toMatchObject(
+      expectedContract
+    );
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      psadtConfig: expectedContract,
+    });
+  });
+
+  it('adds a usable Build Tools workload to QA and customer packaging', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'Microsoft.VisualStudio.BuildTools',
+          displayName: 'Visual Studio BuildTools 2026',
+          version: '18.9.1',
+          psadtConfig: { ...DEFAULT_PSADT_CONFIG },
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    const expectedAdapter = {
+      reviewedInstallArguments: [
+        '--installPath "%ProgramFiles%\\Microsoft Visual Studio\\18\\BuildTools"',
+        '--add Microsoft.VisualStudio.Workload.MSBuildTools',
+        '--norestart',
+      ],
+      reviewedManagedInstallDirectory:
+        '%ProgramFiles%\\Microsoft Visual Studio\\18\\BuildTools',
+      reviewedManagedUninstall: {
+        executablePath:
+          '%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\setup.exe',
+        arguments: [
+          'uninstall',
+          '--installPath',
+          '%ProgramFiles%\\Microsoft Visual Studio\\18\\BuildTools',
+          '--quiet',
+          '--norestart',
+        ],
+        completionTimeoutMinutes: 15,
+      },
     };
     expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].psadtConfig)).toMatchObject(
       expectedAdapter
@@ -684,6 +1293,109 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig)).toMatchObject({
       detectionRules: [expectedRule],
     });
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      detectionRules: [expectedRule],
+      psadtConfig: { detectionRules: [expectedRule] },
+    });
+  });
+
+  it('restores a saved custom marker root for both QA and customer packaging', async () => {
+    const savedRule = {
+      type: 'registry',
+      keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\HBX\\InstalledApps\\8x8_Work',
+      valueName: 'Version',
+      check32BitOn64System: false,
+      detectionType: 'version',
+      operator: 'greaterThanOrEqual',
+      detectionValue: '8.36.2',
+    };
+    // The marker root is what this test is about. The operator comes back as
+    // 'equal' because managed marker rules are reconciled to detect their own
+    // version only - a profile saved before that change still identifies as
+    // ours, which is how the custom root is recovered at all.
+    const reconciledRule = { ...savedRule, operator: 'equal' };
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: '8x8.Work',
+          displayName: '8x8 Work',
+          version: '8.36.2',
+          installerType: 'msi',
+          detectionRules: [savedRule],
+          psadtConfig: { ...DEFAULT_PSADT_CONFIG, detectionRules: [savedRule] },
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    for (const serializedConfig of [
+      ensureQaDemandMock.mock.calls[0][1].psadtConfig,
+      triggerPackagingWorkflowMock.mock.calls[0][0].psadtConfig,
+    ]) {
+      expect(JSON.parse(serializedConfig)).toMatchObject({
+        registryMarkerPath: 'SOFTWARE\\HBX\\InstalledApps',
+        detectionRules: [reconciledRule],
+      });
+    }
+    expect(createMock.mock.calls[0][0].package_config).toMatchObject({
+      detectionRules: [reconciledRule],
+      psadtConfig: {
+        registryMarkerPath: 'SOFTWARE\\HBX\\InstalledApps',
+        detectionRules: [reconciledRule],
+      },
+    });
+  });
+
+  it('repairs stale generated MSIX detection before both QA and customer MSI packaging', async () => {
+    const staleMsixRule = {
+      type: 'script',
+      scriptContent: [
+        '# MSIX Detection Script',
+        '# Package Family Name: Agilebits.1Password_amwd9z03whsfe',
+        'exit 0',
+      ].join('\n'),
+      enforceSignatureCheck: false,
+      runAs32Bit: false,
+    };
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'AgileBits.1Password',
+          displayName: '1Password',
+          version: '8.12.30.21',
+          installerType: 'msi',
+          detectionRules: [staleMsixRule],
+          psadtConfig: { ...DEFAULT_PSADT_CONFIG, detectionRules: [staleMsixRule] },
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    const expectedRule = expect.objectContaining({
+      type: 'registry',
+      keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\AgileBits_1Password',
+      detectionValue: '8.12.30.21',
+    });
+    expect(JSON.parse(ensureQaDemandMock.mock.calls[0][1].detectionRules)).toEqual([
+      expectedRule,
+    ]);
+    expect(JSON.parse(triggerPackagingWorkflowMock.mock.calls[0][0].detectionRules)).toEqual([
+      expectedRule,
+    ]);
     expect(createMock.mock.calls[0][0].package_config).toMatchObject({
       detectionRules: [expectedRule],
       psadtConfig: { detectionRules: [expectedRule] },
@@ -819,6 +1531,71 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
+  it('dispatches a customer upload while its QA lifecycle remains durably queued during a bounded continuity window', async () => {
+    process.env.QA_DEFERRED_CUSTOMER_UPLOADS_UNTIL = new Date(
+      Date.now() + 7 * 24 * 60 * 60 * 1000
+    ).toISOString();
+    ensureQaDemandMock.mockResolvedValueOnce({
+      state: 'waiting',
+      candidateId: 'candidate-deferred-1',
+      identity: {
+        executionProfileSha256: 'A'.repeat(64),
+        packageProfileSha256: 'A'.repeat(64),
+        presentationProfileSha256: 'B'.repeat(64),
+      },
+    });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const response = await POST(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.jobs[0]).toMatchObject({ status: 'packaging' });
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'queued',
+      status_message: 'Preparing deployment while installation validation remains scheduled',
+      qa_candidate_id: 'candidate-deferred-1',
+      qa_completed_at: null,
+    }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips QA demand entirely and authorizes customer dispatch during manual maintenance', async () => {
+    process.env.QA_MAINTENANCE_MODE = 'true';
+
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const response = await POST(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.jobs[0]).toMatchObject({ status: 'packaging' });
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'queued',
+      status_message: null,
+      qa_candidate_id: null,
+      qa_completed_at: null,
+    }));
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock.mock.calls[0][0]).toMatchObject({ qaOverride: true });
+  });
+
   it('calculates the hash in the workflow for a custom app without a supplied SHA256', async () => {
     const request = new NextRequest('http://localhost:3000/api/package', {
       method: 'POST',
@@ -841,6 +1618,31 @@ describe('POST /api/package (workflow dispatch)', () => {
         hashValidationMode: 'calculate',
       })
     );
+  });
+
+  it('rejects a custom plain EXE without silent switches before creating a job', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          sourceType: 'custom',
+          installerSha256: '',
+          installCommand: 'setup.exe',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body).toMatchObject({ code: 'SILENT_INSTALL_UNAVAILABLE' });
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
   it('treats a whitespace-only custom-app SHA256 as missing', async () => {
@@ -955,6 +1757,9 @@ describe('POST /api/package (workflow dispatch)', () => {
   });
 
   it('creates an actionable blocked job for a failed execution profile', async () => {
+    process.env.QA_DEFERRED_CUSTOMER_UPLOADS_UNTIL = new Date(
+      Date.now() + 7 * 24 * 60 * 60 * 1000
+    ).toISOString();
     ensureQaDemandMock.mockResolvedValueOnce({
       state: 'failed',
       candidateId: 'candidate-1',

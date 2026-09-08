@@ -9,6 +9,12 @@ type ScriptGenerator = {
   getInstallCommand(job: PackagingJob, fileName: string, silentSwitches: string): string;
   getUninstallCommand(job: PackagingJob, fileName: string): string;
   getPostInstallVerificationBlock(job: PackagingJob, escapedAppName: string): string;
+  extractMsiProperties(silentSwitches: string): string;
+  extractSilentSwitches(
+    installCommand: string,
+    installerType: string,
+    nestedInstallerType?: string
+  ): string;
 };
 
 const generator = JobProcessor.prototype as unknown as ScriptGenerator;
@@ -52,6 +58,55 @@ function uninstallScript(job: PackagingJob): string {
 }
 
 describe('nested portable PSADT generation', () => {
+  it('strips complete MSI UI tokens without leaking quiet suffix fragments', () => {
+    expect(
+      generator.extractMsiProperties.call(
+        generator,
+        '/quiet /norestart IACCEPTMSODBCSQLLICENSETERMS=YES ALLUSERS=1'
+      )
+    ).toBe('IACCEPTMSODBCSQLLICENSETERMS=YES ALLUSERS=1');
+  });
+
+  it('safely stages a top-level portable zip payload', () => {
+    const script = installScript(packagingJob({
+      installer_type: 'portable',
+      package_config: {},
+    }));
+
+    expect(script).toContain('[System.IO.Compression.ZipFile]::OpenRead($archivePath)');
+    expect(script).toContain('Move-Item -LiteralPath $portableStageDir -Destination $installPath');
+    expect(script).not.toContain('Zip package does not declare');
+  });
+
+  it('treats a zip without nested metadata as a portable archive', () => {
+    const job = packagingJob({ package_config: {} });
+    const script = installScript(job);
+
+    expect(script).toContain('[System.IO.Compression.ZipFile]::OpenRead($archivePath)');
+    expect(script).toContain('Move-Item -LiteralPath $portableStageDir -Destination $installPath');
+    expect(script).not.toContain('$declaredNestedPath');
+    expect(uninstallScript(job)).toContain('Remove-Item -LiteralPath $installPath -Recurse -Force');
+  });
+
+  it.each([
+    ['Expand-Archive -Path "app.zip" -DestinationPath app -Force', 'zip', 'inno', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'],
+    ['powershell.exe -Command Expand-Archive -Path app.zip -DestinationPath app', 'zip', 'inno', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'],
+    ['"setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-', 'zip', 'inno', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'],
+    ['"setup.exe" /configure https://aka.ms/fhlwingetconfig', 'exe', undefined, '/configure https://aka.ms/fhlwingetconfig'],
+    ['msiexec.exe /i "agent.msi" /qn REBOOT=ReallySuppress ALLUSERS=1', 'msi', undefined, '/qn REBOOT=ReallySuppress ALLUSERS=1'],
+    ['Expand-Archive -Path "app.zip" -DestinationPath app -Force', 'zip', undefined, ''],
+    ['Expand-Archive -Path "app.zip" -DestinationPath app -Force', 'portable', undefined, ''],
+  ])('extracts local silent switches without archive arguments', (command, type, nestedType, expected) => {
+    expect(generator.extractSilentSwitches.call(generator, command, type, nestedType)).toBe(expected);
+  });
+
+  it('does not emit PowerShell archive tokens into a generated argument list', () => {
+    const script = generator.generateDeployScript.call(generator, packagingJob({
+      install_command: 'powershell.exe -Command Expand-Archive -Path app.zip -DestinationPath app',
+    }), 'piicrawler.zip');
+
+    expect(script).not.toMatch(/-ArgumentList '[^']*(?:-Command|-Archive)/);
+  });
   it('preserves manifest-declared installer success exit codes', () => {
     const script = generator.generateDeployScript.call(generator, packagingJob({
       package_config: {
@@ -274,10 +329,13 @@ describe('hosted PSADT portable generator', () => {
     const script = readFileSync(scriptPath, 'utf8');
 
     expect(script).toContain("$isNestedPortable = $installerTypeLower -eq 'zip'");
-    expect(script).toContain("if ($installerTypeLower -eq 'portable' -or $isNestedPortable)");
+    expect(script).toContain("if ($installerTypeLower -eq 'portable' -or $isNestedPortable -or $isPlainPortableArchive)");
     expect(script).toContain('[System.IO.Compression.ZipFile]::OpenRead($installerPath)');
     expect(script).toContain('Archive entry escapes the portable staging directory');
     expect(script).not.toContain('Portable nested installers are not supported yet');
+    expect(script).not.toContain('Zip package does not declare a nested installer');
+    expect(script).toContain('if ($isNestedPortable -or $isPlainPortableArchive)');
+    expect(script).toContain('Move-Item -LiteralPath $portableStageDir -Destination $installPath');
   });
 
   it('uses the non-admin PSADT log setting for user-scope packages', () => {
@@ -358,7 +416,7 @@ describe('Burn bundle PSADT generation', () => {
     );
     expect(script).toContain("Join-Path $adtSession.DirFiles 'python-3.14.7-amd64.exe'");
     expect(script).toContain(
-      '$registeredUninstallFile = [string]$registeredApplication."$($registeredUninstallProperty)FilePath"'
+      '$registeredUninstallFile = if ($registeredUninstallProperty) { [string]$registeredApplication."$($registeredUninstallProperty)FilePath" } else {'
     );
     expect(script).toContain('$burnUninstaller = $registeredUninstallFile');
     expect(script).toContain('$burnUninstaller = $bundledUninstaller');
@@ -374,7 +432,13 @@ describe('Burn bundle PSADT generation', () => {
     expect(script).toContain('$uninstallHandle = Start-ADTProcess @uninstallProcessParameters');
     expect(script).toContain('The Burn uninstall parent process exited with code');
     expect(script).toContain('foreach ($verificationAttempt in 1..5)');
-    expect(script).not.toContain("Start-ADTMsiProcess -Action 'Uninstall'");
+    expect(script).toContain("$registeredUninstallLeaf -in @('msiexec', 'msiexec.exe')");
+    expect(script).toContain(
+      "Start-ADTMsiProcess -Action 'Uninstall' -ProductCode $capturedMsiProductCode"
+    );
+    expect(script.indexOf('$registeredUninstallLeaf =')).toBeLessThan(
+      script.indexOf('$capturedMsiProductCode =')
+    );
   });
 
   it('narrows duplicate bundle and chained-MSI display names to the bundle entry', () => {
@@ -392,7 +456,7 @@ describe('Burn bundle PSADT generation', () => {
     );
 
     expect(verification).toContain(
-      "if ($selectedApplications.Count -gt 1 -and 'burn' -eq 'burn')"
+      "if ($selectedApplications.Count -gt 1 -and 'burn' -in @('burn', 'exe'))"
     );
     expect(verification).toContain(
       '$bundleCandidates = @($selectedApplications | Where-Object {'
@@ -403,7 +467,71 @@ describe('Burn bundle PSADT generation', () => {
     );
   });
 
-  it('keeps Burn-only duplicate-entry narrowing disabled for non-Burn packages', () => {
+  it('uses nested EXE behavior for archived wrapper packages', () => {
+    const job = packagingJob({
+      installer_type: 'zip',
+      uninstall_command: 'REGISTRY_UNINSTALL:Microsoft FSLogix Apps',
+      package_config: {
+        nestedInstallerType: 'exe',
+        nestedInstallerPath: 'x64/Release/FSLogixAppsSetup.exe',
+        psadtConfig: {},
+      },
+    });
+
+    const verification = generator.getPostInstallVerificationBlock.call(
+      generator,
+      job,
+      'FSLogix'
+    );
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      job,
+      'FSLogix.zip'
+    );
+
+    expect(verification).toContain(
+      "$selectedApplications.Count -gt 1 -and 'exe' -in @('burn', 'exe')"
+    );
+    expect(uninstall).toContain(
+      "$installedApps.Count -gt 1 -and 'exe' -in @('burn', 'exe')"
+    );
+  });
+
+  it('keeps a reviewed nested EXE installer observable within its bounded wait', () => {
+    const script = generator.getInstallCommand.call(
+      generator,
+      packagingJob({
+        winget_id: 'Flashforge.FlashPrint',
+        installer_type: 'zip',
+        install_command:
+          'FlashPrint.exe /exenoui /qb! REBOOT=ReallySuppress',
+        package_config: {
+          nestedInstallerType: 'exe',
+          nestedInstallerPath: 'FlashPrint 5_5.8.3_x64.exe',
+          psadtConfig: {
+            reviewedInstallCompletionTimeoutMinutes: 15,
+          },
+        },
+      }),
+      'FlashPrint.zip',
+      '/exenoui /qb! REBOOT=ReallySuppress'
+    );
+
+    expect(script).toContain(
+      '$installDeadline = [DateTime]::UtcNow.AddMinutes(15)'
+    );
+    expect(script).toContain(
+      'Start-ADTProcess -FilePath $nestedInstallerPath -ArgumentList \'/exenoui /qb! REBOOT=ReallySuppress\' -WindowStyle Hidden -WaitForMsiExec -NoWait -PassThru'
+    );
+    expect(script).toContain(
+      'The reviewed nested vendor installer is still working.'
+    );
+    expect(script).toContain(
+      '$installProcessExitCode = $installHandle.Task.GetAwaiter().GetResult().ExitCode'
+    );
+  });
+
+  it('keeps executable-wrapper duplicate-entry narrowing disabled for native framework packages', () => {
     const job = packagingJob({
       installer_type: 'inno',
       uninstall_command: 'REGISTRY_UNINSTALL:Example App',
@@ -415,14 +543,56 @@ describe('Burn bundle PSADT generation', () => {
       'Example App'
     );
 
-    expect(verification).toContain("$selectedApplications.Count -gt 1 -and 'inno' -eq 'burn'");
+    expect(verification).toContain(
+      "$selectedApplications.Count -gt 1 -and 'inno' -in @('burn', 'exe')"
+    );
     expect(verification).not.toContain(
-      "$selectedApplications.Count -gt 1 -and 'inno' -eq 'inno'"
+      "$selectedApplications.Count -gt 1 -and 'inno' -in @('inno')"
     );
   });
 });
 
 describe('EXE product identity PSADT generation', () => {
+  it('uses a reviewed exact non-MSI registry key for install capture and removal', () => {
+    const job = packagingJob({
+      winget_id: 'CodecGuide.K-LiteCodecPack.Full',
+      display_name: 'K-Lite Codec Pack Full',
+      installer_type: 'inno',
+      uninstall_command:
+        'REGISTRY_UNINSTALL_KEY:KLiteCodecPack_is1:K-Lite Codec Pack Full',
+    });
+
+    const snapshot = generator.getRegistryInstallSnapshotBlock.call(
+      generator,
+      job,
+      'K-Lite Codec Pack Full'
+    );
+    const verification = generator.getPostInstallVerificationBlock.call(
+      generator,
+      job,
+      'K-Lite Codec Pack Full'
+    );
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      job,
+      'klcp_full.exe'
+    );
+
+    expect(snapshot).toContain(
+      "$configuredUninstallProductCode = 'KLiteCodecPack_is1'"
+    );
+    expect(verification).toContain(
+      '[string]$_.PSChildName -eq $configuredUninstallProductCode'
+    );
+    expect(uninstall).toContain(
+      "$configuredProductCode = 'KLiteCodecPack_is1'"
+    );
+    expect(uninstall).toContain(
+      '$_.PSChildName -eq $configuredProductCode'
+    );
+    expect(uninstall).toContain("'inno' -eq 'inno'");
+  });
+
   it('captures MSI identity when Winget leaves a PRODUCT_CODE placeholder', () => {
     const job = packagingJob({
       winget_id: 'Yealink.YealinkUSBConnect',
@@ -486,6 +656,37 @@ describe('EXE product identity PSADT generation', () => {
     expect(verification.indexOf('$publisherAgnosticMatches')).toBeLessThan(
       verification.indexOf('$bundleCandidates')
     );
+  });
+
+  it('matches and removes one registry identity with the exact package-version suffix', () => {
+    const job = packagingJob({
+      winget_id: 'IPEVO.VisualizerLTSE',
+      display_name: 'Visualizer LTSE',
+      version: '1.2.73.0',
+      installer_type: 'exe',
+      uninstall_command: 'REGISTRY_UNINSTALL:Visualizer LTSE',
+    });
+    const verification = generator.getPostInstallVerificationBlock.call(
+      generator,
+      job,
+      'Visualizer LTSE'
+    );
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      job,
+      'visualizer.exe'
+    );
+
+    expect(verification).toContain('$configuredUninstallVersionedName = if (');
+    expect(verification).toContain('$versionSuffixedMatches = @($changedApplications');
+    expect(verification).toContain(
+      '[string]$_.DisplayVersion -eq $configuredUninstallVersion'
+    );
+    expect(uninstall).toContain('$configuredVersionedDisplayName = if (');
+    expect(uninstall).toContain(
+      "Get-ADTApplication -Name $configuredVersionedDisplayName -NameMatch 'Exact'"
+    );
+    expect(uninstall).toContain('[string]$_.DisplayVersion -eq $configuredVersion');
   });
 
   it('matches one localized registry identity without accepting helper entries', () => {
@@ -576,6 +777,35 @@ describe('EXE product identity PSADT generation', () => {
     expect(deployScript).toContain('Close-ADTSession -ExitCode $script:UninstallRebootExitCode');
   });
 
+  it('resolves only bounded inbox PowerShell -File uninstall registrations', () => {
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      packagingJob({
+        display_name: 'Namma Agent',
+        installer_type: 'exe',
+        uninstall_command: 'REGISTRY_UNINSTALL:Namma Agent',
+      }),
+      'namma-agent.exe'
+    );
+
+    expect(uninstall).toContain(
+      "$isRegisteredPowerShellHost = $registeredUninstallLeaf -in @('powershell', 'powershell.exe')"
+    );
+    expect(uninstall).toContain('$powerShellFileSwitchIndexes.Count -ne 1');
+    expect(uninstall).toContain('[string]$registeredApplication.InstallLocation');
+    expect(uninstall).toContain('[Uri]::TryCreate($registeredPowerShellScript');
+    expect(uninstall).toContain('$registeredPowerShellScriptUri.IsFile');
+    expect(uninstall).toContain('[StringComparison]::OrdinalIgnoreCase');
+    expect(uninstall).toContain(
+      "$registeredUninstallFile = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'"
+    );
+    expect(uninstall).toContain(
+      'The registered PowerShell uninstall command contains an unsupported host switch'
+    );
+    expect(uninstall).not.toContain('Get-Command powershell');
+    expect(uninstall).not.toContain('[IO.Path]::IsPathFullyQualified');
+  });
+
   it('emits apostrophe-safe registry identity strings', () => {
     const job = packagingJob({
       display_name: "Contoso O'Brien Agent",
@@ -647,6 +877,31 @@ describe('EXE product identity PSADT generation', () => {
     expect(uninstall).not.toContain("'zip' -eq 'inno'");
   });
 
+  it('uses the vendor-specific CutePDF silent uninstaller instead of Inno switches', () => {
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      packagingJob({
+        installer_type: 'zip',
+        install_command: 'CuteWriter.zip /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+        uninstall_command: 'REGISTRY_UNINSTALL:CutePDF Writer',
+        package_config: {
+          nestedInstallerType: 'inno',
+          nestedInstallerPath: 'CuteWriter.exe',
+          psadtConfig: {},
+        },
+      }),
+      'CuteWriter.zip'
+    );
+
+    expect(uninstall).toContain("$registeredUninstallRegistryKey -ieq 'CutePDF Writer Installation'");
+    expect(uninstall).toContain("$registeredUninstallLeaf -in @('unInstcpw.exe', 'unInstcpw64.exe')");
+    expect(uninstall).toContain("$registeredUninstallArguments = @('/uninstall', '/s')");
+    expect(uninstall).toContain(
+      "if (-not $isCutePdfWriterUninstall -and (Split-Path -Leaf $registeredUninstallFile) -ine 'msiexec.exe'"
+    );
+    expect(uninstall).toContain('-not $isCutePdfWriterUninstall');
+  });
+
   it('appends only bounded reviewed arguments to the exact registered vendor uninstaller', () => {
     const uninstall = generator.getUninstallCommand.call(
       generator,
@@ -685,7 +940,7 @@ describe('EXE product identity PSADT generation', () => {
     )).toThrow('single-line');
   });
 
-  it('guards only the reviewed newly spawned MSI uninstall helper', () => {
+  it('guards only the reviewed recently created MSI uninstall helper', () => {
     const uninstall = generator.getUninstallCommand.call(
       generator,
       packagingJob({
@@ -698,6 +953,7 @@ describe('EXE product identity PSADT generation', () => {
               processName: 'Camera Hub.exe',
               argumentsPattern: '(?:^|\\s)--pre-uninstall(?:\\s|$).*--quit(?:\\s|$)',
               graceSeconds: 20,
+              creationLookbackSeconds: 300,
             },
           },
         },
@@ -710,6 +966,10 @@ describe('EXE product identity PSADT generation', () => {
       "$reviewedGuardArgumentsPattern = '(?:^|\\s)--pre-uninstall(?:\\s|$).*--quit(?:\\s|$)'"
     );
     expect(uninstall).toContain('$reviewedGuardGraceSeconds = 20');
+    expect(uninstall).toContain('$reviewedGuardCreationLookbackSeconds = 300');
+    expect(uninstall).toContain(
+      '[DateTime]::UtcNow.AddSeconds(-$reviewedGuardCreationLookbackSeconds)'
+    );
     expect(uninstall).toContain('$_.CreationDate.ToUniversalTime() -ge $StartedAt');
     expect(uninstall).toContain('$current.Name -ieq $ProcessName');
     expect(uninstall).toContain('Stop-Process -Id $current.ProcessId -Force');
@@ -736,6 +996,25 @@ describe('EXE product identity PSADT generation', () => {
       }),
       'example.msi'
     )).toThrow('executable leaf name');
+
+    expect(() => generator.getUninstallCommand.call(
+      generator,
+      packagingJob({
+        installer_type: 'msi',
+        uninstall_command: 'REGISTRY_UNINSTALL:Example',
+        package_config: {
+          psadtConfig: {
+            reviewedUninstallProcessGuard: {
+              processName: 'helper.exe',
+              argumentsPattern: '--quit',
+              graceSeconds: 20,
+              creationLookbackSeconds: 601,
+            },
+          },
+        },
+      }),
+      'example.msi'
+    )).toThrow('creationLookbackSeconds');
   });
 
   it('extends registry-aware completion only for a reviewed vendor profile', () => {
@@ -858,8 +1137,50 @@ describe('self-hosted MSIX PSADT generation', () => {
     );
 
     expect(install).toContain('Add-AppxProvisionedPackage -Online');
+    expect(install).toContain("Wait-Job -Job $provisioningJob -Timeout 30");
+    expect(install).toContain('MSIX/APPX provisioning is still in progress');
+    expect(install).toContain('Receive-Job -Job $provisioningJob -ErrorAction Stop');
     expect(uninstall).toContain('Get-AppxProvisionedPackage -Online');
     expect(uninstall).toContain('Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers');
+  });
+
+  it('uses the MSIX lifecycle for a ZIP-wrapped AppX payload', () => {
+    const job = packagingJob({
+      winget_id: 'Microsoft.DotNet.Native.Runtime',
+      display_name: 'Microsoft .NET Native Runtime',
+      version: '2.2.28604.0',
+      installer_type: 'zip',
+      installer_url: 'https://example.com/Dependencies.zip',
+      uninstall_command: 'MSIX_UNINSTALL:Microsoft.NET.Native.Runtime.2.2',
+      install_scope: 'machine',
+      package_config: {
+        nestedInstallerType: 'msix',
+        nestedInstallerPath:
+          'Dependencies\\x64\\Microsoft.NET.Native.Runtime.2.2.appx',
+        psadtConfig: {},
+      },
+    });
+    const install = generator.getInstallCommand.call(
+      generator,
+      job,
+      'Dependencies.zip',
+      ''
+    );
+    const uninstall = generator.getUninstallCommand.call(
+      generator,
+      job,
+      'Dependencies.zip'
+    );
+
+    expect(install).toContain('$msixPath = $nestedInstallerPath');
+    expect(install).toContain('Add-AppxProvisionedPackage -Online');
+    expect(install).not.toContain('Start-ADTProcess -FilePath $nestedInstallerPath');
+    expect(uninstall).toContain(
+      "Get-AppxPackage -Name 'Microsoft.NET.Native.Runtime.2.2' -AllUsers"
+    );
+    expect(uninstall).toContain(
+      'Machine-scoped MSIX/APPX removal verification failed for exact package identity'
+    );
   });
 
   it('refuses a display-name fallback that is not an exact package identity', () => {

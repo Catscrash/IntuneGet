@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
@@ -19,7 +19,7 @@ export async function GET(request: NextRequest) {
     // unmanaged-apps/route.ts). The deployment lookups below go through the
     // db abstraction, which already supports both SQLite and Supabase.
     let tenantId = user.tenantId;
-    if (isSupabaseConfigured()) {
+    if (isSupabaseServerConfigured()) {
       const supabase = createServerClient();
       const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 

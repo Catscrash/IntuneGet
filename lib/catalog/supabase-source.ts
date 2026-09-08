@@ -1,3 +1,6 @@
+import { loadReleaseMetadata, releasePairKey } from './release-metadata';
+import { enrichRelease, type FileReputation } from './release-enrichment';
+import type { ReleaseHistoryFilters, ReleaseHistoryResult } from './release-history';
 /**
  * Supabase-backed CatalogSource.
  *
@@ -15,6 +18,10 @@
 import { createClient } from '@supabase/supabase-js';
 import { createServerClient } from '@/lib/supabase';
 import { getLocaleDisplay } from '@/lib/locale-utils';
+import {
+  quotePostgrestLikePattern,
+  quotePostgrestValue,
+} from '@/lib/catalog/postgrest-filter';
 import type { LocaleVariant } from '@/types/winget';
 import type { CuratedAppMatch } from '@/lib/app-mappings';
 import type { InstallationSnapshot } from '@/lib/winget-api';
@@ -54,6 +61,33 @@ function serviceOrAnonClient() {
 let warnedMissingQaServiceRole = false;
 
 export class SupabaseCatalogSource implements CatalogSource {
+  async getReleaseHistory(filters: ReleaseHistoryFilters): Promise<ReleaseHistoryResult> {
+    const client = serviceOrAnonClient();
+    if (!client) throw new Error('Catalog unavailable');
+    const { data, error } = await client.rpc('get_catalog_release_history', {
+      search_text: filters.query, month_filter: filters.month,
+      kind_filter: filters.kind, page_number: filters.page,
+    }).abortSignal(AbortSignal.timeout(15_000));
+    if (error) throw new Error('Catalog history unavailable', { cause: error });
+    const result = data as ReleaseHistoryResult;
+    if (!result.rows.length) return result;
+    const {metadata, unavailable} = await loadReleaseMetadata(result.rows, batch => {
+      const pairs = batch.map(row => `and(winget_id.eq.${quotePostgrestValue(row.winget_id)},version.eq.${quotePostgrestValue(row.version)})`).join(',');
+      return client.from('version_history').select('winget_id,version,release_notes_url,installer_sha256,installers').or(pairs).limit(batch.length).abortSignal(AbortSignal.timeout(10_000));
+    });
+    const hashes = [...new Set(metadata.map(v => v.installer_sha256?.toLowerCase()).filter((hash): hash is string => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)))];
+    let reputations: FileReputation[] = [];
+    if (hashes.length) {
+      const responses = await Promise.allSettled([
+        client.from('catalog_file_reputation').select('sha256,status,malicious,suspicious,total_engines,analyzed_at').in('sha256', hashes).abortSignal(AbortSignal.timeout(5000)),
+        process.env.SUPABASE_SERVICE_ROLE_KEY ? client.rpc('request_catalog_file_reputation', {hashes, prioritized: true}).abortSignal(AbortSignal.timeout(5000)) : Promise.resolve(null),
+      ]);
+      const cached = responses[0];
+      if (cached.status === 'fulfilled' && cached.value && !cached.value.error) reputations = (cached.value.data ?? []) as FileReputation[];
+    }
+    return {...result, rows: result.rows.map(row => unavailable.has(releasePairKey(row)) ? {...row, detailsUnavailable: true} : enrichRelease(row, metadata, reputations))};
+  }
+
   // ---------------------------------------------------------------------------
   // search / discovery
   // ---------------------------------------------------------------------------
@@ -77,7 +111,9 @@ export class SupabaseCatalogSource implements CatalogSource {
     );
 
     return {
-      data: (curatedData || null) as CuratedAppRpcRow[] | null,
+      data: curatedData
+        ? (curatedData as CuratedAppRpcRow[]).filter((app) => app.latest_version != null)
+        : null,
       error: curatedError,
     };
   }
@@ -87,6 +123,7 @@ export class SupabaseCatalogSource implements CatalogSource {
     offset: number;
     category?: string | null;
     sort: SearchSort;
+    verifiedOnly?: boolean;
   }): Promise<PopularPackagesResult | null> {
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseKey =
@@ -98,32 +135,33 @@ export class SupabaseCatalogSource implements CatalogSource {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const { limit, offset, category, sort } = opts;
+    const { limit, offset, category, sort, verifiedOnly = true } = opts;
 
-    const baseQuery = supabase
+    let baseQuery = supabase
       .from('curated_apps')
       .select('*', { count: 'exact', head: true })
-      .eq('is_verified', true)
+      .not('latest_version', 'is', null)
       .eq('is_locale_variant', false);
 
-    const countQuery = category ? baseQuery.eq('category', category) : baseQuery;
-    const { count: totalCount, error: countError } = await countQuery;
-
-    if (countError) {
-      console.error('Failed to count curated packages', { error: countError, category });
-      return null;
+    if (verifiedOnly) {
+      baseQuery = baseQuery.eq('is_verified', true);
     }
 
+    const countQuery = category ? baseQuery.ilike('category', category) : baseQuery;
     let dataQuery = supabase
       .from('curated_apps')
       .select(
         'id, winget_id, name, publisher, latest_version, description, homepage, category, tags, icon_path, popularity_rank, app_source, store_package_id'
       )
-      .eq('is_verified', true)
+      .not('latest_version', 'is', null)
       .eq('is_locale_variant', false);
 
+    if (verifiedOnly) {
+      dataQuery = dataQuery.eq('is_verified', true);
+    }
+
     if (category) {
-      dataQuery = dataQuery.eq('category', category);
+      dataQuery = dataQuery.ilike('category', category);
     }
 
     switch (sort) {
@@ -141,7 +179,14 @@ export class SupabaseCatalogSource implements CatalogSource {
         break;
     }
 
-    const { data, error } = await dataQuery.range(offset, offset + limit - 1);
+    const [{ count: totalCount, error: countError }, { data, error }] = await Promise.all([
+      countQuery,
+      dataQuery.range(offset, offset + limit - 1),
+    ]);
+    if (countError) {
+      console.error('Failed to count curated packages', { error: countError, category });
+      return null;
+    }
 
     if (error) {
       console.error('Failed to query curated packages', { error, category, sort, limit, offset });
@@ -172,7 +217,9 @@ export class SupabaseCatalogSource implements CatalogSource {
     );
 
     return {
-      data: (curatedData || null) as CuratedAppRpcRow[] | null,
+      data: curatedData
+        ? (curatedData as CuratedAppRpcRow[]).filter((app) => app.latest_version != null)
+        : null,
       error: curatedError,
     };
   }
@@ -196,6 +243,40 @@ export class SupabaseCatalogSource implements CatalogSource {
     }));
   }
 
+  async getVerifiedAppIds(
+    limit?: number
+  ): Promise<{ winget_id: string; updated_at?: string | null }[]> {
+    const supabase = serviceOrAnonClient();
+    if (!supabase) return [];
+
+    const pageSize = limit === undefined ? 1000 : Math.min(limit, 1000);
+    const rows: { winget_id: string; updated_at?: string | null }[] = [];
+    let offset = 0;
+
+    while (limit === undefined || rows.length < limit) {
+      const requested = limit === undefined ? pageSize : Math.min(pageSize, limit - rows.length);
+      const { data, error } = await supabase
+        .from('curated_apps')
+        .select('winget_id, updated_at')
+        .eq('is_verified', true)
+        .eq('is_locale_variant', false)
+        .not('latest_version', 'is', null)
+        .order('popularity_rank', { ascending: true, nullsFirst: false })
+        .order('winget_id', { ascending: true })
+        .range(offset, offset + requested - 1);
+
+      if (error) {
+        console.error('Failed to list verified catalog apps:', error.message);
+        return rows;
+      }
+      const page = (data || []) as { winget_id: string; updated_at: string | null }[];
+      rows.push(...page);
+      if (page.length < requested) break;
+      offset += page.length;
+    }
+    return rows;
+  }
+
   async getCategoryCount(opts: { verifiedOnly: boolean }): Promise<number | null> {
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseKey =
@@ -213,6 +294,7 @@ export class SupabaseCatalogSource implements CatalogSource {
     if (opts.verifiedOnly) {
       query = query.eq('is_verified', true);
     }
+    query = query.not('latest_version', 'is', null);
 
     const { count } = await query;
     return count ?? null;
@@ -222,34 +304,27 @@ export class SupabaseCatalogSource implements CatalogSource {
   // app detail
   // ---------------------------------------------------------------------------
 
-  async getAppByWingetId(wingetId: string): Promise<CuratedAppWithDetails | null> {
+  async getAppByWingetId(wingetId: string, options: { presentationOnly?: boolean } = {}): Promise<CuratedAppWithDetails | null> {
     const supabase = serviceOrAnonClient();
     if (!supabase) {
       return null;
     }
 
-    const { data: curatedData } = await supabase
-      .from('curated_apps')
-      .select('*')
-      .eq('winget_id', wingetId)
-      .single();
-
-    if (!curatedData) {
-      return null;
-    }
-
-    // Get versions from version_history
-    const { data: versionData } = await supabase
-      .from('version_history')
-      .select('version')
-      .eq('winget_id', wingetId)
+    const versionsQuery = supabase.from('version_history').select('version').eq('winget_id', wingetId)
       .order('created_at', { ascending: false });
+    const [{ data: curatedData }, { data: versionData }] = await Promise.all([
+      supabase.from('curated_apps').select(options.presentationOnly
+        ? 'winget_id,name,publisher,latest_version,description,homepage,license,icon_path,category,is_locale_variant,parent_winget_id,is_verified,app_source'
+        : '*').eq('winget_id', wingetId).single<CuratedAppWithDetails['app']>(),
+      options.presentationOnly ? versionsQuery.limit(10) : versionsQuery,
+    ]);
+    if (!curatedData) return null;
 
     const versions = versionData?.map((v) => v.version) || [];
 
     // Fetch locale variants if this is a parent app (not a variant itself)
     let localeVariants: LocaleVariant[] | undefined;
-    if (!curatedData.is_locale_variant) {
+    if (!curatedData.is_locale_variant && !options.presentationOnly) {
       const { data: variantData } = await supabase.rpc('get_locale_variants', {
         parent_id: wingetId,
       });
@@ -389,7 +464,7 @@ export class SupabaseCatalogSource implements CatalogSource {
       const { data, error } = await supabase
         .from('qa_package_results')
         .select(
-          'package_profile_sha256, winget_id, display_name, publisher, tested_version, architecture, installer_sha256, outcome, tested_at_utc, overall_duration_seconds, installer_type, install_command, uninstall_command, detection, phase_results, changes, relevant_event_count, environment, effective_configuration, qa_schema_version, psadt_version, psadt_template_sha256, psadt_config_sha256, detection_rules_sha256, packager_commit, package_content_sha256'
+          'package_profile_sha256, winget_id, display_name, publisher, tested_version, architecture, installer_sha256, outcome, tested_at_utc, overall_duration_seconds, installer_type, install_command, uninstall_command, detection, phase_results, changes, relevant_event_count, environment, effective_configuration, qa_schema_version, psadt_version, psadt_template_sha256, psadt_config_sha256, detection_rules_sha256, packager_commit, package_content_sha256, virustotal_status, virustotal_malicious, virustotal_suspicious, virustotal_total_engines, virustotal_scanned_at_utc'
         )
         .eq('winget_id', wingetId)
         .eq('package_profile_sha256', packageProfileSha256.toUpperCase())
@@ -416,7 +491,7 @@ export class SupabaseCatalogSource implements CatalogSource {
     const { data, error } = await supabase
       .from('qa_results')
       .select(
-        'winget_id, display_name, publisher, tested_version, architecture, outcome, tested_at_utc, installer_sha256, overall_duration_seconds, installer_type, install_command, uninstall_command, detection, phase_results, changes, relevant_event_count, environment, effective_configuration, qa_schema_version, synced_at, test_level, package_profile_sha256, psadt_version, psadt_template_sha256, psadt_config_sha256, detection_rules_sha256, packager_commit, package_content_sha256'
+        'winget_id, display_name, publisher, tested_version, architecture, outcome, tested_at_utc, installer_sha256, overall_duration_seconds, installer_type, install_command, uninstall_command, detection, phase_results, changes, relevant_event_count, environment, effective_configuration, qa_schema_version, synced_at, test_level, package_profile_sha256, psadt_version, psadt_template_sha256, psadt_config_sha256, detection_rules_sha256, packager_commit, package_content_sha256, virustotal_status, virustotal_malicious, virustotal_suspicious, virustotal_total_engines, virustotal_scanned_at_utc'
       )
       .eq('winget_id', wingetId)
       .eq('test_level', 'psadt-package')
@@ -587,6 +662,7 @@ export class SupabaseCatalogSource implements CatalogSource {
     }
 
     const normalizedSearch = term.toLowerCase().trim();
+    const searchPattern = quotePostgrestLikePattern(normalizedSearch);
     const supabase = createServerClient();
 
     try {
@@ -595,7 +671,11 @@ export class SupabaseCatalogSource implements CatalogSource {
         .select('winget_id, name, publisher, latest_version')
         .not('latest_version', 'is', null)
         .or(
-          `name.ilike.%${normalizedSearch}%,publisher.ilike.%${normalizedSearch}%,winget_id.ilike.%${normalizedSearch}%`
+          [
+            `name.ilike.${searchPattern}`,
+            `publisher.ilike.${searchPattern}`,
+            `winget_id.ilike.${searchPattern}`,
+          ].join(',')
         )
         .order('popularity_rank', { ascending: true, nullsFirst: false })
         .limit(10);
@@ -651,10 +731,12 @@ export class SupabaseCatalogSource implements CatalogSource {
     };
 
     // Build the OR conditions defensively: quote values so names containing
-    // spaces or parentheses (e.g. "Zoom Workplace (64-bit)") don't break the
+    // commas or parentheses (e.g. "Zoom Workplace (64-bit)") don't break the
     // PostgREST or() parser, and only filter on product code when one exists
-    // (eq.null would not match NULL rows anyway).
-    const quote = (v: string) => `"${v.replace(/"/g, '')}"`;
+    // (eq.null would not match NULL rows anyway). The shared helper escapes
+    // embedded quotes rather than stripping them, so a name carrying one is
+    // still matched exactly instead of silently missing its row.
+    const quote = quotePostgrestValue;
     const orConditions = [
       `sccm_display_name_normalized.eq.${quote(displayNameNormalized)}`,
       `sccm_ci_id.eq.${quote(ciId)}`,
@@ -750,12 +832,18 @@ export class SupabaseCatalogSource implements CatalogSource {
     term: string,
     limit: number
   ): Promise<{ winget_id: string; name: string }[]> {
+    const termPattern = quotePostgrestLikePattern(term);
     const supabase = createServerClient();
 
     const { data } = await supabase
       .from('curated_apps')
       .select('winget_id, name')
-      .or(`winget_id.ilike.%${term}%,name.ilike.%${term}%`)
+      .or(
+        [
+          `winget_id.ilike.${termPattern}`,
+          `name.ilike.${termPattern}`,
+        ].join(',')
+      )
       .eq('is_verified', true)
       .limit(limit);
 

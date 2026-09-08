@@ -5,7 +5,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { getServicePrincipalToken } from '@/lib/intune/graph-client';
@@ -94,7 +94,7 @@ export async function GET(request: NextRequest) {
     // Supabase only adds MSP tenant resolution, the consent record, and the
     // two explicit-mapping sources below - so run without it rather than
     // refusing the whole check (same shape as unmanaged-apps/route.ts).
-    const supabase = isSupabaseConfigured() ? createServerClient() : null;
+    const supabase = getServerClientOrNull();
     let tenantId = user.tenantId;
 
     if (supabase) {

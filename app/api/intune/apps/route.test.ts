@@ -3,15 +3,13 @@ import { NextRequest } from 'next/server';
 const {
   parseAccessTokenMock,
   getServicePrincipalTokenMock,
-  createServerClientMock,
-  isSupabaseConfiguredMock,
+  getServerClientOrNullMock,
   resolveTargetTenantIdMock,
   fetchMock,
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
   getServicePrincipalTokenMock: vi.fn(),
-  createServerClientMock: vi.fn(),
-  isSupabaseConfiguredMock: vi.fn(),
+  getServerClientOrNullMock: vi.fn(),
   resolveTargetTenantIdMock: vi.fn(),
   fetchMock: vi.fn(),
 }));
@@ -25,8 +23,7 @@ vi.mock('@/lib/intune/graph-client', () => ({
 }));
 
 vi.mock('@/lib/supabase', () => ({
-  createServerClient: createServerClientMock,
-  isSupabaseConfigured: isSupabaseConfiguredMock,
+  getServerClientOrNull: getServerClientOrNullMock,
 }));
 
 vi.mock('@/lib/msp/tenant-resolution', () => ({
@@ -45,6 +42,7 @@ describe('GET /api/intune/apps', () => {
       tenantId: 'tenant-1',
       userName: 'User',
     });
+    getServerClientOrNullMock.mockReturnValue(null);
     getServicePrincipalTokenMock.mockResolvedValue('graph-token');
     fetchMock.mockResolvedValue({
       ok: true,
@@ -53,8 +51,6 @@ describe('GET /api/intune/apps', () => {
   });
 
   it('lists apps without touching Supabase when running Supabase-less (DATABASE_MODE=sqlite, no MSP config)', async () => {
-    isSupabaseConfiguredMock.mockReturnValue(false);
-
     const request = new NextRequest('http://localhost:3000/api/intune/apps', {
       headers: { Authorization: 'Bearer test-token' },
     });
@@ -67,15 +63,13 @@ describe('GET /api/intune/apps', () => {
     // The regression this guards against: the route called createServerClient()
     // and queried the tenant_consent table unconditionally, which throws (or
     // 403s) in installs that don't configure Supabase.
-    expect(createServerClientMock).not.toHaveBeenCalled();
     expect(resolveTargetTenantIdMock).not.toHaveBeenCalled();
     expect(getServicePrincipalTokenMock).toHaveBeenCalledWith('tenant-1');
   });
 
   it('resolves the MSP tenant and checks consent when Supabase is configured', async () => {
-    isSupabaseConfiguredMock.mockReturnValue(true);
     const supabaseStub = { from: vi.fn() };
-    createServerClientMock.mockReturnValue(supabaseStub);
+    getServerClientOrNullMock.mockReturnValue(supabaseStub);
     resolveTargetTenantIdMock.mockResolvedValue({
       tenantId: 'tenant-2',
       errorResponse: null,
@@ -100,9 +94,8 @@ describe('GET /api/intune/apps', () => {
   });
 
   it('returns 403 when Supabase is configured but consent is missing', async () => {
-    isSupabaseConfiguredMock.mockReturnValue(true);
     const supabaseStub = { from: vi.fn() };
-    createServerClientMock.mockReturnValue(supabaseStub);
+    getServerClientOrNullMock.mockReturnValue(supabaseStub);
     resolveTargetTenantIdMock.mockResolvedValue({
       tenantId: 'tenant-2',
       errorResponse: null,
@@ -121,5 +114,35 @@ describe('GET /api/intune/apps', () => {
 
     expect(response.status).toBe(403);
     expect(getServicePrincipalTokenMock).not.toHaveBeenCalled();
+  });
+
+  it('serves Graph data without Supabase', async () => {
+    getServicePrincipalTokenMock.mockResolvedValue('graph-token');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      value: [{ id: 'app-1', displayName: 'Example App' }],
+    }), { status: 200 })));
+
+    const response = await GET(new NextRequest('http://localhost/api/intune/apps'));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      apps: [{ id: 'app-1', displayName: 'Example App' }],
+      count: 1,
+    });
+  });
+  it('returns a lightweight first page and preserves the opaque continuation', async () => {
+    getServicePrincipalTokenMock.mockResolvedValue('graph-token');
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      value: [{ id: 'one', displayName: 'App', largeIcon: { value: 'large-icon' }, detectionRules: ['large-config'] }],
+      '@odata.nextLink': 'https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?$skiptoken=next%2Bpage',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const response = await GET(new NextRequest('http://localhost/api/intune/apps?view=list&cursor=start'));
+    const data = await response.json();
+    expect(data.nextPageToken).toBe('next+page');
+    expect(data.apps[0]).toMatchObject({ id: 'one', hasIcon: true });
+    expect(data.apps[0]).not.toHaveProperty('largeIcon');
+    expect(data.apps[0]).not.toHaveProperty('detectionRules');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(new URL(fetchMock.mock.calls[0][0]).searchParams.get('$skiptoken')).toBe('start');
   });
 });

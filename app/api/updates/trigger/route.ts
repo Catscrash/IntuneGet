@@ -4,7 +4,8 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { sanitizeAssignmentsForDispatch } from '@/lib/assignment-intents';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
@@ -82,7 +83,7 @@ export async function POST(request: NextRequest) {
     // packaging job, exactly as a normal deployment does. The policy round
     // trip below (create a policy, flip it to auto_update, restore it) is a
     // vehicle for AutoUpdateTrigger, not something the user asked for.
-    if (!isSupabaseConfigured()) {
+    if (!isSupabaseServerConfigured()) {
       return triggerWithoutSupabase(user, updateRequests);
     }
 
@@ -182,7 +183,6 @@ export async function POST(request: NextRequest) {
             tenantId: req.tenant_id,
             wingetId: req.winget_id,
             latestVersion: updateResult.latest_version,
-            globalCarryOver,
           });
 
           if (built.status === 'orphaned_job') {
@@ -361,7 +361,12 @@ export async function POST(request: NextRequest) {
                 ? JSON.stringify(deploymentConfig.psadtConfig)
                 : undefined,
               assignments: deploymentConfig.assignments
-                ? JSON.stringify(deploymentConfig.assignments)
+                ? JSON.stringify(
+                    sanitizeAssignmentsForDispatch(
+                      deploymentConfig.assignments,
+                      Boolean(deploymentConfig.requirementRules?.length)
+                    )
+                  )
                 : undefined,
               categories: deploymentConfig.categories
                 ? JSON.stringify(deploymentConfig.categories)
@@ -566,7 +571,6 @@ async function triggerWithoutSupabase(
         tenantId: req.tenant_id,
         wingetId: req.winget_id,
         latestVersion: updateResult.latest_version,
-        globalCarryOver,
       });
 
       if (built.status === 'orphaned_job') {
@@ -642,9 +646,11 @@ async function triggerWithoutSupabase(
           autoSupersede,
           supersedenceType: autoSupersede ? 'update' : undefined,
           allowAvailableUninstall,
-          // The current setting wins over whatever the original deployment
-          // stored, matching how the Supabase path re-reads it per run.
-          assignmentMigration: {
+          // An explicit per-app choice stored with the original deployment
+          // wins; otherwise the user's current global setting applies, read
+          // per run rather than frozen. Same precedence as the Supabase path
+          // in AutoUpdateTrigger.
+          assignmentMigration: config.assignmentMigration ?? {
             carryOverAssignments: globalCarryOver,
             removeAssignmentsFromPreviousApp: globalCarryOver,
           },

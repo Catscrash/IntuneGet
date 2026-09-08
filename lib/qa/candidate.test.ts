@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isQaRunnerArchitectureSupported,
   normalizeInstallerSha256,
   normalizeQaArchitecture,
   normalizeQaInstallerType,
@@ -24,6 +25,12 @@ describe('QA candidate normalization', () => {
     expect(normalizeQaArchitecture(undefined)).toBe('x64');
   });
 
+  it('only sends architectures executable by the current x64 VM to QA', () => {
+    expect(isQaRunnerArchitectureSupported('x64')).toBe(true);
+    expect(isQaRunnerArchitectureSupported('x86')).toBe(true);
+    expect(isQaRunnerArchitectureSupported('arm64')).toBe(false);
+  });
+
   it('uses x86 only as an explicit fallback supported by the x64 QA VM', () => {
     expect(selectQaVmInstaller(installers)).toMatchObject({ architecture: 'x64' });
     expect(selectQaVmInstaller([installers[0]])).toMatchObject({ architecture: 'x86' });
@@ -46,6 +53,60 @@ describe('QA candidate normalization', () => {
 
     expect(selectQaVmInstaller(scopedInstallers)?.installer.InstallerUrl).toContain('all-users');
     expect(selectWingetInstaller(scopedInstallers, 'x64')?.InstallerUrl).toContain('all-users');
+  });
+
+  it('prefers an admin MSI over a bootstrapper for machine-scope QA', () => {
+    const ringCentralInstallers = [
+      {
+        Architecture: 'x64',
+        Scope: 'machine',
+        InstallerType: 'nullsoft',
+        InstallerUrl: 'https://example.test/ringcentral-user.exe',
+      },
+      {
+        Architecture: 'x64',
+        Scope: 'machine',
+        InstallerType: 'wix',
+        InstallerUrl: 'https://example.test/ringcentral-admin.msi',
+        ProductCode: '{1DE15838-06D0-4C9D-B513-F86B806149D5}',
+      },
+    ];
+
+    expect(selectQaVmInstaller(ringCentralInstallers)?.installer.InstallerType).toBe('wix');
+    expect(selectWingetInstaller(ringCentralInstallers, 'x64')?.InstallerType).toBe('wix');
+    expect(selectWingetInstaller(ringCentralInstallers, 'x64', 'machine')?.InstallerType)
+      .toBe('wix');
+  });
+
+  it('requires Webroot MSI across QA and deployment selection', () => {
+    const webrootInstallers = [
+      {
+        Architecture: 'x86',
+        InstallerType: 'msi',
+        InstallerUrl: 'https://example.test/wsainstall.msi',
+      },
+      {
+        Architecture: 'x86',
+        InstallerType: 'exe',
+        Scope: 'machine',
+        InstallerUrl: 'https://example.test/wsainstall.exe',
+      },
+    ];
+
+    expect(
+      selectQaVmInstaller(webrootInstallers, 'Webroot.SecureAnywhere')?.installer.InstallerType
+    ).toBe('msi');
+    expect(
+      selectWingetInstaller(
+        webrootInstallers,
+        'x86',
+        'machine',
+        'Webroot.SecureAnywhere',
+      )?.InstallerType
+    ).toBe('msi');
+    expect(
+      selectQaVmInstaller([webrootInstallers[1]], 'Webroot.SecureAnywhere')
+    ).toBeNull();
   });
 
   it('falls back to user scope when no machine or unspecified-scope installer exists', () => {
@@ -86,7 +147,8 @@ describe('QA candidate normalization', () => {
     expect(normalizeQaInstallerType('inno', 'exe')).toBe('exe');
     expect(normalizeQaInstallerType('nullsoft', 'exe')).toBe('exe');
     expect(normalizeQaInstallerType('wix', 'exe')).toBe('msi');
-    expect(normalizeQaInstallerType('portable', 'exe')).toBe('exe');
+    expect(normalizeQaInstallerType('portable', 'exe')).toBe('portable');
+    expect(normalizeQaInstallerType(null, 'portable')).toBe('portable');
   });
 
   it('gives extensionless executable URLs a runnable filename', () => {

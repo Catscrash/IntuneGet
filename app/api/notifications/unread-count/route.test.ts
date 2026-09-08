@@ -1,20 +1,16 @@
 import { NextRequest } from 'next/server';
 
-const { parseAccessTokenMock, createServerClientMock, isSupabaseConfiguredMock } = vi.hoisted(
-  () => ({
-    parseAccessTokenMock: vi.fn(),
-    createServerClientMock: vi.fn(),
-    isSupabaseConfiguredMock: vi.fn(),
-  })
-);
+const { parseAccessTokenMock, getServerClientOrNullMock } = vi.hoisted(() => ({
+  parseAccessTokenMock: vi.fn(),
+  getServerClientOrNullMock: vi.fn(),
+}));
 
 vi.mock('@/lib/auth-utils', () => ({
   parseAccessToken: parseAccessTokenMock,
 }));
 
 vi.mock('@/lib/supabase', () => ({
-  createServerClient: createServerClientMock,
-  isSupabaseConfigured: isSupabaseConfiguredMock,
+  getServerClientOrNull: getServerClientOrNullMock,
 }));
 
 import { GET } from '@/app/api/notifications/unread-count/route';
@@ -28,7 +24,7 @@ function makeRequest() {
 describe('GET /api/notifications/unread-count', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isSupabaseConfiguredMock.mockReturnValue(true);
+    getServerClientOrNullMock.mockReturnValue(null);
     parseAccessTokenMock.mockResolvedValue({
       userId: 'user-1',
       userEmail: 'user@example.com',
@@ -41,15 +37,14 @@ describe('GET /api/notifications/unread-count', () => {
     // Regression: the route called createServerClient() unconditionally, which
     // throws without Supabase config, so every dashboard load logged a 500.
     // user_notifications is Supabase-only, so an empty count is the honest
-    // answer here.
-    isSupabaseConfiguredMock.mockReturnValue(false);
+    // answer here - under the same `unread_count` key the bell reads.
+    getServerClientOrNullMock.mockReturnValue(null);
 
     const response = await GET(makeRequest());
     const body = await response.json();
 
     expect(response.status).toBe(200);
     expect(body.unread_count).toBe(0);
-    expect(createServerClientMock).not.toHaveBeenCalled();
   });
 
   it('counts unread notifications when Supabase is configured', async () => {
@@ -57,7 +52,7 @@ describe('GET /api/notifications/unread-count', () => {
     query.select = vi.fn(() => query);
     query.eq = vi.fn(() => query);
     query.is = vi.fn(async () => ({ count: 3, error: null }));
-    createServerClientMock.mockReturnValue({ from: vi.fn(() => query) });
+    getServerClientOrNullMock.mockReturnValue({ from: vi.fn(() => query) });
 
     const response = await GET(makeRequest());
     const body = await response.json();

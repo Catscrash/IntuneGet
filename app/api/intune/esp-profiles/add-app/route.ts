@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { acquireGraphToken } from '@/lib/graph-token';
@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
     // tenant and let the Graph token acquired below prove consent (matches
     // the pattern in unmanaged-apps/route.ts).
     let tenantId = user.tenantId;
-    if (isSupabaseConfigured()) {
+    if (isSupabaseServerConfigured()) {
       const supabase = createServerClient();
       const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 

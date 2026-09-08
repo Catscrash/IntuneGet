@@ -7,8 +7,14 @@
 import { createHmac } from 'node:crypto';
 
 import { applyInstallerUrlOverride } from './installer-url-overrides';
-import { enforceInstallerPreflight } from './installer-preflight';
+import { reconcileCatalogInstaller } from './catalog-installer-reconciliation';
+import { enforceInstallerPreflight, InstallerPreflightError } from './installer-preflight';
 import { enforceQaGate } from './qa/gate';
+import {
+  resolveApplicationInstallerSuccessCodes,
+  resolveApplicationUninstallCommand,
+} from './packaging-adapters';
+import { assertPackagingContract } from './packaging-contract';
 import {
   normalizeQaWorkflowPackageInput,
 } from './qa/package-profile';
@@ -16,6 +22,8 @@ import {
   resolveWingetPackageDependencies,
   type PackagedWingetDependency,
 } from './winget-dependencies';
+import type { Win32CartItem } from '@/types/upload';
+import type { NormalizedInstaller } from '@/types/winget';
 
 export interface WorkflowInputs {
   jobId: string;
@@ -120,23 +128,108 @@ export async function triggerPackagingWorkflow(
 ): Promise<TriggerResult> {
   const cfg = config || getGitHubActionsConfig();
 
+  let effectiveInputs = inputs;
+  let trustedInstallers: NormalizedInstaller[] | undefined;
+  if (inputs.sourceType !== 'custom') {
+    const resolvedUninstallCommand = resolveApplicationUninstallCommand(
+      inputs.wingetId,
+      inputs.uninstallCommand,
+    );
+    const generatedDisplayUninstallCommand = resolveApplicationUninstallCommand(
+      inputs.wingetId,
+      `REGISTRY_UNINSTALL:${inputs.displayName}`,
+    );
+    // A display-name registry marker is the catalog fallback, not a customer
+    // override. Let live manifest reconciliation replace it with a stronger
+    // ProductCode or exact ARP key when the trusted installer now provides one.
+    const customerUninstallOverride = resolvedUninstallCommand.trim() &&
+      resolvedUninstallCommand.trim() !== generatedDisplayUninstallCommand
+      ? resolvedUninstallCommand
+      : undefined;
+    try {
+      const reconciled = await reconcileCatalogInstaller({
+        id: inputs.jobId,
+        addedAt: new Date().toISOString(),
+        appSource: 'win32',
+        sourceType: 'winget',
+        wingetId: inputs.wingetId,
+        displayName: inputs.displayName,
+        description: inputs.description,
+        publisher: inputs.publisher,
+        version: inputs.version,
+        architecture: (inputs.architecture || 'x64') as Win32CartItem['architecture'],
+        installScope: inputs.installScope || 'machine',
+        installerType: inputs.installerType as Win32CartItem['installerType'],
+        installerUrl: inputs.installerUrl,
+        installerSha256: inputs.installerSha256,
+        installerSuccessCodes: inputs.installerSuccessCodes,
+        installCommand: inputs.silentSwitches,
+        uninstallCommand: inputs.uninstallCommand,
+        detectionRules: [],
+        requirementRules: [],
+        psadtConfig: {
+          installCommand: inputs.silentSwitches,
+          uninstallCommand: customerUninstallOverride,
+        } as Win32CartItem['psadtConfig'],
+      });
+      effectiveInputs = {
+        ...inputs,
+        installerUrl: reconciled.item.installerUrl,
+        installerSha256: reconciled.item.installerSha256,
+        installerType: reconciled.item.installerType,
+        nestedInstallerType: reconciled.item.nestedInstallerType,
+        nestedInstallerPath: reconciled.item.nestedInstallerPath,
+        silentSwitches: reconciled.item.installCommand,
+        installerSuccessCodes: reconciled.item.installerSuccessCodes,
+        uninstallCommand: reconciled.item.uninstallCommand,
+        installScope: reconciled.item.installScope,
+      };
+      trustedInstallers = reconciled.trustedInstallers;
+    } catch (error) {
+      if (!(error instanceof InstallerPreflightError && error.retryable)) {
+        throw error;
+      }
+      console.warn(`Live installer reconciliation unavailable for ${inputs.wingetId} ${inputs.version}; using the catalog tuple.`);
+    }
+  }
+
   const finalInstallerUrl = applyInstallerUrlOverride(
-    inputs.wingetId,
-    inputs.version,
-    inputs.architecture ?? '',
-    inputs.installerUrl,
+    effectiveInputs.wingetId,
+    effectiveInputs.version,
+    effectiveInputs.architecture ?? '',
+    effectiveInputs.installerUrl,
   );
   // This is the final dispatch boundary shared by manual, MSP, update-policy,
   // and auto-update paths. Never create a packaging run for a known-bad tuple.
   await enforceInstallerPreflight({
-    wingetId: inputs.wingetId,
-    version: inputs.version,
-    architecture: inputs.architecture,
+    wingetId: effectiveInputs.wingetId,
+    version: effectiveInputs.version,
+    architecture: effectiveInputs.architecture,
     installerUrl: finalInstallerUrl,
-    installerSha256: inputs.installerSha256,
+    manifestInstallerUrl: effectiveInputs.installerUrl,
+    installerSha256: effectiveInputs.installerSha256,
+    installerType: effectiveInputs.installerType,
+    installScope: effectiveInputs.installScope,
+    sourceType: effectiveInputs.sourceType,
+  }, trustedInstallers);
+  inputs = effectiveInputs.sourceType === 'custom'
+    ? effectiveInputs
+    : {
+        ...effectiveInputs,
+        installerSuccessCodes: resolveApplicationInstallerSuccessCodes(
+          effectiveInputs.wingetId,
+          effectiveInputs.installerSuccessCodes
+        ),
+      };
+  // Final dispatch boundary: custom callers bypass catalog reconciliation, so
+  // they must still prove an unattended install contract before GitHub sees
+  // the installer URL or any tenant-scoped packaging request.
+  assertPackagingContract({
+    wingetId: inputs.wingetId,
     installerType: inputs.installerType,
-    installScope: inputs.installScope,
-    sourceType: inputs.sourceType,
+    silentArgs: inputs.silentSwitches,
+    nestedInstallerType: inputs.nestedInstallerType,
+    nestedInstallerFiles: inputs.nestedInstallerPath ? [inputs.nestedInstallerPath] : [],
   });
   const packageDependencies = inputs.sourceType === 'custom'
     ? []
@@ -150,6 +243,17 @@ export async function triggerPackagingWorkflow(
   const normalizedPackageInput = inputs.sourceType === 'custom'
     ? null
     : normalizeQaWorkflowPackageInput({ ...inputs, packageDependencies });
+  // Keep the workflow payload and its hashed execution profile identical even
+  // when live catalog reconciliation is temporarily unavailable. Reviewed app
+  // identities are resolved again by normalizeQaWorkflowPackageInput; dispatch
+  // that exact command so the customer PSADT package cannot retain stale
+  // manifest metadata while its QA gate evaluates the corrected profile.
+  if (normalizedPackageInput) {
+    inputs = {
+      ...inputs,
+      uninstallCommand: normalizedPackageInput.uninstallCommand,
+    };
+  }
   const packageDependenciesJson = JSON.stringify(packageDependencies);
   const dependencyBundleSignature = packageDependencies.length > 0
     ? (() => {

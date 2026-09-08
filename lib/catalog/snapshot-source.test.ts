@@ -62,6 +62,17 @@ const curatedApps = [
     popularity_rank: 5,
   },
   {
+    id: 5,
+    winget_id: 'Example.Unverified',
+    name: 'Unverified Example',
+    publisher: 'Example',
+    latest_version: '1.0',
+    category: 'Utilities',
+    is_verified: false,
+    is_locale_variant: false,
+    popularity_rank: 99,
+  },
+  {
     id: 4,
     winget_id: 'Google.Chrome.de',
     name: 'Google Chrome (German)',
@@ -222,6 +233,23 @@ describe('SnapshotCatalogSource', () => {
     expect((data || [])[0].winget_id).toBe('Google.Chrome');
   });
 
+  it('getPopularApps can include the full non-variant catalog', async () => {
+    const result = await source.getPopularApps({
+      limit: 10,
+      offset: 0,
+      sort: 'name',
+      verifiedOnly: false,
+    });
+    expect(result?.data.map((app) => app.winget_id)).toContain('Example.Unverified');
+    expect(result?.data.map((app) => app.winget_id)).not.toContain('Google.Chrome.de');
+    expect(result?.total).toBe(4);
+  });
+
+  it('getVerifiedAppIds returns canonical apps in popularity order', async () => {
+    const ids = await source.getVerifiedAppIds(2);
+    expect(ids.map((row) => row.winget_id)).toEqual(['Google.Chrome', 'Mozilla.Firefox']);
+  });
+
   it('getCategories returns per-category counts', async () => {
     const cats = await source.getCategories();
     const browsers = cats.find((c) => c.category === 'Browsers');
@@ -325,12 +353,12 @@ describe('SnapshotCatalogSource', () => {
 
   it('getCatalogStats counts all curated apps', async () => {
     const stats = await source.getCatalogStats();
-    expect(stats.totalApps).toBe(4);
+    expect(stats.totalApps).toBe(5);
   });
 
   it('getCategoryCount respects verifiedOnly', async () => {
     expect(await source.getCategoryCount({ verifiedOnly: true })).toBe(4);
-    expect(await source.getCategoryCount({ verifiedOnly: false })).toBe(4);
+    expect(await source.getCategoryCount({ verifiedOnly: false })).toBe(5);
   });
 });
 
@@ -351,5 +379,24 @@ describe('snapshot QA schema compatibility', () => {
     )`);
     expect(hasCompatibleQaResultsTable(current)).toBe(true);
     current.close();
+  });
+});
+
+
+describe('catalog release history', () => {
+  it('filters observations and retains the previous version across month/type filters', async () => {
+    const source = new SnapshotCatalogSource();
+    const result = await source.getReleaseHistory({ query: 'Chrome', month: '2026-01', kind: 'updated', page: 1 });
+    expect(result.total).toBe(1);
+    expect(result.apps).toBe(1);
+    expect(result.firstTracked).toBe(0);
+    expect(result.rows[0]).toMatchObject({ version: '120.0', previous_version: '119.0', detected_at: '2026-01-02T00:00:00Z' });
+    expect(result.months).toEqual(['2026-01']);
+    expect(result.sync).toBeNull();
+  });
+  it('does not treat wildcard search characters as SQL patterns', async () => {
+    const result = await new SnapshotCatalogSource().getReleaseHistory({ query: '%', month: '', kind: 'all', page: 1 });
+    expect(result.rows).toEqual([]);
+    expect(result.total).toBe(0);
   });
 });

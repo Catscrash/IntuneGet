@@ -42,6 +42,7 @@ const footerGroups: Array<{ title: string; links: FooterLink[] }> = [
     title: "Deploy",
     links: [
       { label: "App catalog", href: "/apps" },
+      { label: "Catalog history", href: "/apps/releases" },
       { label: "How it works", href: "/#how-it-works" },
       { label: "Get started", href: "/#get-started" },
     ],
@@ -220,7 +221,7 @@ export function Footer() {
                   aria-hidden="true"
                 />
               </summary>
-              <ul className="grid gap-3 pb-5 sm:grid-cols-3">
+              <ul className="grid grid-cols-1 gap-3 pb-5 sm:grid-cols-3">
                 {group.links.map((link) => (
                   <li key={link.label}>
                     <FooterNavLink link={link} />

@@ -1,9 +1,13 @@
+import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import { dispatchQaCandidate } from '@/lib/qa/dispatch';
-import { validateCurrentQaPackageProfile } from '@/lib/qa/package-profile';
-import { getQaPipelineControl } from '@/lib/qa/pipeline-control';
+import { QA_PSADT_TOOLCHAIN, validateCurrentQaPackageProfile } from '@/lib/qa/package-profile';
+import { getQaPipelineControl, isQaPackagerReleaseReady } from '@/lib/qa/pipeline-control';
 import { qaTimeoutRecoveryUpdate } from '@/lib/qa/recovery';
+import { InstallerPreflightError } from '@/lib/installer-preflight';
+import { isQaRunnerArchitectureSupported } from '@/lib/qa/candidate';
+import { getGitHubActionsHealth } from '@/lib/qa/github-actions-health';
 
 const DISPATCH_TIMEOUT_MS = 15 * 60 * 1000;
 const RUN_TIMEOUT_MS = 5 * 60 * 60 * 1000;
@@ -45,13 +49,29 @@ export async function GET(request: Request) {
 
   const supabase = createServerClient();
   const control = await getQaPipelineControl(supabase);
-  if (control.paused) {
+  if (control.paused || isQaMaintenanceMode()) {
     return NextResponse.json({
       success: true,
       dispatched: false,
       reason: 'maintenance_paused',
       maintenanceReason: control.reason,
       pausedAt: control.updatedAt,
+    });
+  }
+  if (!isQaPackagerReleaseReady(control, QA_PSADT_TOOLCHAIN.packagerCommit)) {
+    return NextResponse.json({
+      success: true,
+      dispatched: false,
+      reason: 'packager_release_pending',
+    });
+  }
+  const githubActions = await getGitHubActionsHealth();
+  if (!githubActions.operational) {
+    return NextResponse.json({
+      success: true,
+      dispatched: false,
+      reason: 'github_actions_unavailable',
+      githubActionsStatus: githubActions.status,
     });
   }
   const now = new Date();
@@ -92,6 +112,13 @@ export async function GET(request: Request) {
   let cursor: { priority: number; enqueuedAt: string; id: string } | null = null;
   let scanned = 0;
   let superseded = 0;
+  let lastInstallerQuarantine: { candidateId: string; code: string } | null = null;
+  let lastInstallerUnavailable: {
+    candidateId: string;
+    code: string;
+    attempts: number;
+    exhausted: boolean;
+  } | null = null;
   const supersededAt = new Date().toISOString();
 
   for (let pageIndex = 0; pageIndex < MAX_QUEUE_SCAN_PAGES; pageIndex++) {
@@ -129,6 +156,10 @@ export async function GET(request: Request) {
     for (const candidate of page) {
       if (!queueCursor(candidate)) {
         addInvalid('queue-metadata-invalid', candidate.id);
+        continue;
+      }
+      if (!isQaRunnerArchitectureSupported(candidate.architecture)) {
+        addInvalid('runner-architecture-unsupported', candidate.id);
         continue;
       }
       const validation = validateCurrentQaPackageProfile({
@@ -233,6 +264,93 @@ export async function GET(request: Request) {
         });
       } catch (error) {
         console.error(`QA dispatch failed for candidate ${claimed.id}:`, error);
+        if (error instanceof InstallerPreflightError && !error.retryable) {
+          const quarantinedAt = new Date().toISOString();
+          const summary = `Installer source quarantined before QA: ${error.code}. ${error.message}`
+            .slice(0, 1000);
+          const { data: quarantinedRows, error: quarantineError } = await supabase
+            .from('qa_candidates')
+            .update({
+              status: 'superseded',
+              finished_at: quarantinedAt,
+              phase: 'preparing_package',
+              phase_started_at: claimed.dispatched_at || quarantinedAt,
+              phase_updated_at: quarantinedAt,
+              failure_summary: summary,
+              updated_at: quarantinedAt,
+            })
+            .in('id', [claimed.id])
+            .eq('status', 'dispatched')
+            .select('id');
+          if (quarantineError) throw quarantineError;
+          superseded += quarantinedRows?.length || 0;
+          lastInstallerQuarantine = {
+            candidateId: claimed.id,
+            code: error.code,
+          };
+          // A deterministic bad tuple must not consume the entire dispatch
+          // tick. Continue scanning the already-validated queue page so one
+          // high-priority candidate cannot starve unrelated applications.
+          continue;
+        }
+        if (error instanceof InstallerPreflightError && error.retryable) {
+          const deferredAt = new Date().toISOString();
+          const attempts = Number.isInteger(claimed.attempts)
+            ? claimed.attempts
+            : candidate.attempts + 1;
+          const exhausted = attempts >= MAX_ATTEMPTS;
+          const { error: deferError } = await supabase
+            .from('qa_candidates')
+            .update(exhausted
+              ? {
+                  status: 'error',
+                  attempts,
+                  finished_at: deferredAt,
+                  phase: null,
+                  phase_started_at: null,
+                  phase_updated_at: null,
+                  failure_summary:
+                    `The installer source remained unavailable after ${attempts} verification attempts. The app was not tested.`,
+                  updated_at: deferredAt,
+                }
+              : {
+                  status: 'queued',
+                  attempts,
+                  enqueued_at: deferredAt,
+                  dispatched_at: null,
+                  phase: null,
+                  phase_started_at: null,
+                  phase_updated_at: null,
+                  failure_summary:
+                    'The installer source is temporarily unavailable; retry scheduled behind other queued apps.',
+                  updated_at: deferredAt,
+                })
+            .eq('id', claimed.id)
+            .eq('status', 'dispatched');
+          if (deferError) throw deferError;
+          lastInstallerUnavailable = {
+            candidateId: claimed.id,
+            code: error.code,
+            attempts,
+            exhausted,
+          };
+          console.warn('QA installer preflight deferred', lastInstallerUnavailable);
+          if (error.code === 'PREFLIGHT_DEADLINE_EXCEEDED') {
+            return NextResponse.json({
+              success: true,
+              dispatched: false,
+              reason: 'installer_unavailable',
+              reconciled,
+              scanned,
+              superseded,
+              installerUnavailable: lastInstallerUnavailable,
+            });
+          }
+          // A transient publisher/CDN response must not block unrelated apps.
+          // Move the candidate behind the current queue (or terminate after the
+          // bounded retry limit) and continue within this dispatch tick.
+          continue;
+        }
         await supabase
           .from('qa_candidates')
           .update({
@@ -257,7 +375,15 @@ export async function GET(request: Request) {
   return NextResponse.json({
     success: true,
     dispatched: false,
-    reason: scanned >= QUEUE_SCAN_PAGE_SIZE * MAX_QUEUE_SCAN_PAGES ? 'scan_limit' : 'queue_empty',
+    reason: lastInstallerQuarantine
+      ? 'installer_quarantined'
+      : lastInstallerUnavailable
+        ? 'installer_unavailable'
+      : scanned >= QUEUE_SCAN_PAGE_SIZE * MAX_QUEUE_SCAN_PAGES
+        ? 'scan_limit'
+        : 'queue_empty',
+    ...(lastInstallerQuarantine || {}),
+    ...(lastInstallerUnavailable || {}),
     reconciled,
     scanned,
     superseded,
@@ -305,4 +431,8 @@ export async function POST(request: Request) {
   return NextResponse.json({ success: true, candidateId: data.id });
 }
 
-export const maxDuration = 60;
+// Installer preflight downloads and hashes the exact vendor payload before
+// dispatching a runner job. Large installers need the same bounded function
+// window as the customer packaging route; otherwise the function can be
+// terminated after claiming a candidate but before GitHub receives a run.
+export const maxDuration = 300;

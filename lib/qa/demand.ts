@@ -1,21 +1,34 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { normalizeQaInstallerType, qaInstallerFileName } from '@/lib/qa/candidate';
+import {
+  isQaRunnerArchitectureSupported,
+  normalizeQaInstallerType,
+  qaInstallerFileName,
+} from '@/lib/qa/candidate';
 import {
   normalizeQaWorkflowPackageInput,
   type QaPackageIdentity,
   type QaWorkflowPackageInput,
 } from '@/lib/qa/package-profile';
-import { resolveWingetPackageDependencies } from '@/lib/winget-dependencies';
+import {
+  isWingetDependencyCompatibilityError,
+  resolveWingetPackageDependencies,
+} from '@/lib/winget-dependencies';
 import type { Json } from '@/types/database';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 import { resolveApplicationInstallScope } from '@/lib/packaging-adapters';
 import {
+  getPackageCompatibilityBlock,
   getPackageEligibilityBlocks,
   PACKAGE_UNAVAILABLE_MESSAGE,
+  PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
 } from '@/lib/package-eligibility';
+import { shouldReactivateSupersededCandidate } from '@/lib/qa/candidate-reactivation';
 
 export type QaDemandSource = 'customer' | 'auto_update' | 'managed' | 'operator';
 export type QaDemandState = 'passed' | 'failed' | 'waiting';
+
+const QA_ARCHITECTURE_UNAVAILABLE_MESSAGE =
+  'This app is not currently available for deployment.';
 
 export interface QaDemandInput extends QaWorkflowPackageInput {
   installerUrl: string;
@@ -48,6 +61,14 @@ export async function ensureQaDemand(
       },
     }),
   };
+  if (!isQaRunnerArchitectureSupported(input.architecture)) {
+    return {
+      identity: normalizeQaWorkflowPackageInput(baseResolvedInput).identity,
+      candidateId: null,
+      state: 'failed',
+      failureSummary: QA_ARCHITECTURE_UNAVAILABLE_MESSAGE,
+    };
+  }
   const eligibilityBlocks = await getPackageEligibilityBlocks(supabase, [input.wingetId]);
   if (eligibilityBlocks.length > 0) {
     return {
@@ -57,16 +78,59 @@ export async function ensureQaDemand(
       failureSummary: PACKAGE_UNAVAILABLE_MESSAGE,
     };
   }
+  const compatibilityBlock = await getPackageCompatibilityBlock(supabase, {
+    wingetId: input.wingetId,
+    version: input.version,
+    architecture: input.architecture || 'x64',
+    installerSha256: input.installerSha256,
+  });
+  if (compatibilityBlock) {
+    return {
+      identity: normalizeQaWorkflowPackageInput(baseResolvedInput).identity,
+      candidateId: null,
+      state: 'failed',
+      failureSummary: PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
+    };
+  }
   // Resolve at the QA-demand boundary as well as at final packaging dispatch.
   // This keeps both gates bound to the same server-trusted dependency graph;
   // caller-supplied dependency metadata is never authoritative.
-  const packageDependencies = await resolveWingetPackageDependencies({
-    wingetId: input.wingetId,
-    version: input.version,
-    architecture: input.architecture,
-    installerSha256: input.installerSha256,
-    installScope,
-  });
+  let packageDependencies: Awaited<ReturnType<typeof resolveWingetPackageDependencies>>;
+  try {
+    packageDependencies = await resolveWingetPackageDependencies({
+      wingetId: input.wingetId,
+      version: input.version,
+      architecture: input.architecture,
+      installerSha256: input.installerSha256,
+      installScope,
+    });
+  } catch (error) {
+    if (!isWingetDependencyCompatibilityError(error)) throw error;
+    const identity = normalizeQaWorkflowPackageInput(baseResolvedInput).identity;
+    const { error: blockError } = await supabase
+      .from('qa_package_blocks')
+      .upsert({
+        winget_id: input.wingetId,
+        version: input.version,
+        architecture: (input.architecture || 'x64').toLowerCase(),
+        installer_sha256: input.installerSha256.toUpperCase(),
+        block_code: error.blockCode,
+        detail: error.message,
+        observed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }, {
+        onConflict: 'winget_id,version,architecture,installer_sha256',
+      });
+    if (blockError) {
+      throw new Error(`Could not persist the package compatibility block: ${blockError.message}`);
+    }
+    return {
+      identity,
+      candidateId: null,
+      state: 'failed',
+      failureSummary: QA_ARCHITECTURE_UNAVAILABLE_MESSAGE,
+    };
+  }
   // The VM validates the same PSADT packaging route used for customer uploads,
   // with one deterministic, non-blocking visual profile per immutable payload.
   // Customer presentation choices are applied later by customer packaging and
@@ -244,6 +308,19 @@ export async function ensureQaDemand(
       candidateId: existing.id,
       state: 'failed',
       failureSummary: existing.failure_summary || 'This app did not pass the isolated installation test.',
+    };
+  }
+
+  if (
+    existing.status === 'superseded' &&
+    !shouldReactivateSupersededCandidate(existing.status, existing.failure_summary, true)
+  ) {
+    return {
+      identity,
+      candidateId: existing.id,
+      state: 'failed',
+      failureSummary:
+        existing.failure_summary || 'This installer is no longer available for deployment.',
     };
   }
 

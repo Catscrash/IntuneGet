@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
@@ -27,10 +27,11 @@ export async function GET(request: NextRequest) {
     // MSP tenant resolution requires Supabase; fall back to the token's own
     // tenant in Supabase-less SQLite installs (matches the pattern in
     // unmanaged-apps/route.ts). The package_config lookup below goes through
-    // the db abstraction, which already supports both SQLite and Supabase.
+    // the db abstraction, which already supports both SQLite and Supabase, so
+    // there is no need for a separate Supabase-less return path here.
     let tenantId = user.tenantId;
-    if (isSupabaseConfigured()) {
-      const supabase = createServerClient();
+    const supabase = getServerClientOrNull();
+    if (supabase) {
       const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 
       const tenantResolution = await resolveTargetTenantId({

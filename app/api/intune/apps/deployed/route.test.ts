@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 const {
   parseAccessTokenMock,
   createServerClientMock,
-  isSupabaseConfiguredMock,
+  isSupabaseServerConfiguredMock,
   resolveTargetTenantIdMock,
   getDatabaseMock,
   getByUserIdAndTenantIdMock,
@@ -11,7 +11,7 @@ const {
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
   createServerClientMock: vi.fn(),
-  isSupabaseConfiguredMock: vi.fn(),
+  isSupabaseServerConfiguredMock: vi.fn(),
   resolveTargetTenantIdMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getByUserIdAndTenantIdMock: vi.fn(),
@@ -24,7 +24,7 @@ vi.mock('@/lib/auth-utils', () => ({
 
 vi.mock('@/lib/supabase', () => ({
   createServerClient: createServerClientMock,
-  isSupabaseConfigured: isSupabaseConfiguredMock,
+  isSupabaseServerConfigured: isSupabaseServerConfiguredMock,
 }));
 
 vi.mock('@/lib/msp/tenant-resolution', () => ({
@@ -40,7 +40,7 @@ import { GET } from '@/app/api/intune/apps/deployed/route';
 describe('GET /api/intune/apps/deployed', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isSupabaseConfiguredMock.mockReturnValue(true);
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
     getDatabaseMock.mockReturnValue({
       uploadHistory: { getByUserIdAndTenantId: getByUserIdAndTenantIdMock },
       jobs: { getByTenantIdAndStatus: getByTenantIdAndStatusMock },
@@ -205,7 +205,7 @@ describe('GET /api/intune/apps/deployed', () => {
   });
 
   it('resolves deployments without touching Supabase when running Supabase-less (DATABASE_MODE=sqlite, no MSP config)', async () => {
-    isSupabaseConfiguredMock.mockReturnValue(false);
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
     parseAccessTokenMock.mockResolvedValue({
       userId: 'user-1',
       userEmail: 'user@example.com',

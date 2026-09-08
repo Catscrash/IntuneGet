@@ -17,11 +17,22 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // These stats are derived entirely from packaging_jobs, which exists in
-    // both backends, so this route works in Supabase-less SQLite installs too.
-    // It previously called createServerClient() unconditionally, which throws
-    // without Supabase config and made the dashboard answer 500.
-    const db = getDatabase();
+    const database = getDatabase();
+
+    // Define the shape of jobs returned from the queries
+    interface PackagingJobStats {
+      status: string;
+      completed_at: string | null;
+    }
+
+    interface PackagingJobRecent {
+      id: string;
+      winget_id: string;
+      display_name: string;
+      status: string;
+      created_at: string;
+      intune_app_url: string | null;
+    }
 
     // Get start of month in UTC for consistent timezone handling
     const now = new Date();
@@ -31,9 +42,14 @@ export async function GET(request: NextRequest) {
       1
     ));
 
-    // One uncapped read serves both the aggregate counts and the activity
-    // feed; a page would undercount the totals rather than just shorten them.
-    const allJobs = await db.jobs.getAllByUserId(user.userId);
+    // Fetch all jobs in a single query and aggregate in memory
+    // This is more efficient than 4 separate count queries
+    // getAllByUserId() rather than getByUserId(), which caps at 50 rows: the
+    // lifetime and this-month totals below have to see every job.
+    const jobs = await database.jobs.getAllByUserId(user.userId);
+    const recentJobs = jobs.slice(0, 5);
+
+    const allJobs = (jobs || []) as PackagingJobStats[];
 
     // Aggregate stats in memory
     let totalDeployed = 0;
@@ -73,8 +89,8 @@ export async function GET(request: NextRequest) {
       intuneAppUrl?: string;
     }
 
-    // getAllByUserId returns newest first, so the feed is just the head of it.
-    const recentActivity: RecentActivityItem[] = allJobs.slice(0, 5).map((job) => {
+    const allRecentJobs = (recentJobs || []) as PackagingJobRecent[];
+    const recentActivity: RecentActivityItem[] = allRecentJobs.map((job) => {
       let type: 'upload' | 'package' | 'error' = 'package';
       let status: 'success' | 'pending' | 'failed' = 'pending';
       let description = '';

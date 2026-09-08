@@ -58,6 +58,15 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Validate public changelog entries
+        run: node scripts/publish-changelog.mjs --validate
+
+      - name: Build packager
+        working-directory: packager
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
   lint:
     name: Lint
     runs-on: ubuntu-24.04

@@ -14,7 +14,7 @@ export function extractSilentSwitches(
   // Common silent switches by installer type
   const defaultSwitches: Record<string, string> = {
     msi: '/qn /norestart',
-    exe: '/S',
+    exe: '',
     inno: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
     nullsoft: '/S',
     wix: '/qn /norestart',
@@ -36,6 +36,7 @@ export function extractSilentSwitches(
   // Strip executable path first (handles paths with hyphens like "7z2501-x64.exe")
   // This removes everything up to and including common installer extensions
   let cleaned = installCommand
+    .replace(/^msiexec(?:\.exe)?\s+/i, '') // Remove Windows Installer launcher with or without .exe
     .replace(/^"[^"]+"\s*/, '') // Remove quoted paths like "C:\path\installer.exe"
     .replace(/^\S+\.(exe|msi|msix|appx)\s*/i, ''); // Remove unquoted paths ending in installer extensions
 
@@ -54,9 +55,14 @@ export function extractSilentSwitches(
   // tokens. The executable token and MSI action target were removed above, so
   // everything remaining belongs to the vendor's install contract.
   cleaned = cleaned.trim();
-  if (/^(?:\/\S+|-{1,2}\S+)/.test(cleaned) && cleaned !== '-DeploymentType') {
+  const beginsWithVendorSwitch = /^(?:\/\S+|-{1,2}\S+)/.test(cleaned);
+  const beginsWithMsiProperty = /^[A-Za-z_][A-Za-z0-9_.-]*=(?:"[^"]*"|\S+)(?:\s|$)/.test(cleaned);
+  if (
+    (beginsWithVendorSwitch && cleaned !== '-DeploymentType') ||
+    (['msi', 'wix'].includes(effectiveType) && beginsWithMsiProperty)
+  ) {
     return cleaned;
   }
 
-  return defaultSwitches[effectiveType] ?? (sourceType === 'zip' ? '' : '/S');
+  return defaultSwitches[effectiveType] ?? '';
 }

@@ -18,20 +18,43 @@ import { getCatalogSource } from '@/lib/catalog';
 const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests';
 const GITHUB_API_BASE = 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests';
 
-function normalizeProductCode(value: unknown): string | undefined {
+function normalizeProductCode(
+  value: unknown,
+  installerType?: unknown
+): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const match = value.trim().match(
+  const candidate = value.trim();
+  const match = candidate.match(
     /^\{?([A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12})\}?$/
   );
-  return match ? `{${match[1].toUpperCase()}}` : undefined;
+  if (match) return `{${match[1].toUpperCase()}}`;
+
+  // WinGet's ProductCode is the ARP registry key, not necessarily an MSI GUID.
+  // NSIS/Inno/EXE packages commonly publish stable values such as
+  // "IntelliJ IDEA 2025.2.5" or "{GUID}_is1". Preserve a conservative registry
+  // key subset for non-MSI installers so packaging can use exact identity
+  // matching instead of a marketing display-name heuristic.
+  const normalizedType = typeof installerType === 'string'
+    ? installerType.toLowerCase()
+    : '';
+  if (normalizedType === 'msi' || normalizedType === 'wix') return undefined;
+  const isSafeNamedKey = /^[A-Za-z0-9][A-Za-z0-9 ._{}()+-]{0,255}$/.test(candidate);
+  const isSafeInnoKey = /^\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}_[A-Za-z0-9._+-]{1,32}$/.test(candidate);
+  return isSafeNamedKey || isSafeInnoKey
+    ? candidate
+    : undefined;
 }
 
-function appsAndFeaturesProductCode(value: unknown): string | undefined {
+function appsAndFeaturesProductCode(
+  value: unknown,
+  installerType?: unknown
+): string | undefined {
   if (!Array.isArray(value)) return undefined;
   for (const entry of value) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const productCode = normalizeProductCode(
-      (entry as Record<string, unknown>).ProductCode
+      (entry as Record<string, unknown>).ProductCode,
+      installerType
     );
     if (productCode) return productCode;
   }
@@ -150,31 +173,96 @@ export async function fetchAvailableVersionsLive(wingetId: string): Promise<stri
 }
 
 /**
- * Fetch installer manifest from GitHub
+ * Transient upstream failure (throttling, outage) while talking to GitHub.
+ * Distinct from an authoritative 404 so trust decisions stay strict while
+ * callers can surface a retryable error instead of a generic crash.
+ */
+export class GitHubUnavailableError extends Error {
+  constructor(public readonly status: number) {
+    super(`GitHub fetch error: ${status}`);
+    this.name = 'GitHubUnavailableError';
+  }
+}
+
+function installerManifestPath(wingetId: string, version: string): string {
+  const { basePath } = getManifestPaths(wingetId);
+  return `${basePath}/${version}/${wingetId}.installer.yaml`
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+}
+
+/**
+ * Anonymous fallback via the raw CDN. Separate host with separate limits
+ * from api.github.com, and winget-pkgs is public so no token is needed;
+ * omitting it also sidesteps token-scoped throttling. A fallback 404 is not
+ * authoritative (the primary already failed non-404), so every fallback
+ * failure reports the primary status as a retryable outage.
+ */
+async function fetchInstallerManifestFromRawFallback(
+  wingetId: string,
+  version: string,
+  primaryStatus: number
+): Promise<Record<string, unknown>> {
+  const url = `${GITHUB_RAW_BASE}/${installerManifestPath(wingetId, version)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      headers: { 'User-Agent': 'IntuneGet', Accept: 'text/plain' },
+      cache: 'no-store',
+    });
+  } catch {
+    throw new GitHubUnavailableError(primaryStatus);
+  }
+
+  if (!response.ok) {
+    throw new GitHubUnavailableError(primaryStatus);
+  }
+
+  return YAML.parse(await response.text());
+}
+
+async function fetchInstallerManifestFromGitHub(
+  wingetId: string,
+  version: string
+): Promise<Record<string, unknown> | null> {
+  const url = `${GITHUB_API_BASE}/${installerManifestPath(wingetId, version)}?ref=master`;
+
+  const response = await fetch(url, {
+    headers: {
+      ...githubReadHeaders('application/vnd.github.raw+json'),
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    cache: 'no-store',
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      console.warn(`Installer manifest not found: ${url}`);
+      return null;
+    }
+    console.warn(
+      `GitHub Contents API returned ${response.status} for ${wingetId}@${version}, falling back to anonymous raw fetch`
+    );
+    return fetchInstallerManifestFromRawFallback(wingetId, version, response.status);
+  }
+
+  const yamlContent = await response.text();
+  return YAML.parse(yamlContent);
+}
+
+/**
+ * Fetch installer manifest from GitHub for best-effort catalog reads.
+ * Live trust decisions use the strict helper below so a transient upstream
+ * failure cannot be mistaken for an authoritative missing manifest.
  */
 export async function fetchInstallerManifest(
   wingetId: string,
   version: string
 ): Promise<Record<string, unknown> | null> {
-  const { basePath } = getManifestPaths(wingetId);
-  const url = `${GITHUB_RAW_BASE}/${basePath}/${version}/${wingetId}.installer.yaml`;
-
   try {
-    const response = await fetch(url, {
-      headers: githubReadHeaders('text/plain'),
-      cache: 'no-store',
-    });
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        console.warn(`Installer manifest not found: ${url}`);
-        return null;
-      }
-      throw new Error(`GitHub fetch error: ${response.status}`);
-    }
-
-    const yamlContent = await response.text();
-    return YAML.parse(yamlContent);
+    return await fetchInstallerManifestFromGitHub(wingetId, version);
   } catch (error) {
     console.error(`Failed to fetch installer manifest for ${wingetId}@${version}:`, error);
     return null;
@@ -444,10 +532,18 @@ function coerceInstallersArray(
       defaultSilentArgs ? { Silent: defaultSilentArgs } : undefined,
       inst.InstallerSwitches
     ),
+    InstallLocationRequired: inst.InstallLocationRequired === true,
+    DefaultInstallLocation:
+      typeof inst.DefaultInstallLocation === 'string'
+        ? inst.DefaultInstallLocation.trim() || undefined
+        : defaultInstallLocation(inst.InstallationMetadata),
     InstallerSuccessCodes: normalizeInstallerSuccessCodes(inst.InstallerSuccessCodes),
     ProductCode: explicitProductCode
-      ? normalizeProductCode(explicitProductCode)
-      : appsAndFeaturesProductCode(inst.AppsAndFeaturesEntries),
+      ? normalizeProductCode(explicitProductCode, inst.InstallerType || defaultType)
+      : appsAndFeaturesProductCode(
+          inst.AppsAndFeaturesEntries,
+          inst.InstallerType || defaultType
+        ),
     PackageFamilyName: inst.PackageFamilyName as string,
     UpgradeBehavior: inst.UpgradeBehavior as WingetInstaller['UpgradeBehavior'],
     Dependencies: inst.Dependencies as WingetInstaller['Dependencies'],
@@ -576,6 +672,14 @@ function mergeInstallerSwitches(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+function defaultInstallLocation(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = (value as Record<string, unknown>).DefaultInstallLocation;
+  if (typeof candidate !== 'string') return undefined;
+  const normalized = candidate.trim();
+  return normalized || undefined;
+}
+
 export function normalizeManifestInstallers(manifest: Record<string, unknown>): WingetInstaller[] {
   const rawInstallers = (manifest.Installers as Array<Record<string, unknown>>) || [];
 
@@ -584,24 +688,31 @@ export function normalizeManifestInstallers(manifest: Record<string, unknown>): 
   const defaultNestedType = manifest.NestedInstallerType as string;
   const defaultNestedFiles = manifest.NestedInstallerFiles as WingetInstaller['NestedInstallerFiles'];
   const defaultScope = manifest.Scope as string;
+  const defaultElevationRequirement = manifest.ElevationRequirement as string;
   const defaultSwitches = manifest.InstallerSwitches;
   const defaultPlatform = manifest.Platform as string[];
   const defaultMinOS = manifest.MinimumOSVersion as string;
   const defaultUpgrade = manifest.UpgradeBehavior as string;
   const defaultDependencies = manifest.Dependencies as WingetInstaller['Dependencies'];
   const defaultProductCode =
-    normalizeProductCode(manifest.ProductCode) ||
-    appsAndFeaturesProductCode(manifest.AppsAndFeaturesEntries);
+    normalizeProductCode(manifest.ProductCode, defaultType) ||
+    appsAndFeaturesProductCode(manifest.AppsAndFeaturesEntries, defaultType);
   const defaultPackageFamilyName = manifest.PackageFamilyName as string;
   const defaultSuccessCodes = normalizeInstallerSuccessCodes(manifest.InstallerSuccessCodes);
+  const defaultInstallLocationRequired = manifest.InstallLocationRequired === true;
+  const inheritedDefaultInstallLocation = defaultInstallLocation(manifest.InstallationMetadata);
 
   return rawInstallers.map((installer) => {
     const explicitInstallerProductCode = typeof installer.ProductCode === 'string'
       ? installer.ProductCode.trim()
       : '';
+    const effectiveInstallerType = (installer.InstallerType as string) || defaultType;
     const installerProductCode = explicitInstallerProductCode
-      ? normalizeProductCode(explicitInstallerProductCode)
-      : appsAndFeaturesProductCode(installer.AppsAndFeaturesEntries) || defaultProductCode;
+      ? normalizeProductCode(explicitInstallerProductCode, effectiveInstallerType)
+      : appsAndFeaturesProductCode(
+          installer.AppsAndFeaturesEntries,
+          effectiveInstallerType
+        ) || defaultProductCode;
 
     return ({
     Architecture: (installer.Architecture as WingetInstaller['Architecture']) || 'x64',
@@ -617,9 +728,18 @@ export function normalizeManifestInstallers(manifest: Record<string, unknown>): 
                           defaultNestedFiles,
     Scope: (installer.Scope as WingetInstaller['Scope']) ||
            (defaultScope as WingetInstaller['Scope']),
+    ElevationRequirement:
+      (installer.ElevationRequirement as WingetInstaller['ElevationRequirement']) ||
+      (defaultElevationRequirement as WingetInstaller['ElevationRequirement']),
     // WinGet inherits installer switches per field. An installer-level Custom
     // value must not discard a root-level Silent value (Vivaldi is one example).
     InstallerSwitches: mergeInstallerSwitches(defaultSwitches, installer.InstallerSwitches),
+    InstallLocationRequired:
+      typeof installer.InstallLocationRequired === 'boolean'
+        ? installer.InstallLocationRequired
+        : defaultInstallLocationRequired,
+    DefaultInstallLocation:
+      defaultInstallLocation(installer.InstallationMetadata) || inheritedDefaultInstallLocation,
     InstallerSuccessCodes:
       normalizeInstallerSuccessCodes(installer.InstallerSuccessCodes) || defaultSuccessCodes,
     // A non-empty installer-level ProductCode is authoritative. If it is an
@@ -643,7 +763,8 @@ function normalizeInstallerSuccessCodes(value: unknown): number[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const codes = Array.from(new Set(value
     .map((code) => typeof code === 'number' ? code : Number(code))
-    .filter((code) => Number.isInteger(code) && code >= 0 && code <= 65535)));
+    .filter((code) => Number.isInteger(code) && code >= -2147483648 && code <= 4294967295)
+    .map((code) => code > 2147483647 ? code - 4294967296 : code)));
   return codes.length > 0 ? codes : undefined;
 }
 
@@ -678,7 +799,9 @@ function getDefaultSilentSwitch(installerType: WingetInstallerType): string {
     msi: '/qn /norestart',
     msix: '',
     appx: '',
-    exe: '/S',
+    // A generic EXE format says nothing about the vendor's unattended
+    // contract. WinGet manifests must declare switches explicitly.
+    exe: '',
     inno: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
     nullsoft: '/S',
     wix: '/qn /norestart',
@@ -716,6 +839,47 @@ function appendCustomSwitch(silentArgs: string, custom: string | undefined): str
   return silentArgs ? `${silentArgs} ${newTokens.join(' ')}` : newTokens.join(' ');
 }
 
+function appendRequiredInstallLocation(
+  silentArgs: string,
+  installer: WingetInstaller
+): string {
+  if (!installer.InstallLocationRequired) return silentArgs;
+
+  const switchTemplate = installer.InstallerSwitches?.InstallLocation?.trim();
+  const installLocation = installer.DefaultInstallLocation?.trim();
+  if (!switchTemplate || !installLocation) return silentArgs;
+
+  const locationSwitch = switchTemplate.replace(/<INSTALLPATH>/gi, installLocation);
+  return silentArgs ? `${silentArgs} ${locationSwitch}` : locationSwitch;
+}
+
+/**
+ * Preserve WinGet's declared machine scope when an MSI/WiX package is
+ * authored as a dual-purpose installer. Such packages commonly default to
+ * ALLUSERS=2 plus MSIINSTALLPERUSER=1, which selects a per-user installation
+ * unless the command line explicitly requests the machine context.
+ *
+ * Do not replace a manifest-owned ALLUSERS value. A publisher may use a
+ * reviewed dual-purpose command (for example ALLUSERS=2 together with an
+ * empty MSIINSTALLPERUSER value), and the manifest remains authoritative in
+ * that case.
+ */
+function appendMachineScopeMsiProperty(
+  silentArgs: string,
+  installer: WingetInstaller,
+  effectiveType: WingetInstallerType
+): string {
+  if (
+    installer.Scope !== 'machine' ||
+    !['msi', 'wix'].includes(effectiveType) ||
+    /(?:^|\s)ALLUSERS\s*=/i.test(silentArgs)
+  ) {
+    return silentArgs;
+  }
+
+  return silentArgs ? `${silentArgs} ALLUSERS=1` : 'ALLUSERS=1';
+}
+
 /**
  * Normalize installer to standard format
  */
@@ -738,6 +902,8 @@ export function normalizeInstaller(installer: WingetInstaller): NormalizedInstal
   }
 
   silentArgs = appendCustomSwitch(silentArgs, installer.InstallerSwitches?.Custom);
+  silentArgs = appendMachineScopeMsiProperty(silentArgs, installer, effectiveType);
+  silentArgs = appendRequiredInstallLocation(silentArgs, installer);
 
   // Map manifest package dependencies (PascalCase) to the normalized shape
   const rawDependencies = installer.Dependencies?.PackageDependencies;
@@ -759,11 +925,18 @@ export function normalizeInstaller(installer: WingetInstaller): NormalizedInstal
     nestedInstallerType: installer.NestedInstallerType,
     nestedInstallerPath: installer.NestedInstallerFiles?.[0]?.RelativeFilePath,
     scope: installer.Scope,
+    elevationRequirement: installer.ElevationRequirement,
     silentArgs,
+    ...(installer.InstallLocationRequired !== undefined
+      ? { installLocationRequired: installer.InstallLocationRequired }
+      : {}),
+    ...(installer.DefaultInstallLocation
+      ? { defaultInstallLocation: installer.DefaultInstallLocation }
+      : {}),
     ...(normalizeInstallerSuccessCodes(installer.InstallerSuccessCodes)
       ? { installerSuccessCodes: normalizeInstallerSuccessCodes(installer.InstallerSuccessCodes) }
       : {}),
-    productCode: normalizeProductCode(installer.ProductCode),
+    productCode: normalizeProductCode(installer.ProductCode, installer.InstallerType),
     packageFamilyName: installer.PackageFamilyName,
     packageDependencies: packageDependencies.length > 0 ? packageDependencies : undefined,
     windowsFeatures: installer.Dependencies?.WindowsFeatures,
@@ -801,7 +974,7 @@ export async function getLiveInstallers(
   wingetId: string,
   version: string
 ): Promise<NormalizedInstaller[]> {
-  const installerManifest = await fetchInstallerManifest(wingetId, version);
+  const installerManifest = await fetchInstallerManifestFromGitHub(wingetId, version);
   if (!installerManifest) {
     return [];
   }

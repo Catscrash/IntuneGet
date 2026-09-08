@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { getServicePrincipalToken } from '@/lib/intune/graph-client';
@@ -27,41 +27,24 @@ export async function GET(
       );
     }
 
-    // MSP tenant resolution and the tenant_consent check both require
-    // Supabase. In Supabase-less SQLite installs there is no MSP membership
-    // data and no consent table to check - fall back to the token's own
-    // tenant and let the service-principal token acquired below prove
-    // consent (matches the pattern in unmanaged-apps/route.ts).
+    // Verify admin consent
+    const supabase = getServerClientOrNull();
+    const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
     let tenantId = user.tenantId;
-    if (isSupabaseConfigured()) {
-      const supabase = createServerClient();
-      const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 
+    if (supabase) {
       const tenantResolution = await resolveTargetTenantId({
-        supabase,
-        userId: user.userId,
-        tokenTenantId: user.tenantId,
+        supabase, userId: user.userId, tokenTenantId: user.tenantId,
         requestedTenantId: mspTenantId,
       });
-
-      if (tenantResolution.errorResponse) {
-        return tenantResolution.errorResponse;
-      }
-
+      if (tenantResolution.errorResponse) return tenantResolution.errorResponse;
       tenantId = tenantResolution.tenantId;
 
       const { data: consentData, error: consentError } = await supabase
-        .from('tenant_consent')
-        .select('*')
-        .eq('tenant_id', tenantId)
-        .eq('is_active', true)
-        .single();
-
+        .from('tenant_consent').select('*').eq('tenant_id', tenantId)
+        .eq('is_active', true).single();
       if (consentError || !consentData) {
-        return NextResponse.json(
-          { error: 'Admin consent not found' },
-          { status: 403 }
-        );
+        return NextResponse.json({ error: 'Admin consent not found' }, { status: 403 });
       }
     }
 
@@ -73,6 +56,16 @@ export async function GET(
         { error: 'Failed to get Graph API token' },
         { status: 500 }
       );
+    }
+
+    if (request.nextUrl.searchParams.get('view') === 'icon') {
+      const response = await fetch(`${GRAPH_API_BASE}/deviceAppManagement/mobileApps/${encodeURIComponent(id)}?$select=largeIcon`, {
+        headers: { Authorization: `Bearer ${graphToken}` }, signal: request.signal,
+        cache: 'no-store',
+      });
+      if (!response.ok) return NextResponse.json({ error: 'Failed to fetch app icon' }, { status: response.status });
+      const data = await response.json();
+      return NextResponse.json({ icon: data.largeIcon || null }, { headers: { 'Cache-Control': 'private, no-store' } });
     }
 
     // Fetch app details and assignments in parallel

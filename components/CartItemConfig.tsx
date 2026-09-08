@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
+  ArrowUpCircle,
   X,
   Settings,
   Terminal,
@@ -34,13 +35,15 @@ import {
 } from '@/components/ui/alert-dialog';
 import { cn } from '@/lib/utils';
 import { AssignmentConfig } from '@/components/AssignmentConfig';
+import { CartUpdatePolicyPicker, type CartUpdatePolicyValue } from '@/components/updates/CartUpdatePolicyPicker';
 import { CategoryConfig } from '@/components/CategoryConfig';
 import { DependencyConfig } from '@/components/DependencyConfig';
 import { EspProfileSelector } from '@/components/EspProfileSelector';
 import type { CartItem, StoreCartItem, IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
 import type { EspProfileSelection } from '@/types/esp';
 import { isStoreCartItem, isWin32CartItem } from '@/types/upload';
-import type { RequirementRule, AppRelationship } from '@/types/intune';
+import type { AppRelationship, MsiDetectionRule } from '@/types/intune';
+import { sanitizeProcessesToClose } from '@/types/psadt';
 import type {
   PSADTConfig,
   ProcessToClose,
@@ -54,7 +57,8 @@ import type {
 } from '@/types/psadt';
 import type { WingetScope } from '@/types/winget';
 import { useCartStore } from '@/stores/cart-store';
-import { generateRequirementRules } from '@/lib/requirement-rules';
+import { useUserSettings } from '@/components/providers/UserSettingsProvider';
+import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
 
 interface CartItemConfigProps {
@@ -72,6 +76,7 @@ type ConfigSection =
   | 'assignment'
   | 'category'
   | 'esp'
+  | 'updates'
   | 'dependencies'
   | 'branding'
   | 'advanced';
@@ -107,10 +112,20 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   );
   const [installCommand, setInstallCommand] = useState(isWin32 ? item.installCommand : '');
   const [uninstallCommand, setUninstallCommand] = useState(isWin32 ? item.uninstallCommand : '');
+  const [updatePolicy, setUpdatePolicy] = useState<CartUpdatePolicyValue>(
+    isWin32 ? item.updatePolicy : undefined
+  );
+  const { settings: userSettings } = useUserSettings();
+  const [carryOverAssignments, setCarryOverAssignments] = useState<boolean>(
+    isWin32
+      ? item.assignmentMigration?.carryOverAssignments ?? Boolean(userSettings.carryOverAssignments)
+      : false
+  );
 
   // UI state
   const [expandedSection, setExpandedSection] = useState<ConfigSection | null>(isStore ? 'assignment' : 'behavior');
   const [isSaving, setIsSaving] = useState(false);
+  const [processesError, setProcessesError] = useState<string | null>(null);
 
   const modalRef = useFocusTrap<HTMLDivElement>();
 
@@ -119,6 +134,8 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   const configSnapshot = JSON.stringify({
     storeInstallExperience, selectedScope, config, assignments, categories,
     espProfiles, relationships, installCommand, uninstallCommand,
+    updatePolicy: updatePolicy ?? null,
+    carryOverAssignments,
   });
   const baselineSnapshotRef = useRef(configSnapshot);
   const requestClose = () => {
@@ -158,6 +175,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   };
 
   const removeProcess = (index: number) => {
+    setProcessesError(null);
     setConfig((prev) => ({
       ...prev,
       processesToClose: prev.processesToClose.filter((_, i) => i !== index),
@@ -165,6 +183,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   };
 
   const updateProcess = (index: number, updates: Partial<ProcessToClose>) => {
+    setProcessesError(null);
     setConfig((prev) => ({
       ...prev,
       processesToClose: prev.processesToClose.map((p, i) =>
@@ -178,6 +197,20 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   };
 
   const handleSave = async () => {
+    // The packaging pipeline rejects close-process entries without an
+    // executable name, so block the save instead of storing a config that
+    // fails minutes later during packaging.
+    const sanitizedProcesses = isWin32
+      ? sanitizeProcessesToClose(config.processesToClose)
+      : null;
+    if (sanitizedProcesses && sanitizedProcesses.invalid.length > 0) {
+      setProcessesError(
+        'Each process to close needs an executable name, for example chrome. Fill in the process name or remove the row.'
+      );
+      setExpandedSection('behavior');
+      return;
+    }
+
     setIsSaving(true);
     try {
       if (isStore) {
@@ -191,17 +224,23 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
       } else {
         // Win32 apps: full config update
         // Generate requirement rules if any assignment uses "Update Only"
-        let requirementRules: RequirementRule[] | undefined;
-        if (isWin32 && assignments.some((a) => a.intent === 'updateOnly')) {
-          requirementRules = generateRequirementRules(
-            item.displayName,
-            item.installerType
-          );
-        }
+        const msiProductCode = isWin32
+          ? (item.detectionRules.find((rule) => rule.type === 'msi') as MsiDetectionRule | undefined)?.productCode
+          : undefined;
+        const requirementRules = isWin32
+          ? buildCartItemRequirementRules(
+              item.displayName,
+              item.installerType,
+              msiProductCode,
+              assignments
+            )
+          : undefined;
 
         updateItem(item.id, {
           installScope: selectedScope,
-          psadtConfig: config,
+          psadtConfig: sanitizedProcesses
+            ? { ...config, processesToClose: sanitizedProcesses.processes }
+            : config,
           assignments: assignments.length > 0 ? assignments : undefined,
           categories: categories.length > 0 ? categories : undefined,
           espProfiles: espProfiles.length > 0 ? espProfiles : undefined,
@@ -209,6 +248,14 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
           requirementRules,
           installCommand,
           uninstallCommand,
+          updatePolicy,
+          assignmentMigration:
+            updatePolicy === 'auto_update'
+              ? {
+                  carryOverAssignments,
+                  removeAssignmentsFromPreviousApp: carryOverAssignments,
+                }
+              : undefined,
         });
       }
       onClose();
@@ -424,7 +471,12 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                               value={process.name}
                               onChange={(e) => updateProcess(index, { name: e.target.value })}
                               placeholder="Process name (e.g., chrome)"
-                              className="flex-1 px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm"
+                              className={cn(
+                                'flex-1 px-3 py-2 bg-bg-elevated border rounded-lg text-text-primary text-sm',
+                                processesError && !process.name.trim() && process.description.trim()
+                                  ? 'border-red-500/60'
+                                  : 'border-overlay/15'
+                              )}
                             />
                             <input
                               type="text"
@@ -441,6 +493,9 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                             </button>
                           </div>
                         ))
+                      )}
+                      {processesError && (
+                        <p className="text-red-400 text-sm">{processesError}</p>
                       )}
                     </div>
                   </div>
@@ -1130,6 +1185,26 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                   hasRequiredAssignment={assignments.some((a) => a.intent === 'required')}
                 />
               </ConfigSection>
+
+              {/* App Updates (win32 only) */}
+              {isWin32 && <ConfigSection
+                title="App Updates"
+                icon={<ArrowUpCircle className="w-4 h-4" />}
+                expanded={expandedSection === 'updates'}
+                onToggle={() => toggleSection('updates')}
+              >
+                <div className="space-y-3">
+                  <p className="text-sm text-text-secondary">
+                    Choose how IntuneGet handles future versions of this app.
+                  </p>
+                  <CartUpdatePolicyPicker
+                    value={updatePolicy}
+                    onChange={setUpdatePolicy}
+                    carryOverAssignments={carryOverAssignments}
+                    onCarryOverAssignmentsChange={setCarryOverAssignments}
+                  />
+                </div>
+              </ConfigSection>}
 
               {/* Dependencies & Supersedence (win32 only) */}
               {isWin32 && <ConfigSection

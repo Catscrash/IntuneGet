@@ -189,6 +189,41 @@ describe('resolveWingetPackageDependencies', () => {
     });
   });
 
+  it('bundles a reviewed ASP.NET Core Runtime Burn prerequisite', async () => {
+    const io = fixtureIo(
+      {
+        'Example.App@1.0.0': [installer({
+          packageDependencies: [{
+            packageIdentifier: 'Microsoft.DotNet.AspNetCore.8',
+            minimumVersion: '8.0.29',
+          }],
+        })],
+        'Microsoft.DotNet.AspNetCore.8@8.0.30': [installer({
+          type: 'burn',
+          url: 'https://download.microsoft.com/aspnetcore-runtime-8.0.30-win-x64.exe',
+          sha256: VC_SHA,
+          silentArgs: '/quiet /norestart',
+        })],
+      },
+      { 'Microsoft.DotNet.AspNetCore.8': ['8.0.30'] }
+    );
+
+    const [dependency] = await resolveWingetPackageDependencies({
+      wingetId: 'Example.App',
+      version: '1.0.0',
+      architecture: 'x64',
+      installerSha256: ROOT_SHA,
+    }, io);
+
+    expect(dependency).toMatchObject({
+      packageIdentifier: 'Microsoft.DotNet.AspNetCore.8',
+      minimumVersion: '8.0.29',
+      version: '8.0.30',
+      installerType: 'burn',
+      silentArgs: '/quiet /norestart',
+    });
+  });
+
   it('selects the reviewed PowerShell Wix installer instead of its MSIX variant', async () => {
     const io = fixtureIo(
       {
@@ -277,7 +312,10 @@ describe('resolveWingetPackageDependencies', () => {
       version: '1.0.0',
       architecture: 'x64',
       installerSha256: ROOT_SHA,
-    }, io)).rejects.toThrow('not in the reviewed redistribution allowlist');
+    }, io)).rejects.toMatchObject({
+      blockCode: 'unreviewed_dependency',
+      message: expect.stringContaining('not in the reviewed redistribution allowlist'),
+    });
   });
 
   it('fails closed when WinGet declares an unsupported external dependency', async () => {
@@ -291,7 +329,10 @@ describe('resolveWingetPackageDependencies', () => {
       version: '1.0.0',
       architecture: 'x64',
       installerSha256: ROOT_SHA,
-    }, io)).rejects.toThrow('declares unsupported dependencies');
+    }, io)).rejects.toMatchObject({
+      blockCode: 'unsupported_dependency_shape',
+      message: expect.stringContaining('declares unsupported dependencies'),
+    });
   });
 
   it('refuses machine-wide prerequisites in a user-scope package', async () => {
@@ -313,6 +354,27 @@ describe('resolveWingetPackageDependencies', () => {
     }, io)).rejects.toThrow('cannot be installed safely in user scope');
   });
 
+  it('refuses a user-scope installer that explicitly requires elevation', async () => {
+    const io = fixtureIo(
+      { 'Example.App@1.0.0': [installer({
+        scope: 'user',
+        elevationRequirement: 'elevationRequired',
+      })] },
+      {}
+    );
+
+    await expect(resolveWingetPackageDependencies({
+      wingetId: 'Example.App',
+      version: '1.0.0',
+      architecture: 'x64',
+      installerSha256: ROOT_SHA,
+      installScope: 'user',
+    }, io)).rejects.toMatchObject({
+      blockCode: 'user_scope_elevation_required',
+      message: expect.stringContaining('requires elevation'),
+    });
+  });
+
   it('requires the exact trusted root installer hash', async () => {
     const io = fixtureIo(
       { 'Example.App@1.0.0': [installer()] },
@@ -324,6 +386,9 @@ describe('resolveWingetPackageDependencies', () => {
       version: '1.0.0',
       architecture: 'x64',
       installerSha256: 'C'.repeat(64),
-    }, io)).rejects.toThrow('trusted WinGet installer tuple');
+    }, io)).rejects.toMatchObject({
+      blockCode: 'trusted_installer_tuple_unavailable',
+      message: expect.stringContaining('trusted WinGet installer tuple'),
+    });
   });
 });

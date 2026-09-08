@@ -23,6 +23,41 @@ type GenericRelationship = {
 export interface Database {
   public: {
     Tables: {
+      installer_health: {
+        Row: {
+          cache_key: string;
+          winget_id: string;
+          version: string;
+          architecture: string;
+          installer_url: string;
+          expected_sha256: string;
+          actual_sha256: string | null;
+          status: 'checking' | 'healthy' | 'quarantined' | 'error';
+          reason_code: string | null;
+          reason_message: string | null;
+          checked_at: string | null;
+          expires_at: string | null;
+          lease_expires_at: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Omit<
+          Database['public']['Tables']['installer_health']['Row'],
+          'actual_sha256' | 'reason_code' | 'reason_message' | 'checked_at' |
+          'expires_at' | 'lease_expires_at' | 'created_at' | 'updated_at'
+        > & {
+          actual_sha256?: string | null;
+          reason_code?: string | null;
+          reason_message?: string | null;
+          checked_at?: string | null;
+          expires_at?: string | null;
+          lease_expires_at?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['installer_health']['Insert']>;
+        Relationships: GenericRelationship[];
+      };
       qa_results: {
         Row: {
           winget_id: string;
@@ -55,6 +90,11 @@ export interface Database {
           github_run_id: string | null;
           github_run_attempt: number | null;
           qa_schema_version: number;
+          virustotal_status: string | null;
+          virustotal_malicious: number | null;
+          virustotal_suspicious: number | null;
+          virustotal_total_engines: number | null;
+          virustotal_scanned_at_utc: string | null;
           synced_at: string;
         };
         Insert: {
@@ -88,6 +128,11 @@ export interface Database {
           github_run_id?: string | null;
           github_run_attempt?: number | null;
           qa_schema_version?: number;
+          virustotal_status?: string | null;
+          virustotal_malicious?: number | null;
+          virustotal_suspicious?: number | null;
+          virustotal_total_engines?: number | null;
+          virustotal_scanned_at_utc?: string | null;
           synced_at?: string;
         };
         Update: {
@@ -121,6 +166,11 @@ export interface Database {
           github_run_id?: string | null;
           github_run_attempt?: number | null;
           qa_schema_version?: number;
+          virustotal_status?: string | null;
+          virustotal_malicious?: number | null;
+          virustotal_suspicious?: number | null;
+          virustotal_total_engines?: number | null;
+          virustotal_scanned_at_utc?: string | null;
           synced_at?: string;
         };
         Relationships: GenericRelationship[];
@@ -255,6 +305,11 @@ export interface Database {
           package_content_sha256: string;
           github_run_id: string | null;
           github_run_url: string | null;
+          virustotal_status: string | null;
+          virustotal_malicious: number | null;
+          virustotal_suspicious: number | null;
+          virustotal_total_engines: number | null;
+          virustotal_scanned_at_utc: string | null;
           synced_at: string;
         };
         Insert: Omit<Database['public']['Tables']['qa_package_results']['Row'], 'synced_at'> & {
@@ -269,7 +324,15 @@ export interface Database {
           version: string;
           architecture: 'x64' | 'x86' | 'arm64';
           installer_sha256: string;
-          block_code: 'user_scope_machine_dependencies';
+          block_code:
+            | 'user_scope_machine_dependencies'
+            | 'user_scope_elevation_required'
+            | 'machine_scope_system_profile_install'
+            | 'missing_authoritative_install_identity'
+            | 'trusted_installer_tuple_unavailable'
+            | 'unsupported_dependency_shape'
+            | 'expired_signing_certificate'
+            | 'unreviewed_dependency';
           detail: string;
           observed_at: string;
           updated_at: string;
@@ -284,10 +347,64 @@ export interface Database {
         Update: Partial<Database['public']['Tables']['qa_package_blocks']['Insert']>;
         Relationships: GenericRelationship[];
       };
+      qa_catalog_reconciliations: {
+        Row: {
+          winget_id: string;
+          catalog_version: string;
+          observed_head_sha: string;
+          observed_live_version: string | null;
+          reason_code:
+            | 'package_or_version_missing'
+            | 'installer_manifest_missing'
+            | 'no_compatible_vm_installer'
+            | 'missing_trusted_installer_metadata'
+            | 'installer_hash_quarantined'
+            | 'package_compatibility_blocked';
+          observed_at: string;
+          updated_at: string;
+        };
+        Insert: Omit<
+          Database['public']['Tables']['qa_catalog_reconciliations']['Row'],
+          'observed_at' | 'updated_at'
+        > & {
+          observed_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<
+          Database['public']['Tables']['qa_catalog_reconciliations']['Insert']
+        >;
+        Relationships: GenericRelationship[];
+      };
+      curated_excluded_apps: {
+        Row: {
+          winget_id: string;
+          reason: string;
+          source: string;
+          excluded_at: string;
+          excluded_by: string | null;
+          notes: string | null;
+        };
+        Insert: Omit<
+          Database['public']['Tables']['curated_excluded_apps']['Row'],
+          'source' | 'excluded_at' | 'excluded_by' | 'notes'
+        > & {
+          source?: string;
+          excluded_at?: string;
+          excluded_by?: string | null;
+          notes?: string | null;
+        };
+        Update: Partial<
+          Database['public']['Tables']['curated_excluded_apps']['Insert']
+        >;
+        Relationships: GenericRelationship[];
+      };
       package_eligibility_blocks: {
         Row: {
           winget_id: string;
-          block_code: 'vendor_retired';
+          block_code:
+            | 'vendor_retired'
+            | 'upstream_removed'
+            | 'unsupported_managed_uninstall';
           detail: string;
           source_url: string;
           blocked_at: string;
@@ -305,11 +422,28 @@ export interface Database {
         >;
         Relationships: GenericRelationship[];
       };
+      qa_demand_backfill_selections: {
+        Row: {
+          winget_id: string;
+          last_selected_at: string;
+        };
+        Insert: {
+          winget_id: string;
+          last_selected_at?: string;
+        };
+        Update: Partial<
+          Database['public']['Tables']['qa_demand_backfill_selections']['Insert']
+        >;
+        Relationships: GenericRelationship[];
+      };
       qa_pipeline_control: {
         Row: {
           id: string;
           paused: boolean;
           reason: string | null;
+          required_packager_commit: string | null;
+          scheduler_packager_commit: string | null;
+          scheduler_seen_at: string | null;
           updated_at: string;
           updated_by: string | null;
         };
@@ -317,6 +451,9 @@ export interface Database {
           id: string;
           paused?: boolean;
           reason?: string | null;
+          required_packager_commit?: string | null;
+          scheduler_packager_commit?: string | null;
+          scheduler_seen_at?: string | null;
           updated_at?: string;
           updated_by?: string | null;
         };
@@ -346,6 +483,8 @@ export interface Database {
           supported_changed_count: number;
           demand_backfill_requested_count: number;
           demand_backfill_count: number;
+          catalog_backfill_requested_count: number;
+          catalog_backfill_count: number;
           created_at: string;
         };
         Insert: {
@@ -370,6 +509,8 @@ export interface Database {
           supported_changed_count?: number;
           demand_backfill_requested_count?: number;
           demand_backfill_count?: number;
+          catalog_backfill_requested_count?: number;
+          catalog_backfill_count?: number;
           created_at?: string;
         };
         Update: Partial<Database['public']['Tables']['qa_poll_runs']['Insert']>;
@@ -1418,6 +1559,7 @@ export interface Database {
           winget_id: string;
           display_name: string;
           version: string;
+          architecture: 'x64' | 'x86' | 'arm64' | 'arm' | 'neutral';
           total_tenants: number;
           completed_tenants: number;
           failed_tenants: number;
@@ -1438,6 +1580,7 @@ export interface Database {
           winget_id: string;
           display_name: string;
           version: string;
+          architecture?: 'x64' | 'x86' | 'arm64' | 'arm' | 'neutral';
           total_tenants: number;
           completed_tenants?: number;
           failed_tenants?: number;
@@ -1458,6 +1601,7 @@ export interface Database {
           winget_id?: string;
           display_name?: string;
           version?: string;
+          architecture?: 'x64' | 'x86' | 'arm64' | 'arm' | 'neutral';
           total_tenants?: number;
           completed_tenants?: number;
           failed_tenants?: number;
@@ -1538,6 +1682,7 @@ export interface Database {
           is_winget_verified: boolean | null;
           is_locale_variant: boolean | null;
           app_source: string | null;
+          upstream_miss_count: number;
           created_at: string;
           updated_at: string;
         };
@@ -1564,6 +1709,7 @@ export interface Database {
           is_winget_verified?: boolean | null;
           is_locale_variant?: boolean | null;
           app_source?: string | null;
+          upstream_miss_count?: number;
           created_at?: string;
           updated_at?: string;
         };
@@ -1590,6 +1736,7 @@ export interface Database {
           is_winget_verified?: boolean | null;
           is_locale_variant?: boolean | null;
           app_source?: string | null;
+          upstream_miss_count?: number;
           created_at?: string;
           updated_at?: string;
         };
@@ -2337,6 +2484,20 @@ export interface Database {
         Returns: Array<{
           winget_id: string;
         }>;
+      };
+      qa_idle_catalog_backfill_ids: {
+        Args: {
+          p_limit?: number;
+        };
+        Returns: Array<{
+          winget_id: string;
+        }>;
+      };
+      record_qa_demand_backfill_selection: {
+        Args: {
+          p_winget_ids: string[];
+        };
+        Returns: void;
       };
       increment_usage: {
         Args: {

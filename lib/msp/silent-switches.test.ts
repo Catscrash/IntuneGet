@@ -33,11 +33,36 @@ describe('extractSilentSwitches', () => {
     )).toBe('/configure https://aka.ms/fhlwingetconfig');
   });
 
+  it('does not guess a universal switch for a plain EXE command', () => {
+    expect(extractSilentSwitches('"setup.exe"', 'exe')).toBe('');
+  });
+
   it('keeps MSI properties after removing the install action target', () => {
     expect(extractSilentSwitches(
       'msiexec.exe /i "agent.msi" /qn REBOOT=ReallySuppress ALLUSERS=1',
       'msi'
     )).toBe('/qn REBOOT=ReallySuppress ALLUSERS=1');
+  });
+
+  it('keeps architecture-specific vendor MSI properties for packaging', () => {
+    expect(extractSilentSwitches(
+      'msiexec /i "Macabacus-9.9.2.msi" /qn /norestart OFFICE2016X64FOUND=1 EULA=1 ALLUSERS=1',
+      'wix'
+    )).toBe('/qn /norestart OFFICE2016X64FOUND=1 EULA=1 ALLUSERS=1');
+  });
+
+  it('keeps MSI properties that appear before the quiet switch', () => {
+    expect(extractSilentSwitches(
+      'msiexec /i "Macabacus-9.9.2.msi" EULA=1 /qn',
+      'wix'
+    )).toBe('EULA=1 /qn');
+  });
+
+  it('keeps an empty MSI property value before later switches', () => {
+    expect(extractSilentSwitches(
+      'msiexec.exe /i "dual-purpose.msi" MSIINSTALLPERUSER="" ALLUSERS=2 /qn',
+      'msi'
+    )).toBe('MSIINSTALLPERUSER="" ALLUSERS=2 /qn');
   });
 
   it('fails closed for an archive with no nested installer type', () => {

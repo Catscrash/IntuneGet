@@ -1,3 +1,4 @@
+import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
 /**
  * Package API Route
  * Queues packaging jobs by triggering GitHub Actions workflows
@@ -5,7 +6,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import {
   isGitHubActionsConfigured,
@@ -21,6 +22,7 @@ import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { checkStoredConsent } from '@/lib/msp/consent-cache';
 import { extractSilentSwitches } from '@/lib/msp/silent-switches';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
+import { sanitizeAssignmentsForDispatch } from '@/lib/assignment-intents';
 import { acquireGraphToken } from '@/lib/graph-token';
 import { deployStoreApp } from '@/lib/store-app-deploy';
 import {
@@ -36,14 +38,18 @@ import {
   enforceInstallerPreflight,
   InstallerPreflightError,
 } from '@/lib/installer-preflight';
+import { applyInstallerUrlOverride } from '@/lib/installer-url-overrides';
 import { ensureQaDemand } from '@/lib/qa/demand';
+import { isDeferredCustomerQaEnabled } from '@/lib/qa/continuity';
 import {
   applyApplicationPackagingAdapter,
   resolveApplicationInstallScope,
 } from '@/lib/packaging-adapters';
 import { normalizeCatalogDetectionRules } from '@/lib/catalog-detection';
+import { inferSavedCustomMarkerPath } from '@/lib/registry-marker';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 import { reconcileCatalogInstaller } from '@/lib/catalog-installer-reconciliation';
+import { evaluatePackagingContract } from '@/lib/packaging-contract';
 import type { NormalizedInstaller } from '@/types/winget';
 import {
   getPackageEligibilityBlocks,
@@ -87,24 +93,20 @@ export async function POST(request: NextRequest) {
     const tokenTenantId = user.tenantId;
 
     // Check for MSP tenant override header and enforce tenant access checks
-    // (membership, managed tenant consent, and customer-only access mode).
-    // MSP features require Supabase; in Supabase-less SQLite installs there
-    // is no MSP membership data to resolve against, so skip straight to the
-    // token's own tenant (matches the pattern in unmanaged-apps/route.ts).
-    let tenantId = tokenTenantId;
-    if (isSupabaseConfigured()) {
-      const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
-      const { tenantId: resolvedTenantId, errorResponse: tenantError } = await resolveTargetTenantId({
-        supabase: createServerClient(),
-        userId,
-        tokenTenantId,
-        requestedTenantId: mspTenantId,
-      });
+    // (membership, managed tenant consent, and customer-only access mode)
+    const supabaseServerConfigured = isSupabaseServerConfigured();
+    const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
+    const { tenantId, errorResponse: tenantError } = supabaseServerConfigured
+      ? await resolveTargetTenantId({
+          supabase: createServerClient(),
+          userId,
+          tokenTenantId,
+          requestedTenantId: mspTenantId,
+        })
+      : { tenantId: tokenTenantId, errorResponse: null };
 
-      if (tenantError) {
-        return tenantError;
-      }
-      tenantId = resolvedTenantId;
+    if (tenantError) {
+      return tenantError;
     }
 
     // Verify admin consent for the target tenant before accepting jobs
@@ -206,10 +208,7 @@ export async function POST(request: NextRequest) {
     const catalogWin32Items = win32Items.filter(
       (item) => item.sourceType !== 'custom' && typeof item.wingetId === 'string'
     );
-    // The retirement blocklist lives in a Supabase-only table. A self-hosted
-    // SQLite install has no such list, so nothing is blocked rather than the
-    // deploy failing on a table that does not exist.
-    const eligibilityBlocks = isSupabaseConfigured()
+    const eligibilityBlocks = supabaseServerConfigured
       ? await getPackageEligibilityBlocks(
           createServerClient(),
           catalogWin32Items.map((item) => item.wingetId)
@@ -279,6 +278,26 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
+      if (item.sourceType === 'custom') {
+        const packagingContract = evaluatePackagingContract({
+          wingetId: item.wingetId,
+          installerType: item.installerType,
+          silentArgs: extractSilentSwitches(
+            item.installCommand,
+            item.installerType,
+            item.nestedInstallerType
+          ),
+          nestedInstallerType: item.nestedInstallerType,
+          nestedInstallerFiles: item.nestedInstallerPath ? [item.nestedInstallerPath] : [],
+        });
+        if (!packagingContract.valid) {
+          return NextResponse.json({
+            error: 'Installer validation blocked this deployment',
+            message: packagingContract.message,
+            code: 'SILENT_INSTALL_UNAVAILABLE',
+          }, { status: 400 });
+        }
+      }
     }
 
     // Re-resolve catalog metadata from the live trusted manifest after the
@@ -333,19 +352,27 @@ export async function POST(request: NextRequest) {
     // batches responsive.
     for (let i = 0; i < win32Items.length; i += 2) {
       const preflightResults = await Promise.allSettled(
-        win32Items.slice(i, i + 2).map((item) => enforceInstallerPreflight(
-          {
+        win32Items.slice(i, i + 2).map((item) => {
+          const executionInstallerUrl = applyInstallerUrlOverride(
+            item.wingetId,
+            item.version,
+            item.architecture || '',
+            item.installerUrl,
+          );
+          return enforceInstallerPreflight({
             wingetId: item.wingetId,
             version: item.version,
             architecture: item.architecture,
-            installerUrl: item.installerUrl,
+            installerUrl: executionInstallerUrl,
+            manifestInstallerUrl: item.installerUrl,
             installerSha256: item.installerSha256,
             installerType: item.installerType,
             installScope: item.installScope,
             sourceType: item.sourceType,
           },
           trustedInstallersByItem.get(item),
-        )),
+          );
+        }),
       );
 
       const failedIndex = preflightResults.findIndex((result) => result.status === 'rejected');
@@ -523,26 +550,45 @@ export async function POST(request: NextRequest) {
           try {
             if (item.sourceType !== 'custom') {
               const requestedPsadtConfig = item.psadtConfig || DEFAULT_PSADT_CONFIG;
-              const detectionRules = normalizeCatalogDetectionRules({
+              let detectionRules = normalizeCatalogDetectionRules({
                 detectionRules: item.detectionRules,
                 fallbackDetectionRules: requestedPsadtConfig.detectionRules,
                 wingetId: item.wingetId,
                 version: item.version,
                 installScope: item.installScope,
                 markerPath: requestedPsadtConfig.registryMarkerPath,
+                installerType: item.nestedInstallerType || item.installerType,
               });
+              const inferredMarkerPath = requestedPsadtConfig.registryMarkerPath
+                ? null
+                : inferSavedCustomMarkerPath({
+                    detectionRules,
+                    wingetId: item.wingetId,
+                    version: item.version,
+                    installScope: item.installScope,
+                  });
+              const effectivePsadtConfig = inferredMarkerPath
+                ? { ...requestedPsadtConfig, registryMarkerPath: inferredMarkerPath }
+                : requestedPsadtConfig;
+              if (inferredMarkerPath) {
+                detectionRules = normalizeCatalogDetectionRules({
+                  detectionRules,
+                  wingetId: item.wingetId,
+                  version: item.version,
+                  installScope: item.installScope,
+                  markerPath: inferredMarkerPath,
+                  installerType: item.nestedInstallerType || item.installerType,
+                });
+              }
               item.detectionRules = detectionRules;
               item.psadtConfig = applyApplicationPackagingAdapter(
                 item.wingetId,
-                { ...requestedPsadtConfig, detectionRules }
+                { ...effectivePsadtConfig, detectionRules }
               );
             }
             const jobId = crypto.randomUUID();
             const installerSha256 = item.installerSha256?.trim() || '';
-            // QA gating is a hosted-service feature: the candidate tables and
-            // the runners that fill them are Supabase-side. Without it the job
-            // simply carries no QA state, the same as a custom-source item.
-            const qaDemand = item.sourceType === 'custom' || !isSupabaseConfigured()
+            const qaDemand = isQaMaintenanceMode() || item.sourceType === 'custom' || !supabaseServerConfigured
               ? null
               : await ensureQaDemand(createServerClient(), {
                   wingetId: item.wingetId,
@@ -568,11 +614,15 @@ export async function POST(request: NextRequest) {
                   priority: 2000,
                   demandSource: 'customer',
                 });
-            const initialStatus = qaDemand?.state === 'waiting'
-              ? 'awaiting_qa'
-              : qaDemand?.state === 'failed'
-                ? 'qa_failed'
-                : 'queued';
+            const qaDeferred = qaDemand?.state === 'waiting' && isDeferredCustomerQaEnabled();
+            // Self-hosted installs have no QA pipeline, so local jobs must remain pollable.
+            const initialStatus = isLocalPackagerMode && !supabaseServerConfigured
+              ? 'queued'
+              : qaDemand?.state === 'waiting' && !qaDeferred
+                ? 'awaiting_qa'
+                : qaDemand?.state === 'failed'
+                  ? 'qa_failed'
+                  : 'queued';
             const now = new Date().toISOString();
 
             const jobRecord = await db.jobs.create({
@@ -595,7 +645,9 @@ export async function POST(request: NextRequest) {
               package_config: item as unknown as import('@/types/database').Json,
               status: initialStatus,
               status_message: qaDemand?.state === 'waiting'
-                ? 'Running an isolated installation test to make sure this app works before deployment'
+                ? qaDeferred
+                  ? 'Preparing deployment while installation validation remains scheduled'
+                  : 'Running an isolated installation test to make sure this app works before deployment'
                 : qaDemand?.state === 'failed'
                   ? qaDemand.failureSummary
                   : null,
@@ -615,7 +667,7 @@ export async function POST(request: NextRequest) {
               continue;
             }
 
-            if (qaDemand?.state === 'waiting' || qaDemand?.state === 'failed') {
+            if ((qaDemand?.state === 'waiting' && !qaDeferred) || qaDemand?.state === 'failed') {
               jobs.push({
                 id: jobId,
                 user_id: userId,
@@ -697,7 +749,14 @@ export async function POST(request: NextRequest) {
               psadtConfig: item.psadtConfig ? JSON.stringify(item.psadtConfig) : undefined,
               detectionRules: item.detectionRules ? JSON.stringify(item.detectionRules) : undefined,
               requirementRules: item.requirementRules ? JSON.stringify(item.requirementRules) : undefined,
-              assignments: item.assignments ? JSON.stringify(item.assignments) : undefined,
+              assignments: item.assignments
+                ? JSON.stringify(
+                    sanitizeAssignmentsForDispatch(
+                      item.assignments,
+                      Boolean(item.requirementRules?.length)
+                    )
+                  )
+                : undefined,
               categories: item.categories ? JSON.stringify(item.categories) : undefined,
               espProfiles: item.espProfiles ? JSON.stringify(item.espProfiles) : undefined,
               relationships: item.relationships && item.relationships.length > 0
@@ -705,7 +764,7 @@ export async function POST(request: NextRequest) {
                 : undefined,
               installScope: item.installScope,
               forceCreate: item.forceCreate || forceCreate,
-              qaOverride: item.qaOverride,
+              qaOverride: isQaMaintenanceMode() || item.qaOverride,
               sourceType: item.sourceType,
             };
 
@@ -790,9 +849,12 @@ export async function POST(request: NextRequest) {
             ? `${storeDeployed} Store app(s) deployed successfully`
             : `${win32Queued} job(s) queued successfully`,
     });
-  } catch {
+  } catch (err) {
+    console.error('[Package] Failed to create packaging jobs:', err);
+    // Self-hosted operators read their own logs, so surface the real message there.
+    const detail = !isSupabaseServerConfigured() && err instanceof Error ? err.message : null;
     return NextResponse.json(
-      { error: 'Internal server error' },
+      { error: detail ?? 'Internal server error' },
       { status: 500 }
     );
   }
@@ -914,9 +976,10 @@ export async function GET(request: NextRequest) {
     const scope = searchParams.get('scope');
     if (scope === 'tenant') {
       // MSP tenant resolution requires Supabase; fall back to the token's
-      // own tenant in Supabase-less SQLite installs.
+      // own tenant in Supabase-less SQLite installs, where createServerClient()
+      // would otherwise throw and turn this into a 500.
       let tenantId = user.tenantId;
-      if (isSupabaseConfigured()) {
+      if (isSupabaseServerConfigured()) {
         const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
         const { tenantId: resolvedTenantId, errorResponse } = await resolveTargetTenantId({
           supabase: createServerClient(),
@@ -941,9 +1004,11 @@ export async function GET(request: NextRequest) {
     const healedJobs = await healStaleJobs(db, jobs);
 
     return NextResponse.json({ jobs: healedJobs });
-  } catch {
+  } catch (err) {
+    console.error('[Package] Failed to fetch jobs:', err);
+    const detail = !isSupabaseServerConfigured() && err instanceof Error ? err.message : null;
     return NextResponse.json(
-      { error: 'Failed to fetch jobs' },
+      { error: detail ?? 'Failed to fetch jobs' },
       { status: 500 }
     );
   }

@@ -3,7 +3,7 @@ import { NextRequest } from 'next/server';
 const {
   parseAccessTokenMock,
   createServerClientMock,
-  isSupabaseConfiguredMock,
+  isSupabaseServerConfiguredMock,
   getDatabaseMock,
   getHistoryMock,
   getJobByIdMock,
@@ -12,7 +12,7 @@ const {
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
   createServerClientMock: vi.fn(),
-  isSupabaseConfiguredMock: vi.fn(),
+  isSupabaseServerConfiguredMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getHistoryMock: vi.fn(),
   getJobByIdMock: vi.fn(),
@@ -26,7 +26,7 @@ vi.mock('@/lib/auth-utils', () => ({
 
 vi.mock('@/lib/supabase', () => ({
   createServerClient: createServerClientMock,
-  isSupabaseConfigured: isSupabaseConfiguredMock,
+  isSupabaseServerConfigured: isSupabaseServerConfiguredMock,
 }));
 
 vi.mock('@/lib/catalog', () => ({
@@ -160,7 +160,7 @@ function makeRequest(body: Record<string, unknown>) {
 describe('POST /api/update-policies', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isSupabaseConfiguredMock.mockReturnValue(true);
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
     getDatabaseMock.mockReturnValue({
       uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
       jobs: { getById: getJobByIdMock },
@@ -394,7 +394,7 @@ describe('POST /api/update-policies', () => {
     // Regression: the route called createServerClient() unconditionally, which
     // throws without Supabase config, so a self-hosted SQLite install got a
     // 500 here. Policies genuinely need Supabase - say so with a 503.
-    isSupabaseConfiguredMock.mockReturnValue(false);
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
 
     const response = await POST(
       makeRequest({
@@ -406,7 +406,7 @@ describe('POST /api/update-policies', () => {
     const body = await response.json();
 
     expect(response.status).toBe(503);
-    expect(body.error).toMatch(/not available on this self-hosted deployment/);
+    expect(body.error).toMatch(/require hosted services/);
     expect(createServerClientMock).not.toHaveBeenCalled();
   });
 });

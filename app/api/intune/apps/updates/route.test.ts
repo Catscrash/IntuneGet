@@ -34,6 +34,11 @@ vi.mock('@/lib/supabase', () => ({
   // getCatalogSource() branches on isSupabaseConfigured(), and so does the
   // route itself now, so each case decides which mode it runs in.
   isSupabaseConfigured: isSupabaseConfiguredMock,
+  isSupabaseServerConfigured: isSupabaseConfiguredMock,
+  // The route reaches for its client through getServerClientOrNull(); drive it
+  // from the same two mocks so every case below keeps setting just those.
+  getServerClientOrNull: () =>
+    isSupabaseConfiguredMock() ? createServerClientMock() : null,
 }));
 
 vi.mock('@/lib/db', () => ({

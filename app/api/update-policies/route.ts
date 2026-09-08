@@ -5,7 +5,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
@@ -18,6 +18,10 @@ import type { Json } from '@/types/database';
  */
 export async function GET(request: NextRequest) {
   try {
+    if (!isSupabaseServerConfigured()) {
+      return NextResponse.json({ policies: [], count: 0 });
+    }
+
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -33,7 +37,7 @@ export async function GET(request: NextRequest) {
     // no SQLite equivalent, and the schedulers that would act on a policy
     // (vercel.json crons) do not exist in a self-hosted container. Report that
     // plainly instead of crashing on createServerClient().
-    if (!isSupabaseConfigured()) {
+    if (!isSupabaseServerConfigured()) {
       return NextResponse.json(
         {
           error:
@@ -84,6 +88,13 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
+    if (!isSupabaseServerConfigured()) {
+      return NextResponse.json(
+        { error: 'Auto-update policies require hosted services' },
+        { status: 503 }
+      );
+    }
+
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -115,7 +126,7 @@ export async function POST(request: NextRequest) {
     // no SQLite equivalent, and the schedulers that would act on a policy
     // (vercel.json crons) do not exist in a self-hosted container. Report that
     // plainly instead of crashing on createServerClient().
-    if (!isSupabaseConfigured()) {
+    if (!isSupabaseServerConfigured()) {
       return NextResponse.json(
         {
           error:
@@ -188,21 +199,11 @@ export async function POST(request: NextRequest) {
         latestVersion = catalogApp?.latest_version || '';
       }
 
-      // Read the user's global carry-over setting (same source as the trigger route)
-      const { data: userSettingsRow } = await (supabase as any)
-        .from('user_settings')
-        .select('settings')
-        .eq('user_id', user.userId)
-        .maybeSingle();
-      const userSettings = (userSettingsRow?.settings as Record<string, unknown> | null) || null;
-      const globalCarryOver = Boolean(userSettings?.carryOverAssignments);
-
       const built = await buildDeploymentConfigForApp(supabase, {
         userId: user.userId,
         tenantId: body.tenant_id,
         wingetId: body.winget_id,
         latestVersion,
-        globalCarryOver,
       });
 
       if (built.status !== 'ok') {

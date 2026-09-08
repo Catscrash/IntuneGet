@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { getServicePrincipalToken } from '@/lib/intune/graph-client';
 import {
@@ -12,7 +12,9 @@ import {
   assignToGroups,
   convertToGraphAssignments,
   syncAppCategories,
+  setAppRules,
 } from '@/lib/intune-api';
+import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
 import { parseAccessToken } from '@/lib/auth-utils';
 import type { PackageAssignment, IntuneAppCategorySelection } from '@/types/upload';
 import type { Json } from '@/types/database';
@@ -32,45 +34,36 @@ export async function PATCH(
       );
     }
 
-    // MSP tenant resolution and the tenant_consent check both require
-    // Supabase. In Supabase-less SQLite installs there is no MSP membership
-    // data and no consent table to check - fall back to the token's own
-    // tenant and let the service-principal token acquired below prove
-    // consent (matches the pattern in unmanaged-apps/route.ts). `supabase`
-    // stays undefined in that case; the packaging_jobs history sync near the
-    // end of this handler is Supabase-only and already guards on it.
-    let tenantId = user.tenantId;
-    const supabase = isSupabaseConfigured() ? createServerClient() : undefined;
-    if (supabase) {
-      const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
+    // Resolve tenant (MSP-aware)
+    const supabase = getServerClientOrNull();
+    const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 
-      const tenantResolution = await resolveTargetTenantId({
-        supabase,
-        userId: user.userId,
-        tokenTenantId: user.tenantId,
-        requestedTenantId: mspTenantId,
-      });
+    const tenantResolution = supabase ? await resolveTargetTenantId({
+      supabase,
+      userId: user.userId,
+      tokenTenantId: user.tenantId,
+      requestedTenantId: mspTenantId,
+    }) : { tenantId: user.tenantId, errorResponse: null };
 
-      if (tenantResolution.errorResponse) {
-        return tenantResolution.errorResponse;
-      }
+    if (tenantResolution.errorResponse) {
+      return tenantResolution.errorResponse;
+    }
 
-      tenantId = tenantResolution.tenantId;
+    const tenantId = tenantResolution.tenantId;
 
-      // Verify admin consent
-      const { data: consentData, error: consentError } = await supabase
-        .from('tenant_consent')
-        .select('*')
-        .eq('tenant_id', tenantId)
-        .eq('is_active', true)
-        .single();
+    // Verify admin consent
+    const { data: consentData, error: consentError } = supabase ? await supabase
+      .from('tenant_consent')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('is_active', true)
+      .single() : { data: true, error: null };
 
-      if (consentError || !consentData) {
-        return NextResponse.json(
-          { error: 'Admin consent not found. Please complete the admin consent flow.' },
-          { status: 403 }
-        );
-      }
+    if (consentError || !consentData) {
+      return NextResponse.json(
+        { error: 'Admin consent not found. Please complete the admin consent flow.' },
+        { status: 403 }
+      );
     }
 
     // Get service principal token
@@ -107,6 +100,26 @@ export async function PATCH(
 
     // Apply assignments
     if (assignments) {
+      const productCode = existingApp.msiInformation?.productCode;
+      const requirementRules = buildCartItemRequirementRules(
+        existingApp.displayName,
+        productCode ? 'msi' : 'exe',
+        productCode,
+        assignments
+      );
+      // Skip when the app already carries requirement rules so repeated
+      // settings updates do not stack duplicates onto the rules array.
+      const existingRules = existingApp.rules ?? [];
+      const hasRequirementRule = existingRules.some(
+        (rule) => rule.ruleType === 'requirement'
+      );
+      if (requirementRules && !hasRequirementRule) {
+        await setAppRules(graphToken, intuneAppId, [
+          ...existingRules,
+          ...requirementRules,
+        ]);
+      }
+
       const graphAssignments = convertToGraphAssignments(assignments);
       await assignToGroups(graphToken, intuneAppId, graphAssignments);
     }

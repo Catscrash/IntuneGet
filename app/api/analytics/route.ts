@@ -52,17 +52,28 @@ export async function GET(request: NextRequest) {
       now.getUTCDate() - days
     ));
 
-    // Reports are derived entirely from packaging_jobs, which exists in both
-    // backends, so this works in Supabase-less SQLite installs too. It
-    // previously called createServerClient() unconditionally, which throws
-    // without Supabase config and made the whole Reports page answer 500.
-    // The date window is applied here rather than in the query: the adapter
-    // returns a user's jobs newest-first and uncapped, so narrowing in memory
-    // cannot drop rows the report should have counted.
-    const startIso = startDate.toISOString();
-    const allJobs = (await getDatabase().jobs.getAllByUserId(user.userId)).filter(
-      (job) => job.created_at >= startIso
+    const database = getDatabase();
+
+    // Define the shape of jobs returned from the query
+    interface PackagingJobAnalytics {
+      id: string;
+      winget_id: string;
+      display_name: string;
+      publisher: string | null;
+      status: string;
+      error_message: string | null;
+      created_at: string;
+      completed_at: string | null;
+    }
+
+    // Get all jobs in date range. getAllByUserId() rather than getByUserId(),
+    // which caps at 50 rows: a report over a 30-365 day window must count every
+    // job in it, not just the newest page.
+    const jobs = (await database.jobs.getAllByUserId(user.userId)).filter(
+      (job) => new Date(job.created_at) >= startDate
     );
+
+    const allJobs = (jobs || []) as PackagingJobAnalytics[];
 
     // Calculate success rate
     const completedJobs = allJobs.filter((j) => j.status === 'completed').length;

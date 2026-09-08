@@ -162,6 +162,19 @@ interface CartItemBase {
   // Explicit acknowledgement of a failed QA result for this exact version.
   qaOverride?: boolean;
 
+  // Update policy chosen during deployment configuration. Absent = "Notify"
+  // (default): no policy row is written on deploy, preserving any policy set
+  // earlier on the Updates page. Win32 only; the UI never sets it for Store apps.
+  updatePolicy?: 'auto_update' | 'ignore';
+
+  // Explicit per-app assignment carry-over for auto updates, set alongside
+  // updatePolicy === 'auto_update'. Absent = follow the user's global
+  // carryOverAssignments setting at update time.
+  assignmentMigration?: {
+    carryOverAssignments: boolean;
+    removeAssignmentsFromPreviousApp: boolean;
+  };
+
   // Cart metadata
   addedAt: string;
 }

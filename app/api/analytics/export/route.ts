@@ -31,12 +31,29 @@ export async function GET(request: NextRequest) {
       now.getUTCDate() - days
     ));
 
+    const database = getDatabase();
 
-    // Same source as the Reports page itself: packaging_jobs through the db
-    // abstraction, so the export works without Supabase as well.
-    const startIso = startDate.toISOString();
-    const jobs = (await getDatabase().jobs.getAllByUserId(user.userId)).filter(
-      (job) => job.created_at >= startIso
+    // Define the shape of jobs returned from the query
+    interface PackagingJobExport {
+      id: string;
+      winget_id: string;
+      display_name: string;
+      publisher: string | null;
+      version: string;
+      architecture: string | null;
+      installer_type: string;
+      status: string;
+      error_message: string | null;
+      intune_app_id: string | null;
+      created_at: string;
+      completed_at: string | null;
+    }
+
+    // Get all jobs in date range. getAllByUserId() rather than getByUserId(),
+    // which caps at 50 rows: a CSV export of the window must contain every job
+    // in it, not just the newest page.
+    const jobs = (await database.jobs.getAllByUserId(user.userId)).filter(
+      (job) => new Date(job.created_at) >= startDate
     );
 
     // Build CSV
@@ -55,7 +72,8 @@ export async function GET(request: NextRequest) {
       'Completed At',
     ];
 
-    const rows = jobs.map((job) => [
+    const allJobs = (jobs || []) as PackagingJobExport[];
+    const rows = allJobs.map((job) => [
       job.id,
       job.winget_id,
       job.display_name,

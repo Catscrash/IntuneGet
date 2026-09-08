@@ -11,7 +11,9 @@ import {
   Monitor,
   Radio,
   Server,
+  ShieldAlert,
   ShieldCheck,
+  ShieldQuestion,
   XCircle,
 } from 'lucide-react';
 import { AppIcon } from '@/components/AppIcon';
@@ -29,10 +31,10 @@ import {
   getQaPhasePresentation,
 } from '@/lib/qa/presentation';
 import { cn } from '@/lib/utils';
-import type { QaLivePhase, QaLiveResponse } from '@/types/qa';
+import type { QaLivePhase, QaLiveResponse, QaVirusTotalStatus } from '@/types/qa';
 
 function healthTone(state: string): StatusTone {
-  if (state === 'healthy' || state === 'testing') return 'success';
+  if (state === 'healthy' || state === 'testing' || state === 'idle') return 'success';
   if (state === 'degraded') return 'warning';
   if (state === 'stalled') return 'error';
   return 'neutral';
@@ -47,6 +49,7 @@ function schedulerIssueLabel(issue: QaLiveResponse['scheduler']['issue']): strin
 
 function QaPhaseLabel({ phase }: { phase: QaLivePhase }) {
   if (phase === 'queued') return <T>Queued</T>;
+  if (phase === 'scanning_installer') return <T>Checking installer reputation</T>;
   if (phase === 'preparing_package') return <T>Preparing package</T>;
   if (phase === 'restoring_vm') return <T>Restoring golden VM</T>;
   if (phase === 'installing') return <T>Installing</T>;
@@ -72,6 +75,42 @@ function QaResultStatus({ outcome }: { outcome: 'Passed' | 'Failed' }) {
       <T>{outcome}</T>
     </span>
   );
+}
+
+function QaVirusTotalCell({ status }: { status: QaVirusTotalStatus | null }) {
+  if (status === 'clean') {
+    return (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-status-success">
+        <ShieldCheck className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <T>Clean</T>
+      </span>
+    );
+  }
+  if (status === 'flagged') {
+    return (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-status-error">
+        <ShieldAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <T>Flagged</T>
+      </span>
+    );
+  }
+  if (status === 'suspicious') {
+    return (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-status-warning">
+        <ShieldAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <T>Suspicious</T>
+      </span>
+    );
+  }
+  if (status === 'not_found') {
+    return (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs text-text-muted">
+        <ShieldQuestion className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <T>Not analyzed</T>
+      </span>
+    );
+  }
+  return <span className="text-xs text-text-muted" aria-hidden="true">—</span>;
 }
 
 function resultEdgeClass(outcome: 'Passed' | 'Failed'): string {
@@ -425,13 +464,26 @@ function DashboardContent() {
   } | null>(null);
   const [showFullQueue, setShowFullQueue] = useState(false);
 
+  // Distinct roots prevent placeholder boxes from being reused as moving live content.
   if (isLoading) {
-    return <div className="h-80 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" aria-label="Loading live QA status" />;
+    return (
+      <div key="loading" aria-label="Loading live QA status" aria-busy="true" role="status">
+        <span className="sr-only">Loading live QA status</span>
+        <div className="space-y-6" aria-hidden="true">
+          <div className="h-64 sm:h-32 lg:h-16 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
+          <div className="h-[600px] lg:h-[480px] animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+            <div className="h-80 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
+            <div className="h-80 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
+          </div>
+        </div>
+      </div>
+    );
   }
 
   if (isError || !data) {
     return (
-      <div className="rounded-2xl border border-status-error/20 bg-status-error/5 p-6 text-center">
+      <div key="error" className="rounded-2xl border border-status-error/20 bg-status-error/5 p-6 text-center">
         <AlertTriangle className="mx-auto mb-3 h-6 w-6 text-status-error" aria-hidden="true" />
         <p className="font-medium text-text-primary"><T>Live QA status is temporarily unavailable.</T></p>
         <button type="button" onClick={() => refetch()} className="mt-3 min-h-10 rounded-lg border border-overlay/10 px-4 py-2 text-sm text-text-secondary hover:text-text-primary"><T>Try again</T></button>
@@ -440,12 +492,12 @@ function DashboardContent() {
   }
 
   return (
-    <div className="space-y-6">
+    <div key="loaded" className="space-y-6">
       <ServiceHealth data={data} />
       <CurrentTest data={data} />
 
-      <div className="grid gap-6 lg:grid-cols-[0.8fr_1.2fr]">
-        <section className="rounded-2xl border border-overlay/10 bg-bg-elevated p-5 sm:p-6" aria-labelledby="queue-heading">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+        <section className="min-w-0 rounded-2xl border border-overlay/10 bg-bg-elevated p-5 sm:p-6" aria-labelledby="queue-heading">
           <div className="mb-4 flex items-baseline justify-between gap-3">
             <h2 id="queue-heading" className="text-lg font-semibold text-text-primary"><T>Next in queue</T></h2>
             <span className="text-xs text-text-muted"><T>One app tested at a time</T></span>
@@ -515,7 +567,14 @@ function DashboardContent() {
                         {formatRelativeTime(item.testedAtUtc, data.serverTime) ?? <T>Test time unavailable</T>}
                       </span>
                     </span>
-                    <QaResultStatus outcome={item.outcome} />
+                    <span className="flex flex-col items-end gap-1">
+                      <QaResultStatus outcome={item.outcome} />
+                      {item.virusTotalStatus === 'clean' ||
+                      item.virusTotalStatus === 'flagged' ||
+                      item.virusTotalStatus === 'suspicious' ? (
+                        <QaVirusTotalCell status={item.virusTotalStatus} />
+                      ) : null}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -524,10 +583,11 @@ function DashboardContent() {
                 <table className="w-full text-left text-sm">
                   <thead className="border-y border-overlay/10 text-xs text-text-muted">
                     <tr>
-                      <th className="px-6 py-3 font-medium"><T>Application</T></th>
-                      <th className="px-3 py-3 font-medium"><T>Result</T></th>
-                      <th className="px-3 py-3 font-medium"><T>Duration</T></th>
-                      <th className="px-6 py-3 font-medium"><T>Tested</T></th>
+                      <th className="w-full px-6 py-3 font-medium"><T>Application</T></th>
+                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>Result</T></th>
+                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>VirusTotal</T></th>
+                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>Duration</T></th>
+                      <th className="whitespace-nowrap px-6 py-3 font-medium"><T>Tested</T></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-overlay/10">
@@ -541,7 +601,7 @@ function DashboardContent() {
                         })}
                         className="cursor-pointer transition-colors hover:bg-overlay/5"
                       >
-                        <td className={cn('border-l-2 px-6 py-3', resultEdgeClass(item.outcome))}>
+                        <td className={cn('w-full max-w-0 border-l-2 px-6 py-3', resultEdgeClass(item.outcome))}>
                           <button
                             type="button"
                             onClick={() => setSelected({
@@ -558,10 +618,13 @@ function DashboardContent() {
                             </span>
                           </button>
                         </td>
-                        <td className="px-3 py-3">
+                        <td className="whitespace-nowrap px-3 py-3">
                           <QaResultStatus outcome={item.outcome} />
                         </td>
-                        <td className="px-3 py-3 font-mono text-xs text-text-secondary">{formatQaDuration(item.durationSeconds)}</td>
+                        <td className="whitespace-nowrap px-3 py-3">
+                          <QaVirusTotalCell status={item.virusTotalStatus} />
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-3 font-mono text-xs text-text-secondary">{formatQaDuration(item.durationSeconds)}</td>
                         <td className="whitespace-nowrap px-6 py-3 text-xs text-text-muted">
                           {formatRelativeTime(item.testedAtUtc, data.serverTime) ?? <T>Not recorded</T>}
                         </td>

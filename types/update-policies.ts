@@ -213,7 +213,11 @@ export interface TriggerUpdateResponse {
     tenant_id: string;
     success: boolean;
     skipped?: boolean;
-    code?: 'QA_FAILED_CURRENT_VERSION' | 'QA_NOT_PASSED_CURRENT_VERSION';
+    code?:
+      | 'QA_FAILED_CURRENT_VERSION'
+      | 'QA_NOT_PASSED_CURRENT_VERSION'
+      | 'QA_SECURITY_FLAGGED_CURRENT_VERSION'
+      | 'QA_PACKAGE_COMPATIBILITY_BLOCKED';
     packaging_job_id?: string;
     error?: string;
   }[];

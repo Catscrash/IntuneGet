@@ -379,6 +379,31 @@ describe('generateDetectionRules', () => {
       expect(rules[0].type).toBe('script');
     });
 
+    it('should detect a ZIP-wrapped AppX by its package family identity', () => {
+      const installer: NormalizedInstaller = {
+        architecture: 'x64',
+        url: 'https://example.com/dependencies.zip',
+        sha256: 'abc123',
+        type: 'zip',
+        nestedInstallerType: 'msix',
+        nestedInstallerPath: 'Dependencies\\x64\\Microsoft.NET.Native.Runtime.2.2.appx',
+        packageFamilyName: 'Microsoft.NET.Native.Runtime.2.2_8wekyb3d8bbwe',
+      };
+
+      const rules = generateDetectionRules(
+        installer,
+        'Microsoft .NET Native Runtime',
+        'Microsoft.DotNet.Native.Runtime',
+        '2.2.28604.0'
+      );
+
+      expect(rules).toHaveLength(1);
+      expect(rules[0].type).toBe('script');
+      expect((rules[0] as ScriptDetectionRule).scriptContent).toContain(
+        'Get-AppxPackage -Name "Microsoft.NET.Native.Runtime.2.2" -AllUsers'
+      );
+    });
+
     it('should query the current user and fall back only when running as SYSTEM', () => {
       const installer: NormalizedInstaller = {
         architecture: 'x64',
@@ -574,6 +599,34 @@ describe('generateInstallCommand', () => {
     expect(command).toContain('ALLUSERS=""');
   });
 
+  it('preserves trusted WinGet custom properties in an MSI install command', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://downloads.example.com/Macabacus-9.9.2.msi',
+      sha256: 'abc123',
+      type: 'wix',
+      silentArgs: '/qn /norestart OFFICE2016X64FOUND=1 EULA=1',
+    };
+
+    expect(generateInstallCommand(installer, 'machine')).toBe(
+      'msiexec /i "Macabacus-9.9.2.msi" /qn /norestart OFFICE2016X64FOUND=1 EULA=1 ALLUSERS=1'
+    );
+  });
+
+  it('does not override a manifest-owned MSI scope property', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://example.com/installer.msi',
+      sha256: 'abc123',
+      type: 'msi',
+      silentArgs: '/qn /norestart ALLUSERS=2 MSIINSTALLPERUSER=""',
+    };
+
+    expect(generateInstallCommand(installer, 'machine')).toBe(
+      'msiexec /i "installer.msi" /qn /norestart ALLUSERS=2 MSIINSTALLPERUSER=""'
+    );
+  });
+
   it('should generate MSIX install command', () => {
     const installer: NormalizedInstaller = {
       architecture: 'x64',
@@ -640,6 +693,7 @@ describe('generateInstallCommand', () => {
     const command = generateInstallCommand(installer);
 
     expect(command).toContain('"windows_64.exe"');
+    expect(command).not.toContain('/S');
   });
 
   it('should append .msi for extensionless MSI URLs', () => {
@@ -712,6 +766,32 @@ describe('generateInstallCommand', () => {
     };
 
     expect(generateInstallCommand(installer)).toContain('Expand-Archive');
+  });
+
+  it('should describe copying a bare portable executable', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://example.com/claude.exe',
+      sha256: 'abc123',
+      type: 'portable',
+    };
+
+    expect(generateInstallCommand(installer)).toBe(
+      'Copy-Item -Path "claude.exe" -Destination "%ProgramFiles%\\claude\\claude.exe" -Force'
+    );
+  });
+
+  it('should describe extracting a portable zip archive', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://example.com/claude.zip',
+      sha256: 'abc123',
+      type: 'portable',
+    };
+
+    expect(generateInstallCommand(installer)).toContain(
+      'Expand-Archive -Path "claude.zip" -DestinationPath "%ProgramFiles%\\claude"'
+    );
   });
 
   it('should reject a nested path without a nested installer type', () => {
@@ -874,6 +954,40 @@ describe('generateUninstallCommand', () => {
     );
   });
 
+  it('should preserve a nested MSI product code for archive packages', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x86',
+      url: 'https://example.com/bankid.zip',
+      sha256: 'abc123',
+      type: 'zip',
+      nestedInstallerType: 'msi',
+      nestedInstallerPath: 'BankID.msi',
+      productCode: '{77B5BCDC-5496-48DA-8B16-5EE2AF08CA31}',
+    };
+
+    expect(
+      generateUninstallCommand(installer, 'BankID säkerhetsprogram')
+    ).toBe(
+      'REGISTRY_UNINSTALL_PRODUCT:{77B5BCDC-5496-48DA-8B16-5EE2AF08CA31}:BankID säkerhetsprogram'
+    );
+  });
+
+  it('should preserve a nested AppX package identity for archive packages', () => {
+    const installer: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://example.com/dependencies.zip',
+      sha256: 'abc123',
+      type: 'zip',
+      nestedInstallerType: 'msix',
+      nestedInstallerPath: 'Dependencies\\x64\\Microsoft.NET.Native.Runtime.2.2.appx',
+      packageFamilyName: 'Microsoft.NET.Native.Runtime.2.2_8wekyb3d8bbwe',
+    };
+
+    expect(
+      generateUninstallCommand(installer, 'Microsoft .NET Native Runtime')
+    ).toBe('MSIX_UNINSTALL:Microsoft.NET.Native.Runtime.2.2');
+  });
+
   it('should canonicalize a braceless product code and reject malformed GUID shapes', () => {
     const base: NormalizedInstaller = {
       architecture: 'x64',
@@ -896,6 +1010,42 @@ describe('generateUninstallCommand', () => {
         'Reader'
       )
     ).toBe('REGISTRY_UNINSTALL:Reader');
+  });
+
+  it('should preserve a safe non-MSI ARP registry key as exact uninstall identity', () => {
+    const base: NormalizedInstaller = {
+      architecture: 'x64',
+      url: 'https://example.com/app.exe',
+      sha256: 'abc123',
+      type: 'nullsoft',
+    };
+
+    expect(
+      generateUninstallCommand(
+        { ...base, productCode: 'IntelliJ IDEA 2025.2.5' },
+        'IntelliJ IDEA Ultimate Edition'
+      )
+    ).toBe(
+      'REGISTRY_UNINSTALL_KEY:IntelliJ IDEA 2025.2.5:IntelliJ IDEA Ultimate Edition'
+    );
+    expect(
+      generateUninstallCommand(
+        {
+          ...base,
+          type: 'inno',
+          productCode: '{22222222-2222-2222-2222-222222222222}_is1',
+        },
+        'Inno App'
+      )
+    ).toBe(
+      'REGISTRY_UNINSTALL_KEY:{22222222-2222-2222-2222-222222222222}_is1:Inno App'
+    );
+    expect(
+      generateUninstallCommand(
+        { ...base, productCode: 'Unsafe\\Key:Value' },
+        'Unsafe App'
+      )
+    ).toBe('REGISTRY_UNINSTALL:Unsafe App');
   });
 
   it('should delegate Inno uninstall to registry lookup when display name is provided', () => {

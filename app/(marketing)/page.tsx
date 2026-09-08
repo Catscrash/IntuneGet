@@ -1,15 +1,15 @@
+import { Header } from "@/components/landing/Header";
+import { HeroSection } from "@/components/landing/sections/HeroSection";
+import { TrustSection } from "@/components/landing/sections/TrustSection";
+import { HowItWorksSection } from "@/components/landing/sections/HowItWorksSection";
+import { FAQSectionAnimated } from "@/components/landing/sections/FAQSectionAnimated";
+import { Footer } from "@/components/landing/sections/Footer";
 import {
-  Header,
-  HeroSection,
-  TrustSection,
-  CapabilitiesSection,
-  ComparisonSection,
-  HowItWorksSection,
-  MSPSection,
-  FAQSectionAnimated,
-  CTASection,
-  Footer,
-} from "@/components/landing";
+  DeferredCapabilities,
+  DeferredComparison,
+  DeferredMSP,
+  DeferredCTA,
+} from "@/components/landing/DeferredSections";
 import { faqData } from "@/lib/data/faq-data";
 import {
   getPublicLandingStats,
@@ -160,12 +160,12 @@ export default async function LandingPage() {
           <main id="main-content" className="flex-1">
             <HeroSection initialStats={stats} />
             <HowItWorksSection />
-            <CapabilitiesSection />
-            <ComparisonSection />
-            <MSPSection />
+            <DeferredCapabilities />
+            <DeferredComparison />
+            <DeferredMSP />
             <TrustSection initialStats={stats} />
             <FAQSectionAnimated />
-            <CTASection initialStats={stats} />
+            <DeferredCTA initialStats={stats} />
           </main>
           <Footer />
         </div>

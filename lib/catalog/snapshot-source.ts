@@ -1,3 +1,5 @@
+import { enrichRelease, type ReleaseMetadata, type FileReputation } from './release-enrichment';
+import type { CatalogRelease, ReleaseHistoryFilters, ReleaseHistoryResult } from './release-history';
 /**
  * SQLite-snapshot-backed CatalogSource (self-hosted / Supabase-less mode).
  *
@@ -179,6 +181,44 @@ function buildFtsMatch(query: string): string | null {
 }
 
 export class SnapshotCatalogSource implements CatalogSource {
+  async getReleaseHistory(filters: ReleaseHistoryFilters): Promise<ReleaseHistoryResult> {
+    return withDb((db) => {
+      // Older snapshots remain readable; release dates were not exported then.
+      const columns = db.prepare('PRAGMA table_info(version_history)').all() as { name: string }[];
+      const releaseDate = columns.some(c => c.name === 'release_date') ? 'v.release_date' : 'NULL';
+      const history = `WITH history AS (
+        SELECT v.winget_id, c.name, c.publisher, v.version, ${releaseDate} AS release_date,
+          v.created_at AS detected_at,
+          lag(v.version) OVER (PARTITION BY v.winget_id ORDER BY v.created_at, v.version) AS previous_version
+        FROM version_history v JOIN curated_apps c USING (winget_id)
+        WHERE coalesce(c.is_locale_variant, 0) = 0 AND v.created_at IS NOT NULL
+      )`;
+      const where = ` WHERE (@month = '' OR substr(detected_at, 1, 7) = @month)
+        AND (@query = '' OR instr(lower(name || ' ' || coalesce(publisher, '') || ' ' || winget_id), lower(@query)) > 0)
+        AND (@kind = 'all' OR (@kind = 'first' AND previous_version IS NULL) OR (@kind = 'updated' AND previous_version IS NOT NULL))`;
+      const params = { month: filters.month, query: filters.query, kind: filters.kind };
+      const rows = db.prepare(`${history} SELECT * FROM history ${where} ORDER BY detected_at DESC, winget_id, version DESC LIMIT 40 OFFSET @offset`)
+        .all({ ...params, offset: (filters.page - 1) * 40 }) as CatalogRelease[];
+      const stats = db.prepare(`${history} SELECT count(*) AS total, count(DISTINCT winget_id) AS apps,
+        coalesce(sum(previous_version IS NULL), 0) AS firstTracked FROM history ${where}`).get(params) as { total: number; apps: number; firstTracked: number };
+      const months = db.prepare(`${history} SELECT DISTINCT substr(detected_at, 1, 7) AS month FROM history ORDER BY month DESC`).all() as { month: string }[];
+      const coverage = db.prepare(`${history} SELECT min(detected_at) AS start FROM history`).get() as { start: string | null };
+      const notesColumn = columns.some(c => c.name === 'release_notes_url') ? 'release_notes_url' : 'NULL AS release_notes_url';
+      const metadataQuery = db.prepare(`SELECT winget_id, version, installer_sha256, installers, ${notesColumn} FROM version_history WHERE winget_id = ? AND version = ?`);
+      const reputationExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'catalog_file_reputation'").get();
+      const reputationQuery = reputationExists ? db.prepare('SELECT * FROM catalog_file_reputation WHERE sha256 = ?') : null;
+      const qaColumns = db.prepare('PRAGMA table_info(qa_results)').all() as {name: string}[];
+      const legacyQuery = qaColumns.some(c => c.name === 'virustotal_status') ? db.prepare("SELECT lower(installer_sha256) AS sha256, 'found' AS status, virustotal_malicious AS malicious, virustotal_suspicious AS suspicious, virustotal_total_engines AS total_engines, virustotal_scanned_at_utc AS analyzed_at FROM qa_results WHERE lower(installer_sha256) = ? AND virustotal_status IN ('clean', 'flagged', 'suspicious') ORDER BY virustotal_scanned_at_utc DESC LIMIT 1") : null;
+      const enriched = rows.map(row => {
+        const metadata = metadataQuery.get(row.winget_id, row.version) as ReleaseMetadata | undefined;
+        const hash = metadata?.installer_sha256?.toLowerCase() ?? '';
+        const reputation = (reputationQuery ?? legacyQuery)?.get(hash) as FileReputation | undefined;
+        return enrichRelease(row, metadata ? [metadata] : [], reputation ? [reputation] : []);
+      });
+      return { rows: enriched, ...stats, months: months.map(m => m.month), coverageStart: coverage.start, sync: null };
+    }, () => { throw new Error('Catalog snapshot unavailable'); });
+  }
+
   // ---------------------------------------------------------------------------
   // search / discovery
   // ---------------------------------------------------------------------------
@@ -210,6 +250,7 @@ export class SnapshotCatalogSource implements CatalogSource {
             JOIN curated_apps ca ON ca.id = f.rowid
             WHERE curated_fts MATCH @match
               AND ca.is_verified = 1
+              AND ca.latest_version IS NOT NULL
               AND ca.is_locale_variant = 0
               ${categoryClause}
             ORDER BY
@@ -239,6 +280,7 @@ export class SnapshotCatalogSource implements CatalogSource {
             SELECT ${CURATED_RPC_COLUMNS}
             FROM curated_apps ca
             WHERE ca.is_verified = 1
+              AND ca.latest_version IS NOT NULL
               AND ca.is_locale_variant = 0
               ${categoryClause}
               AND (
@@ -274,17 +316,19 @@ export class SnapshotCatalogSource implements CatalogSource {
     offset: number;
     category?: string | null;
     sort: SearchSort;
+    verifiedOnly?: boolean;
   }): Promise<PopularPackagesResult | null> {
     return withDb(
       (db) => {
-        const { limit, offset, category, sort } = opts;
-        const categoryClause = category ? 'AND category = @category' : '';
+        const { limit, offset, category, sort, verifiedOnly = true } = opts;
+        const categoryClause = category ? 'AND category = @category COLLATE NOCASE' : '';
+        const verifiedClause = verifiedOnly ? 'AND is_verified = 1' : '';
         const baseParams: Record<string, unknown> = category ? { category } : {};
 
         const countRow = db
           .prepare(
             `SELECT COUNT(*) AS c FROM curated_apps
-             WHERE is_verified = 1 AND is_locale_variant = 0 ${categoryClause}`
+             WHERE latest_version IS NOT NULL AND is_locale_variant = 0 ${verifiedClause} ${categoryClause}`
           )
           .get(baseParams) as { c: number };
 
@@ -306,7 +350,7 @@ export class SnapshotCatalogSource implements CatalogSource {
           .prepare(
             `SELECT ${CURATED_RPC_COLUMNS}
              FROM curated_apps
-             WHERE is_verified = 1 AND is_locale_variant = 0 ${categoryClause}
+             WHERE latest_version IS NOT NULL AND is_locale_variant = 0 ${verifiedClause} ${categoryClause}
              ORDER BY ${orderBy}
              LIMIT @limit OFFSET @offset`
           )
@@ -335,7 +379,7 @@ export class SnapshotCatalogSource implements CatalogSource {
           .prepare(
             `SELECT ${CURATED_RPC_COLUMNS}
              FROM curated_apps
-             WHERE is_verified = 1 AND is_locale_variant = 0 ${categoryClause}
+             WHERE is_verified = 1 AND latest_version IS NOT NULL AND is_locale_variant = 0 ${categoryClause}
              ORDER BY popularity_rank IS NULL, popularity_rank ASC, name ASC
              LIMIT @limit`
           )
@@ -354,7 +398,7 @@ export class SnapshotCatalogSource implements CatalogSource {
           .prepare(
             `SELECT category, COUNT(*) AS count
              FROM curated_apps
-             WHERE is_verified = 1 AND category IS NOT NULL
+             WHERE is_verified = 1 AND latest_version IS NOT NULL AND category IS NOT NULL
              GROUP BY category`
           )
           .all() as { category: string; count: number }[];
@@ -365,10 +409,36 @@ export class SnapshotCatalogSource implements CatalogSource {
     );
   }
 
+  async getVerifiedAppIds(
+    limit?: number
+  ): Promise<{ winget_id: string; updated_at?: string | null }[]> {
+    return withDb(
+      (db) => {
+        const limitClause = limit === undefined ? '' : 'LIMIT @limit';
+        // The snapshot schema has no updated_at; created_at is the closest
+        // last-changed signal it carries.
+        return db
+          .prepare(
+            `SELECT winget_id, created_at AS updated_at FROM curated_apps
+             WHERE is_verified = 1 AND is_locale_variant = 0 AND latest_version IS NOT NULL
+             ORDER BY popularity_rank IS NULL, popularity_rank ASC, winget_id ASC
+             ${limitClause}`
+          )
+          .all(limit === undefined ? {} : { limit }) as {
+          winget_id: string;
+          updated_at: string | null;
+        }[];
+      },
+      () => []
+    );
+  }
+
   async getCategoryCount(opts: { verifiedOnly: boolean }): Promise<number | null> {
     return withDb(
       (db) => {
-        const where = opts.verifiedOnly ? 'WHERE is_verified = 1' : '';
+        const where = opts.verifiedOnly
+          ? 'WHERE is_verified = 1 AND latest_version IS NOT NULL'
+          : 'WHERE latest_version IS NOT NULL';
         const row = db
           .prepare(`SELECT COUNT(*) AS c FROM curated_apps ${where}`)
           .get() as { c: number };
@@ -382,7 +452,7 @@ export class SnapshotCatalogSource implements CatalogSource {
   // app detail
   // ---------------------------------------------------------------------------
 
-  async getAppByWingetId(wingetId: string): Promise<CuratedAppWithDetails | null> {
+  async getAppByWingetId(wingetId: string, options: { presentationOnly?: boolean } = {}): Promise<CuratedAppWithDetails | null> {
     return withDb(
       (db) => {
         const app = db
@@ -395,7 +465,7 @@ export class SnapshotCatalogSource implements CatalogSource {
 
         const versionRows = db
           .prepare(
-            `SELECT version FROM version_history WHERE winget_id = ? ORDER BY created_at DESC`
+            `SELECT version FROM version_history WHERE winget_id = ? ORDER BY created_at DESC${options.presentationOnly ? " LIMIT 10" : ""}`
           )
           .all(wingetId) as { version: string }[];
         const versions = versionRows.map((v) => v.version);
@@ -406,7 +476,7 @@ export class SnapshotCatalogSource implements CatalogSource {
         const isLocaleVariant = Boolean(app.is_locale_variant);
 
         let localeVariants: LocaleVariant[] | undefined;
-        if (!isLocaleVariant) {
+        if (!isLocaleVariant && !options.presentationOnly) {
           const variantRows = db
             .prepare(
               `SELECT winget_id, locale_code, latest_version

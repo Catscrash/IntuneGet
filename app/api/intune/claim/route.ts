@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { parseAccessToken } from '@/lib/auth-utils';
 import type { ClaimAppRequest, ClaimedApp } from '@/types/unmanaged';
@@ -57,6 +57,9 @@ async function ensureUserProfile(
  */
 export async function POST(request: NextRequest) {
   try {
+    if (!isSupabaseServerConfigured()) {
+      return NextResponse.json({ error: 'App claims require hosted services' }, { status: 503 });
+    }
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -71,19 +74,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: 'Missing required fields' },
         { status: 400 }
-      );
-    }
-
-    // Claim tracking (claimed_apps/user_profiles) has no SQLite equivalent -
-    // it's a Supabase-only feature, unlike the discovered-apps scan itself
-    // (unmanaged-apps/route.ts), which runs live and cache-less without
-    // Supabase. Report unavailable rather than crash; the caller (POST
-    // handler in use-unmanaged-apps.ts) already treats a >=500 response here
-    // as non-fatal and still adds the app to the cart.
-    if (!isSupabaseConfigured()) {
-      return NextResponse.json(
-        { error: 'Claim tracking is not available without Supabase configured.' },
-        { status: 503 }
       );
     }
 
@@ -188,17 +178,15 @@ export async function POST(request: NextRequest) {
  */
 export async function GET(request: NextRequest) {
   try {
+    if (!isSupabaseServerConfigured()) {
+      return NextResponse.json({ claims: [] });
+    }
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
         { error: 'Authentication required' },
         { status: 401 }
       );
-    }
-
-    // Claim tracking has no SQLite equivalent (Supabase-only feature).
-    if (!isSupabaseConfigured()) {
-      return NextResponse.json({ claims: [] });
     }
 
     const supabase = createServerClient();
@@ -257,6 +245,9 @@ export async function GET(request: NextRequest) {
  */
 export async function PATCH(request: NextRequest) {
   try {
+    if (!isSupabaseServerConfigured()) {
+      return NextResponse.json({ error: 'App claims require hosted services' }, { status: 503 });
+    }
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -272,14 +263,6 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json(
         { error: 'Missing claim ID' },
         { status: 400 }
-      );
-    }
-
-    // Claim tracking has no SQLite equivalent (Supabase-only feature).
-    if (!isSupabaseConfigured()) {
-      return NextResponse.json(
-        { error: 'Claim tracking is not available without Supabase configured.' },
-        { status: 503 }
       );
     }
 

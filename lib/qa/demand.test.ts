@@ -1,20 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ensureQaDemand, type QaDemandInput } from '@/lib/qa/demand';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
+import { WingetDependencyCompatibilityError } from '@/lib/winget-dependencies';
 
-const { resolveWingetPackageDependenciesMock, getPackageEligibilityBlocksMock } = vi.hoisted(() => ({
+const {
+  resolveWingetPackageDependenciesMock,
+  getPackageCompatibilityBlockMock,
+  getPackageEligibilityBlocksMock,
+} = vi.hoisted(() => ({
   resolveWingetPackageDependenciesMock: vi.fn(),
+  getPackageCompatibilityBlockMock: vi.fn(),
   getPackageEligibilityBlocksMock: vi.fn(),
 }));
 
-vi.mock('@/lib/winget-dependencies', () => ({
-  resolveWingetPackageDependencies: resolveWingetPackageDependenciesMock,
-}));
+vi.mock('@/lib/winget-dependencies', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@/lib/winget-dependencies')>();
+  return {
+    ...original,
+    resolveWingetPackageDependencies: resolveWingetPackageDependenciesMock,
+  };
+});
 
 vi.mock('@/lib/package-eligibility', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/package-eligibility')>();
   return {
     ...original,
+    getPackageCompatibilityBlock: getPackageCompatibilityBlockMock,
     getPackageEligibilityBlocks: getPackageEligibilityBlocksMock,
   };
 });
@@ -63,6 +74,8 @@ describe('ensureQaDemand app-version evidence reuse', () => {
     resolveWingetPackageDependenciesMock.mockResolvedValue([]);
     getPackageEligibilityBlocksMock.mockReset();
     getPackageEligibilityBlocksMock.mockResolvedValue([]);
+    getPackageCompatibilityBlockMock.mockReset();
+    getPackageCompatibilityBlockMock.mockResolvedValue(null);
   });
 
   it('does not queue or resolve dependencies for a retired catalog app', async () => {
@@ -76,7 +89,56 @@ describe('ensureQaDemand app-version evidence reuse', () => {
     expect(result).toMatchObject({
       state: 'failed',
       candidateId: null,
-      failureSummary: 'This app is no longer available for deployment.',
+      failureSummary: 'This app is not available for automated deployment.',
+    });
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before queueing an ARM64 payload on the x64 QA runner', async () => {
+    const client = { from: vi.fn() };
+    const result = await ensureQaDemand(client as never, {
+      ...demandInput(),
+      architecture: 'arm64',
+    });
+
+    expect(result).toMatchObject({
+      state: 'failed',
+      candidateId: null,
+      failureSummary: 'This app is not currently available for deployment.',
+    });
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(getPackageEligibilityBlocksMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks an exact reviewed installer tuple before resolving dependencies', async () => {
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      wingetId: 'r12f.DivoomGateway',
+      version: '0.1.42.0',
+      architecture: 'x64',
+      installerSha256: 'A'.repeat(64),
+      code: 'expired_signing_certificate',
+      detail: 'The signing certificate is expired.',
+    });
+    const client = { from: vi.fn() };
+
+    const result = await ensureQaDemand(client as never, {
+      ...demandInput(),
+      wingetId: 'r12f.DivoomGateway',
+      version: '0.1.42.0',
+    });
+
+    expect(result).toMatchObject({
+      state: 'failed',
+      candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+    });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, {
+      wingetId: 'r12f.DivoomGateway',
+      version: '0.1.42.0',
+      architecture: 'x64',
+      installerSha256: 'A'.repeat(64),
     });
     expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
     expect(client.from).not.toHaveBeenCalled();
@@ -207,6 +269,55 @@ describe('ensureQaDemand app-version evidence reuse', () => {
         test_config: expect.objectContaining({ packageDependencies: [dependency] }),
       }),
     ]);
+  });
+
+  it('does not reactivate an installer source quarantined by dispatch preflight', async () => {
+    const input = demandInput();
+    const quarantineSummary =
+      'Installer source quarantined before QA: MANIFEST_CHANGED. The selected installer is stale.';
+    let candidateCall = 0;
+    const client = {
+      from: vi.fn((table: string) => {
+        if (table === 'qa_package_results') {
+          return { select: vi.fn(() => query({ data: null, error: null })) };
+        }
+        if (table !== 'qa_candidates') throw new Error(`Unexpected table: ${table}`);
+        candidateCall++;
+        if (candidateCall === 1) return query({ data: null, error: null });
+        if (candidateCall === 2) {
+          return {
+            insert: vi.fn(() => query({
+              data: null,
+              error: { message: 'duplicate', code: '23505' },
+            })),
+          };
+        }
+        if (candidateCall === 3) return query({ data: null, error: null });
+        if (candidateCall === 4) {
+          return {
+            select: vi.fn(() => query({
+              data: {
+                id: 'candidate-quarantined',
+                status: 'superseded',
+                priority: 500,
+                failure_summary: quarantineSummary,
+              },
+              error: null,
+            })),
+          };
+        }
+        throw new Error('Quarantined candidate must not be updated');
+      }),
+    };
+
+    const result = await ensureQaDemand(client as never, input);
+
+    expect(result).toMatchObject({
+      state: 'failed',
+      candidateId: 'candidate-quarantined',
+      failureSummary: quarantineSummary,
+    });
+    expect(candidateCall).toBe(4);
   });
 
   it('joins the active payload test when a concurrent insert wins the race', async () => {
@@ -369,5 +480,41 @@ describe('ensureQaDemand app-version evidence reuse', () => {
       'Unreviewed package dependency'
     );
     expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('persists a reviewed compatibility block and returns a generic customer message', async () => {
+    const upsert = vi.fn(async () => ({ data: null, error: null }));
+    const client = {
+      from: vi.fn((table: string) => {
+        if (table === 'qa_package_blocks') return { upsert };
+        throw new Error(`Unexpected table: ${table}`);
+      }),
+    };
+    resolveWingetPackageDependenciesMock.mockRejectedValue(
+      new WingetDependencyCompatibilityError(
+        'Example.App requires elevation in user scope.',
+        'user_scope_elevation_required'
+      )
+    );
+
+    const result = await ensureQaDemand(client as never, {
+      ...demandInput(),
+      installScope: 'user',
+    });
+
+    expect(result).toMatchObject({
+      state: 'failed',
+      candidateId: null,
+      failureSummary: 'This app is not currently available for deployment.',
+    });
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({
+      winget_id: 'Example.App',
+      version: '1.2.3',
+      architecture: 'x64',
+      installer_sha256: 'A'.repeat(64),
+      block_code: 'user_scope_elevation_required',
+    }), {
+      onConflict: 'winget_id,version,architecture,installer_sha256',
+    });
   });
 });

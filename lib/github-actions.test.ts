@@ -6,10 +6,15 @@ import {
 } from './github-actions';
 import { buildQaPackageIdentityFromWorkflowInput } from './qa/package-profile';
 
-const { enforceInstallerPreflightMock, enforceQaGateMock, resolveDependenciesMock } = vi.hoisted(() => ({
+const { enforceInstallerPreflightMock, enforceQaGateMock, reconcileCatalogInstallerMock, resolveDependenciesMock } = vi.hoisted(() => ({
   enforceInstallerPreflightMock: vi.fn(),
   enforceQaGateMock: vi.fn(),
+  reconcileCatalogInstallerMock: vi.fn(),
   resolveDependenciesMock: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock('./catalog-installer-reconciliation', () => ({
+  reconcileCatalogInstaller: reconcileCatalogInstallerMock,
 }));
 
 vi.mock('./installer-preflight', async (importOriginal) => {
@@ -68,7 +73,369 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+reconcileCatalogInstallerMock.mockImplementation(async (item) => ({
+  item,
+  trustedInstallers: [],
+}));
+
 describe('triggerPackagingWorkflow hash validation payload', () => {
+  it('reconciles a WinGet tuple and passes trusted installers to preflight', async () => {
+    const trustedInstallers = [{
+      architecture: 'x64',
+      url: 'https://example.com/refreshed.exe',
+      sha256: 'B'.repeat(64),
+      type: 'exe',
+      scope: 'machine',
+    }];
+    reconcileCatalogInstallerMock.mockImplementationOnce(async (item) => ({
+      item: {
+        ...item,
+        installerUrl: trustedInstallers[0].url,
+        installerSha256: trustedInstallers[0].sha256,
+        installCommand: '/quiet',
+        uninstallCommand: 'uninstall.exe /quiet',
+      },
+      trustedInstallers,
+    }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Example.App',
+      sourceType: 'winget',
+      installerSha256: 'A'.repeat(64),
+    }), config, { skipRunCapture: true });
+
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        installerUrl: trustedInstallers[0].url,
+        installerSha256: trustedInstallers[0].sha256,
+      }),
+      trustedInstallers,
+    );
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer).toEqual(expect.objectContaining({
+      url: trustedInstallers[0].url,
+      sha256: trustedInstallers[0].sha256,
+      silentSwitches: '/quiet',
+    }));
+  });
+
+  it('dispatches reviewed Movavi success codes through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Movavi.MovaviPhotoFocus',
+      displayName: 'Movavi Photo Focus',
+      publisher: 'Movavi',
+      version: '1.1.0',
+      architecture: 'x86',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'nullsoft',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Movavi Photo Focus',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(JSON.parse(payload.client_payload.installer.successCodes)).toEqual([1223]);
+  });
+
+  it('dispatches JetBrains Toolbox headless removal through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'JetBrains.Toolbox',
+      displayName: 'JetBrains Toolbox',
+      publisher: 'JetBrains',
+      version: '3.7.2.0',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'exe',
+      silentSwitches: '/headless',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Toolbox:JetBrains Toolbox',
+      installScope: 'user',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(JSON.parse(payload.client_payload.config.psadtConfig))
+      .toMatchObject({ reviewedUninstallArguments: ['/headless'] });
+  });
+
+  it('dispatches IDM reviewed window automation through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Tonec.InternetDownloadManager',
+      displayName: 'Internet Download Manager',
+      publisher: 'Tonec Inc.',
+      version: '6.43.10',
+      architecture: 'x86',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'exe',
+      silentSwitches: '/skipdlgs',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Internet Download Manager',
+      installScope: 'machine',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    const psadtConfig = JSON.parse(payload.client_payload.config.psadtConfig);
+    expect(psadtConfig.reviewedUninstallArguments).toEqual([]);
+    expect(psadtConfig.reviewedUninstallWindowAutomation).toEqual({
+      processName: 'Uninstall.exe',
+      steps: [
+        {
+          windowText: 'Internet Download Manager',
+          buttonIndex: 2,
+          timeoutSeconds: 60,
+        },
+        { buttonIndex: 3, timeoutSeconds: 15 },
+        {
+          windowText: 'Internet protocol options',
+          buttonIndex: 2,
+          timeoutSeconds: 15,
+        },
+      ],
+    });
+  });
+
+  it('dispatches the reviewed Postgres Pro lifecycle through the customer packager', async () => {
+    reconcileCatalogInstallerMock.mockImplementationOnce(async (item) => ({
+      item: {
+        ...item,
+        uninstallCommand:
+          'REGISTRY_UNINSTALL_KEY:PostgreSQL 17 (64bit):PostgreSQL 17 (64bit)',
+      },
+      trustedInstallers: [],
+    }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'PostgresPro.Standard.17',
+      displayName: 'Postgres Pro Standard 17',
+      publisher: 'Postgres Professional',
+      version: '17.7',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'nullsoft',
+      silentSwitches: '--mode unattended',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Postgres Pro Standard 17',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:PostgreSQL 17 (64bit):PostgreSQL 17 (64bit)'
+    );
+    expect(JSON.parse(payload.client_payload.config.psadtConfig))
+      .toMatchObject({ reviewedUninstallArguments: ['/S'] });
+  });
+
+  it('dispatches Teradata silent archive removal through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Teradata.TTUOdbc',
+      displayName: 'Teradata ODBC Driver',
+      publisher: 'Teradata Corporation',
+      version: '20.00.38.00',
+      architecture: 'x64',
+      installerUrl: 'https://example.com/TeradataODBC.zip',
+      installerSha256: 'D'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'zip',
+      nestedInstallerType: 'exe',
+      nestedInstallerPath: 'TeradataODBC\\TTUSuiteSilent.exe',
+      silentSwitches: '/silent',
+      uninstallCommand:
+        'REGISTRY_UNINSTALL_PRODUCT:{F075B63A-C629-41F8-BA56-33D9940F2000}:Teradata ODBC Driver',
+      installScope: 'machine',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(JSON.parse(payload.client_payload.config.psadtConfig)).toMatchObject({
+      reviewedArchiveUninstall: {
+        relativePath: 'TeradataODBC\\silent_uninstall.bat',
+        arguments: ['ALL'],
+        completionTimeoutMinutes: 15,
+      },
+    });
+  });
+
+  it('dispatches the observable Webroot MSI lifecycle through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Webroot.SecureAnywhere',
+      displayName: 'Webroot SecureAnywhere',
+      publisher: 'Webroot',
+      version: '9.0.45.63',
+      architecture: 'x86',
+      installerSha256: 'B'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'msi',
+      silentSwitches: '/qn /norestart ALLUSERS=1',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Webroot SecureAnywhere',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.type).toBe('msi');
+    expect(JSON.parse(payload.client_payload.config.psadtConfig)).toMatchObject({
+      reviewedInstallArguments: ['CMDLINE=SME,quiet'],
+      reviewedInstallCompletionTimeoutMinutes: 30,
+    });
+  });
+
+  it('dispatches FSLogix removal with restart suppression through the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Microsoft.FSLogix',
+      displayName: 'FSLogix',
+      publisher: 'Microsoft',
+      version: '3.26.126.19110',
+      architecture: 'x64',
+      installerSha256: 'C'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'zip',
+      nestedInstallerType: 'exe',
+      silentSwitches: '/install /quiet /norestart',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Microsoft FSLogix Apps',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL:Microsoft FSLogix Apps'
+    );
+    expect(JSON.parse(payload.client_payload.config.psadtConfig)).toMatchObject({
+      reviewedUninstallArguments: ['/norestart'],
+    });
+  });
+
+  it('dispatches Chrome Beta EXE with the vendor channel uninstall key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Google.Chrome.Beta.EXE',
+      displayName: 'Google Chrome Beta (EXE)',
+      publisher: 'Google',
+      version: '152.0.7977.54',
+      architecture: 'x64',
+      installerSha256: 'D'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'exe',
+      silentSwitches: '--do-not-launch-chrome --system-level --chrome-beta',
+      uninstallCommand:
+        'REGISTRY_UNINSTALL_KEY:Google Chrome:Google Chrome Beta (EXE)',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:Google Chrome Beta:Google Chrome Beta'
+    );
+  });
+
+  it('dispatches DSH Desktop with the reviewed NSIS key to the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'JustGenius-s.DSHDesktop',
+      displayName: 'DSH-Decktop',
+      publisher: 'JustGenius-s',
+      version: '0.2.0',
+      architecture: 'x64',
+      installerSha256: 'D'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'nullsoft',
+      silentSwitches: '/S /allusers',
+      uninstallCommand:
+        'REGISTRY_UNINSTALL_PRODUCT:{239D4E5C-394E-5607-BF11-8B5229505789}:DSH-Decktop',
+      installScope: 'machine',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:239d4e5c-394e-5607-bf11-8b5229505789:DSH-Desktop 0.2.0'
+    );
+  });
+
+  it('dispatches JS8Call-improved with the reviewed Inno key to the customer packager', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'JS8Call-improved.JS8Call-improved',
+      displayName: 'JS8Call-improved',
+      publisher: 'JS8Call-improved',
+      version: '3.0.3',
+      architecture: 'x64',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      installerType: 'inno',
+      silentSwitches: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+      uninstallCommand: 'REGISTRY_UNINSTALL:JS8Call-improved',
+      installScope: 'machine',
+    }), config, { skipRunCapture: true });
+
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const payload = JSON.parse(String(request.body));
+    expect(payload.client_payload.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:{B5281957-28FD-4BAE-8D06-FC59898D850E}_is1:JS8Call 3.0.3'
+    );
+  });
+
+  it('lets reconciliation strengthen a generated display-name uninstall fallback', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'FinancialID.BankID',
+      displayName: 'BankID säkerhetsprogram',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      uninstallCommand: 'REGISTRY_UNINSTALL:BankID säkerhetsprogram',
+    }), config, { skipRunCapture: true });
+
+    const reconciledItem = reconcileCatalogInstallerMock.mock.calls[0][0];
+    expect(reconciledItem.psadtConfig.uninstallCommand).toBeUndefined();
+  });
+
+  it('preserves a customer-provided uninstall override during reconciliation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await triggerPackagingWorkflow(workflowInputs({
+      wingetId: 'Example.App',
+      installerSha256: 'A'.repeat(64),
+      sourceType: 'winget',
+      uninstallCommand: 'vendor-remover.exe /tenant-approved',
+    }), config, { skipRunCapture: true });
+
+    const reconciledItem = reconcileCatalogInstallerMock.mock.calls[0][0];
+    expect(reconciledItem.psadtConfig.uninstallCommand).toBe(
+      'vendor-remover.exe /tenant-approved'
+    );
+  });
+
   it('dispatches calculate mode for a custom installer without a trusted hash', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -83,6 +450,18 @@ describe('triggerPackagingWorkflow hash validation payload', () => {
         hashValidationMode: 'calculate',
       })
     );
+  });
+
+  it('does not dispatch a custom plain EXE without silent switches', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(triggerPackagingWorkflow(workflowInputs({
+      silentSwitches: '',
+    }), config, { skipRunCapture: true })).rejects.toMatchObject({
+      code: 'silent-install-contract-missing',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('defaults to strict mode when no mode override is supplied', async () => {

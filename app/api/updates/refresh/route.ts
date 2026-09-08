@@ -5,7 +5,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { parseVersion } from '@/lib/version-compare';
-import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
     // The scan runs against the live route and the results are cached through
     // the db abstraction, so both work without Supabase. Only MSP tenant
     // resolution and the notification fan-out below still need it.
-    const supabase = isSupabaseConfigured() ? createServerClient() : null;
+    const supabase = isSupabaseServerConfigured() ? createServerClient() : null;
     const db = getDatabase();
 
     let tenantId = user.tenantId;

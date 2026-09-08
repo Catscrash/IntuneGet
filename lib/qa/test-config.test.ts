@@ -2,6 +2,91 @@ import { describe, expect, it } from 'vitest';
 import { buildQaCatalogTestConfig } from './test-config';
 
 describe('buildQaCatalogTestConfig', () => {
+  it('adds the reviewed Movavi success code to catalog QA packaging', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Movavi.MovaviPhotoFocus',
+        name: 'Movavi Photo Focus',
+        publisher: 'Movavi',
+        version: '1.1.0',
+      },
+      manifest: { InstallerType: 'nullsoft' },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'nullsoft',
+        ProductCode: 'Movavi Photo Focus',
+      },
+    });
+
+    expect(config.successCodes).toEqual([1223]);
+  });
+
+  it('normalizes TeamSpeak 6 Beta contradictory user manifest to machine QA', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'TeamSpeakSystems.TeamSpeakClient.Beta.6',
+        name: 'TeamSpeak 6 Beta',
+        publisher: 'TeamSpeakSystems',
+        version: '6.0.0-beta4.1',
+      },
+      manifest: {
+        InstallerType: 'wix',
+        Scope: 'user',
+        InstallerSwitches: { Custom: 'ALLUSERS=1' },
+        ProductCode: '{7BC5AB94-97F7-480C-A8A0-3D334A3A56DC}',
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'wix',
+        Scope: 'user',
+        ProductCode: '{7BC5AB94-97F7-480C-A8A0-3D334A3A56DC}',
+      },
+    });
+
+    expect(config.scope).toBe('machine');
+    expect(config.silentArgs).toBe('/qn /norestart ALLUSERS=1');
+    expect(config.detectionRules[0]).toMatchObject({
+      keyPath:
+        'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\TeamSpeakSystems_TeamSpeakClient_Beta_6',
+      detectionValue: '6.0.0-beta4.1',
+    });
+  });
+
+  it('adds the Simple Hydraulic Calculator exact NSIS removal to catalog QA', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Igneus.SimpleHydraulicCalculator',
+        name: 'Simple Hydraulic Calculator',
+        publisher: 'Igneus',
+        version: '2.3.9',
+      },
+      manifest: { InstallerType: 'nullsoft', Scope: 'machine' },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'nullsoft',
+        Scope: 'machine',
+        ProductCode: 'Simple Hydraulic Calculator',
+      },
+    });
+
+    expect(config.psadtConfig.reviewedExactUninstall).toEqual({
+      executablePath:
+        '%ProgramFiles(x86)%\\Igneus\\SHC\\shc2uninstall.exe',
+      arguments: ['/S _?=%ProgramFiles(x86)%\\Igneus\\SHC'],
+      completionTimeoutMinutes: 5,
+    });
+    expect(config.psadtConfig.reviewedUninstallWindowAutomation).toEqual({
+      processName: 'shc2uninstall.exe',
+      steps: [
+        {
+          windowText: 'Simple Hydraulic Calculator',
+          buttonIndex: 1,
+          timeoutSeconds: 60,
+        },
+      ],
+    });
+  });
+
   it('prefers installer-specific silent switches and product metadata', () => {
     const config = buildQaCatalogTestConfig({
       app: {
@@ -46,6 +131,96 @@ describe('buildQaCatalogTestConfig', () => {
     });
   });
 
+  it('reconciles FSLogix WinGet metadata to its registered bundle display name', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Microsoft.FSLogix',
+        name: 'FSLogix',
+        publisher: 'Microsoft',
+        version: '3.26.126.19110',
+      },
+      manifest: {
+        InstallerType: 'zip',
+        NestedInstallerType: 'exe',
+        ProductCode: 'Microsoft FSLogix Apps',
+        InstallerSwitches: { Silent: '/install /quiet /norestart' },
+      },
+      installer: {
+        Architecture: 'neutral',
+        InstallerType: 'zip',
+        NestedInstallerType: 'exe',
+        ProductCode: 'Microsoft FSLogix Apps',
+      },
+    });
+
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL:Microsoft FSLogix Apps'
+    );
+    expect(config.psadtConfig.reviewedUninstallArguments).toEqual([
+      '/norestart',
+    ]);
+  });
+
+  it('binds Chrome Beta EXE QA to the vendor channel uninstall key', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Google.Chrome.Beta.EXE',
+        name: 'Google Chrome Beta (EXE)',
+        publisher: 'Google',
+        version: '152.0.7977.54',
+      },
+      manifest: {
+        InstallerType: 'exe',
+        ProductCode: 'Google Chrome',
+        InstallerSwitches: {
+          Silent: '--do-not-launch-chrome --system-level --chrome-beta',
+        },
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'exe',
+        ProductCode: 'Google Chrome',
+        AppsAndFeaturesEntries: [{
+          DisplayName: 'Google Chrome Beta (EXE)',
+          ProductCode: 'Google Chrome',
+        }],
+      },
+    });
+
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:Google Chrome Beta:Google Chrome Beta'
+    );
+  });
+
+  it('binds G.SKILL Trident Z QA to its observed visible Inno identity', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'GSKILL.TridentZLightingControl',
+        name: 'G.SKILL Trident Z Lighting Control',
+        publisher: 'GSKILL',
+        version: '1.00.38',
+      },
+      manifest: {
+        InstallerType: 'zip',
+        NestedInstallerType: 'inno',
+        ProductCode: 'G.SKILL Trident Z Lighting Control',
+        InstallerSwitches: {
+          Silent: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+        },
+      },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'zip',
+        NestedInstallerType: 'inno',
+        ProductCode: 'G.SKILL Trident Z Lighting Control',
+      },
+    });
+
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:{97CD7AFC-0ED3-41B8-9CCD-22717E8631D0}_is1:Trident Z Lighting Control'
+    );
+  });
+
   it.each([
     ['inno', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'],
     ['nullsoft', '/S'],
@@ -88,6 +263,38 @@ describe('buildQaCatalogTestConfig', () => {
     });
   });
 
+  it('keeps a nested MSI ProductCode in the canonical QA uninstall identity', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'FinancialID.BankID',
+        name: 'BankID säkerhetsprogram',
+        publisher: 'FinancialID',
+        version: '7.17.101.2526',
+      },
+      manifest: {
+        InstallerType: 'zip',
+        NestedInstallerType: 'msi',
+      },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'zip',
+        NestedInstallerType: 'msi',
+        NestedInstallerFiles: [{ RelativeFilePath: 'BankID.msi' }],
+        ProductCode: '{77B5BCDC-5496-48DA-8B16-5EE2AF08CA31}',
+        Scope: 'machine',
+      },
+    });
+
+    expect(config).toMatchObject({
+      sourceInstallerType: 'zip',
+      nestedInstallerType: 'msi',
+      nestedInstallerFiles: ['BankID.msi'],
+      productCode: '{77B5BCDC-5496-48DA-8B16-5EE2AF08CA31}',
+      uninstallCommand:
+        'REGISTRY_UNINSTALL_PRODUCT:{77B5BCDC-5496-48DA-8B16-5EE2AF08CA31}:BankID säkerhetsprogram',
+    });
+  });
+
   it('appends inherited custom switches to the derived silent default', () => {
     const config = buildQaCatalogTestConfig({
       app: {
@@ -122,6 +329,64 @@ describe('buildQaCatalogTestConfig', () => {
     });
 
     expect(config.silentArgs).toBe('/ROOT /CURRENTUSER');
+  });
+
+  it('includes a required WinGet install location in the shared QA package arguments', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Blizzard.BattleNet',
+        name: 'Battle.net Setup',
+        publisher: 'Blizzard',
+        version: '1.19.3.3219',
+      },
+      manifest: {
+        InstallerType: 'exe',
+        Scope: 'machine',
+        InstallLocationRequired: true,
+        InstallerSwitches: {
+          Custom: '--lang=enUS',
+          InstallLocation: '--installpath="<INSTALLPATH>"',
+        },
+        InstallationMetadata: {
+          DefaultInstallLocation: '%PROGRAMFILES(X86)%\\Battle.net',
+        },
+      },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'exe',
+        ProductCode: 'Battle.net',
+      },
+    });
+
+    expect(config.silentArgs).toBe(
+      '--lang=enUS --installpath="%PROGRAMFILES(X86)%\\Battle.net"'
+    );
+  });
+
+  it('preserves the WinGet machine scope for Arduino-style dual-purpose MSI packages', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'ArduinoSA.IDE.stable',
+        name: 'Arduino IDE',
+        publisher: 'ArduinoSA',
+        version: '2.3.10',
+      },
+      manifest: { InstallerType: 'wix' },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'wix',
+        Scope: 'machine',
+        ProductCode: '{2512FA64-8592-4C98-8430-9262623F95F0}',
+      },
+    });
+
+    expect(config).toMatchObject({
+      scope: 'machine',
+      silentArgs: '/qn /norestart ALLUSERS=1',
+      productCode: '{2512FA64-8592-4C98-8430-9262623F95F0}',
+      uninstallCommand:
+        'msiexec /x "{2512FA64-8592-4C98-8430-9262623F95F0}" /qn /norestart',
+    });
   });
 
   it('preserves Vivaldi-style root silent and installer custom switches', () => {
@@ -201,6 +466,23 @@ describe('buildQaCatalogTestConfig', () => {
     expect(config.successCodes).toEqual([1168]);
   });
 
+  it('converts Recuva unsigned WinGet success codes to signed process exit codes', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Piriform.Recuva',
+        name: 'Recuva',
+        publisher: 'Piriform',
+        version: '1.54.120',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        InstallerSuccessCodes: [3221225477, 3221226505],
+      },
+      installer: { Architecture: 'x64', InstallerType: 'nullsoft' },
+    });
+    expect(config.successCodes).toEqual([-1073741819, -1073740791]);
+  });
+
   it('uses an EXE AppsAndFeatures product code as the exact uninstall identity', () => {
     const config = buildQaCatalogTestConfig({
       app: {
@@ -225,6 +507,25 @@ describe('buildQaCatalogTestConfig', () => {
     expect(config.uninstallCommand).toBe(
       'REGISTRY_UNINSTALL_PRODUCT:{AC76BA86-1033-FF00-7760-BC15014EA700}:Adobe Acrobat Reader (64-bit)'
     );
+  });
+
+  it('uses the reviewed ARP identity for the Google Chrome EXE catalog variant', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Google.Chrome.EXE',
+        name: 'Google Chrome (EXE)',
+        publisher: 'Google',
+        version: '151.0.7922.76',
+      },
+      manifest: { InstallerType: 'exe' },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'exe',
+        InstallerSwitches: { Silent: '/silent /install' },
+      },
+    });
+
+    expect(config.uninstallCommand).toBe('REGISTRY_UNINSTALL:Google Chrome');
   });
 
   it('prefers architecture-specific AppsAndFeatures identity over a root product code', () => {
@@ -264,7 +565,7 @@ describe('buildQaCatalogTestConfig', () => {
         Architecture: 'x64',
         InstallerType: 'exe',
         AppsAndFeaturesEntries: [
-          { ProductCode: 'not-a-guid' },
+          { ProductCode: 'not\\a:guid' },
           { ProductCode: '{33333333-3333-3333-3333-333333333333}' },
         ],
       },
@@ -292,8 +593,39 @@ describe('buildQaCatalogTestConfig', () => {
       },
     });
 
-    expect(config.productCode).toBe('');
-    expect(config.uninstallCommand).toBe('REGISTRY_UNINSTALL:Contoso Inno App');
+    expect(config.productCode).toBe(
+      '{22222222-2222-2222-2222-222222222222}_is1'
+    );
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:{22222222-2222-2222-2222-222222222222}_is1:Contoso Inno App'
+    );
+  });
+
+  it('uses a root non-MSI ProductCode as the exact ARP lifecycle identity', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'JetBrains.IntelliJIDEA.Ultimate',
+        name: 'IntelliJ IDEA Ultimate Edition',
+        publisher: 'JetBrains',
+        version: '2025.2.5',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        ProductCode: 'IntelliJ IDEA 2025.2.5',
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerUrl: 'https://example.com/idea.exe',
+        InstallerSha256: 'A'.repeat(64),
+        InstallerType: 'nullsoft',
+        Scope: 'machine',
+      },
+    });
+
+    expect(config.productCode).toBe('IntelliJ IDEA 2025.2.5');
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:IntelliJ IDEA 2025.2.5:IntelliJ IDEA Ultimate Edition'
+    );
   });
 
   it('inherits a root package family name for user-scoped MSIX handling', () => {
@@ -329,7 +661,44 @@ describe('buildQaCatalogTestConfig', () => {
     );
   });
 
-  it('includes the reviewed Stream Deck process adapter in the catalog profile', () => {
+  it('uses the root package identity for a machine-scoped nested AppX lifecycle', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Microsoft.DotNet.Native.Runtime',
+        name: 'Microsoft .NET Native Runtime',
+        publisher: 'Microsoft',
+        version: '2.2.28604.0',
+      },
+      manifest: {
+        InstallerType: 'zip',
+        NestedInstallerType: 'msix',
+        Scope: 'machine',
+        PackageFamilyName: 'Microsoft.NET.Native.Runtime.2.2_8wekyb3d8bbwe',
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'zip',
+        NestedInstallerFiles: [{
+          RelativeFilePath: 'Dependencies\\x64\\Microsoft.NET.Native.Runtime.2.2.appx',
+        }],
+      },
+    });
+
+    expect(config.nestedInstallerType).toBe('msix');
+    expect(config.uninstallCommand).toBe(
+      'MSIX_UNINSTALL:Microsoft.NET.Native.Runtime.2.2'
+    );
+    expect(config.detectionRules[0]).toMatchObject({ type: 'script' });
+    const script = 'scriptContent' in config.detectionRules[0]
+      ? config.detectionRules[0].scriptContent
+      : '';
+    expect(script).toContain(
+      'Get-AppxPackage -Name "Microsoft.NET.Native.Runtime.2.2" -AllUsers'
+    );
+    expect(script).toContain('Get-AppxProvisionedPackage -Online');
+  });
+
+  it('does not include the disproven Stream Deck uninstall guard in the catalog profile', () => {
     const config = buildQaCatalogTestConfig({
       app: {
         wingetId: 'Elgato.StreamDeck',
@@ -348,9 +717,8 @@ describe('buildQaCatalogTestConfig', () => {
       },
     });
 
-    expect(config.psadtConfig.processesToClose).toEqual([
-      { name: 'StreamDeck', description: 'Elgato Stream Deck' },
-    ]);
+    expect(config.psadtConfig.processesToClose).toEqual([]);
+    expect(config.psadtConfig.reviewedUninstallProcessGuard).toBeUndefined();
   });
 
   it('includes the reviewed Creative Cloud process adapter in the catalog profile', () => {
@@ -410,6 +778,167 @@ describe('buildQaCatalogTestConfig', () => {
     expect(config.detectionRules).toEqual([
       expect.objectContaining({
         keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\VNGCorp_Zalo',
+      }),
+    ]);
+  });
+
+  it('tests RedisInsight in user context when its NSIS manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'RedisInsight.RedisInsight',
+        name: 'Redis Insight',
+        publisher: 'Redis Ltd.',
+        version: '3.4.2',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        ProductCode: '35443657-9fe0-5c86-a3fe-135cfbd99cbb',
+        AppsAndFeaturesEntries: [{ DisplayName: 'Redis Insight' }],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\RedisInsight_RedisInsight',
+      }),
+    ]);
+  });
+
+  it('tests Ente Photos in user context when its Electron Builder manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'ente-io.photos-desktop',
+        name: 'Ente Photos',
+        publisher: 'Ente',
+        version: '1.7.27',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        ProductCode: 'fb682768-51c6-5397-92da-171dc1777808',
+        AppsAndFeaturesEntries: [
+          {
+            DisplayName: 'ente 1.7.27',
+            Publisher: 'Ente',
+            ProductCode: 'fb682768-51c6-5397-92da-171dc1777808',
+          },
+        ],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_PRODUCT:{FB682768-51C6-5397-92DA-171DC1777808}:Ente Photos'
+    );
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\ente_io_photos_desktop',
+      }),
+    ]);
+  });
+
+  it('tests Arvis in user context when its Electron Builder manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'jopemachine.Arvis',
+        name: 'Arvis',
+        publisher: 'jopemachine',
+        version: '0.14.6',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        AppsAndFeaturesEntries: [{ DisplayName: 'Arvis 0.14.6' }],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\jopemachine_Arvis',
+      }),
+    ]);
+  });
+
+  it('tests zyfun in machine context with Electron Builder all-users mode', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'HiramWong.zyfun',
+        name: 'zyfun',
+        publisher: 'HiramWong',
+        version: '3.4.7',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        ProductCode: '1cf4e394-3cb1-57f9-a0e2-d9add46ad139',
+        AppsAndFeaturesEntries: [
+          {
+            DisplayName: 'zyfun',
+            Publisher: 'HiramWong',
+            ProductCode: '1cf4e394-3cb1-57f9-a0e2-d9add46ad139',
+          },
+        ],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('machine');
+    expect(config.silentArgs).toBe('/S');
+    expect(config.psadtConfig.reviewedInstallArguments).toEqual(['/allusers']);
+    expect(config.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_PRODUCT:{1CF4E394-3CB1-57F9-A0E2-D9ADD46AD139}:zyfun'
+    );
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\HiramWong_zyfun',
+      }),
+    ]);
+  });
+
+  it('tests Youdao in user context when its NSIS manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'Youdao.YoudaoTranslate',
+        name: '网易有道翻译',
+        publisher: 'Youdao',
+        version: '11.3.16.0',
+      },
+      manifest: {
+        InstallerType: 'exe',
+      },
+      installer: {
+        Architecture: 'x86',
+        InstallerType: 'exe',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\Youdao_YoudaoTranslate',
       }),
     ]);
   });

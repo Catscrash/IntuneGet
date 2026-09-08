@@ -34,7 +34,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:INPUT_INSTALLER_SUCCESS_CODES)) {
 }
 $InstallerSuccessCodes = @($InstallerSuccessCodes | ForEach-Object {
     $parsedCode = 0
-    if (-not [int]::TryParse([string]$_, [ref]$parsedCode) -or $parsedCode -lt 0 -or $parsedCode -gt 65535) {
+    if (-not [int]::TryParse([string]$_, [ref]$parsedCode)) {
         throw "Invalid installer success exit code: $_"
     }
     $parsedCode
@@ -74,9 +74,10 @@ foreach ($dependency in $PackageDependencies) {
     $dependencyInstallerType = ([string]$dependency.installerType).ToLowerInvariant()
     $isVCRedistributable = $dependencyIdentifier -match '^Microsoft\.VCRedist\.[A-Za-z0-9+.-]+\.(x86|x64|arm64)$'
     $isDotNetDesktopRuntime = $dependencyIdentifier -match '^Microsoft\.DotNet\.DesktopRuntime\.\d+$'
+    $isDotNetAspNetCoreRuntime = $dependencyIdentifier -match '^Microsoft\.DotNet\.AspNetCore\.\d+$'
     $isPowerShell = $dependencyIdentifier -eq 'Microsoft.PowerShell'
     $isVCLibsDesktop = $dependencyIdentifier -eq 'Microsoft.VCLibs.Desktop.14'
-    if (-not ($isVCRedistributable -or $isDotNetDesktopRuntime -or $isPowerShell -or $isVCLibsDesktop)) {
+    if (-not ($isVCRedistributable -or $isDotNetDesktopRuntime -or $isDotNetAspNetCoreRuntime -or $isPowerShell -or $isVCLibsDesktop)) {
         throw "Package dependency is not in the reviewed redistribution allowlist: $($dependency.packageIdentifier)"
     }
     $reviewedInstallerTypes = if ($isPowerShell) {
@@ -229,6 +230,73 @@ if ($psadtConfig.Contains('reviewedInstallArguments') -and
     }
 }
 
+$reviewedInstallArgumentsOverride = ''
+if ($psadtConfig.Contains('reviewedInstallArgumentsOverride') -and
+    $null -ne $psadtConfig['reviewedInstallArgumentsOverride']) {
+    if ($psadtConfig['reviewedInstallArgumentsOverride'] -isnot [string]) {
+        throw 'PSADT reviewedInstallArgumentsOverride must be a string.'
+    }
+    $reviewedInstallArgumentsOverride = $psadtConfig['reviewedInstallArgumentsOverride'].Trim()
+    if ([string]::IsNullOrWhiteSpace($reviewedInstallArgumentsOverride) -or
+        $reviewedInstallArgumentsOverride.Length -gt 256 -or
+        [regex]::IsMatch($reviewedInstallArgumentsOverride, '[\x00-\x1F\x7F]')) {
+        throw 'PSADT reviewedInstallArgumentsOverride must be a non-empty, bounded, single-line string.'
+    }
+}
+
+$reviewedArgumentlessInstall = $false
+if ($psadtConfig.Contains('reviewedArgumentlessInstall') -and
+    $null -ne $psadtConfig['reviewedArgumentlessInstall']) {
+    if ($psadtConfig['reviewedArgumentlessInstall'] -isnot [bool]) {
+        throw 'PSADT reviewedArgumentlessInstall must be a boolean.'
+    }
+    $reviewedArgumentlessInstall = $psadtConfig['reviewedArgumentlessInstall']
+}
+
+$reviewedInstallCompletionTimeoutMinutes = 0
+if ($psadtConfig.Contains('reviewedInstallCompletionTimeoutMinutes') -and
+    $null -ne $psadtConfig['reviewedInstallCompletionTimeoutMinutes']) {
+    $rawReviewedInstallCompletionTimeoutMinutes = $psadtConfig['reviewedInstallCompletionTimeoutMinutes']
+    if ($rawReviewedInstallCompletionTimeoutMinutes -isnot [int] -and
+        $rawReviewedInstallCompletionTimeoutMinutes -isnot [long]) {
+        throw 'PSADT reviewedInstallCompletionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+    $reviewedInstallCompletionTimeoutMinutes = [int]$rawReviewedInstallCompletionTimeoutMinutes
+    if ($reviewedInstallCompletionTimeoutMinutes -lt 1 -or
+        $reviewedInstallCompletionTimeoutMinutes -gt 60) {
+        throw 'PSADT reviewedInstallCompletionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+}
+
+$reviewedInstallShieldAdministrativeImageConfigured = $false
+$reviewedInstallShieldMsiExpectedFileName = ''
+if ($psadtConfig.Contains('reviewedInstallShieldAdministrativeImage') -and
+    $null -ne $psadtConfig['reviewedInstallShieldAdministrativeImage']) {
+    $rawInstallShieldAdministrativeImage = $psadtConfig['reviewedInstallShieldAdministrativeImage']
+    if ($rawInstallShieldAdministrativeImage -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage must be a JSON object.'
+    }
+    foreach ($installShieldAdministrativeImageKey in $rawInstallShieldAdministrativeImage.Keys) {
+        if ([string]$installShieldAdministrativeImageKey -notin @('expectedMsiFileName')) {
+            throw "PSADT reviewedInstallShieldAdministrativeImage contains an unsupported property: $installShieldAdministrativeImageKey"
+        }
+    }
+    if (-not $rawInstallShieldAdministrativeImage.Contains('expectedMsiFileName') -or
+        $rawInstallShieldAdministrativeImage['expectedMsiFileName'] -isnot [string]) {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage must include expectedMsiFileName as a string.'
+    }
+    $reviewedInstallShieldMsiExpectedFileName =
+        ([string]$rawInstallShieldAdministrativeImage['expectedMsiFileName']).Trim()
+    if ([string]::IsNullOrWhiteSpace($reviewedInstallShieldMsiExpectedFileName) -or
+        $reviewedInstallShieldMsiExpectedFileName.Length -gt 128 -or
+        [System.IO.Path]::GetFileName($reviewedInstallShieldMsiExpectedFileName) -ne $reviewedInstallShieldMsiExpectedFileName -or
+        $reviewedInstallShieldMsiExpectedFileName -notmatch '^[A-Za-z0-9][A-Za-z0-9 ._()-]*\.msi$' -or
+        $reviewedInstallShieldMsiExpectedFileName.Contains('..')) {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage expectedMsiFileName must be a safe literal MSI filename.'
+    }
+    $reviewedInstallShieldAdministrativeImageConfigured = $true
+}
+
 $reviewedUninstallArguments = @()
 if ($psadtConfig.Contains('reviewedUninstallArguments') -and
     $null -ne $psadtConfig['reviewedUninstallArguments']) {
@@ -263,10 +331,117 @@ $reviewedUninstallArgumentsLiteral = @(
     $reviewedUninstallArguments | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }
 ) -join ', '
 
+$reviewedUninstallWindowAutomationConfigured = $false
+$reviewedUninstallWindowAutomation = $null
+if ($psadtConfig.Contains('reviewedUninstallWindowAutomation') -and
+    $null -ne $psadtConfig['reviewedUninstallWindowAutomation']) {
+    $rawWindowAutomation = $psadtConfig['reviewedUninstallWindowAutomation']
+    if ($rawWindowAutomation -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedUninstallWindowAutomation must be an object.'
+    }
+    foreach ($windowAutomationKey in $rawWindowAutomation.Keys) {
+        if ([string]$windowAutomationKey -notin @('processName', 'steps')) {
+            throw "PSADT reviewedUninstallWindowAutomation contains an unsupported property: $windowAutomationKey"
+        }
+    }
+    $windowAutomationProcessName = ([string]$rawWindowAutomation['processName']).Trim()
+    if ($windowAutomationProcessName -notmatch '^[A-Za-z0-9 _().-]+\.exe$' -or
+        $windowAutomationProcessName.Length -gt 128 -or
+        [System.IO.Path]::GetFileName($windowAutomationProcessName) -ne $windowAutomationProcessName) {
+        throw 'PSADT reviewedUninstallWindowAutomation.processName must be a bounded executable leaf name.'
+    }
+    $rawWindowAutomationSteps = $rawWindowAutomation['steps']
+    if ($rawWindowAutomationSteps -is [string] -or
+        $rawWindowAutomationSteps -isnot [System.Collections.IEnumerable]) {
+        throw 'PSADT reviewedUninstallWindowAutomation.steps must be an array.'
+    }
+    $windowAutomationSteps = @()
+    foreach ($rawWindowAutomationStep in @($rawWindowAutomationSteps)) {
+        if ($rawWindowAutomationStep -isnot [System.Collections.IDictionary]) {
+            throw 'Every PSADT reviewed uninstall window-automation step must be an object.'
+        }
+        foreach ($windowAutomationStepKey in $rawWindowAutomationStep.Keys) {
+            if ([string]$windowAutomationStepKey -notin @('windowText', 'buttonIndex', 'timeoutSeconds')) {
+                throw "PSADT reviewed uninstall window-automation step contains an unsupported property: $windowAutomationStepKey"
+            }
+        }
+        $windowText = if ($rawWindowAutomationStep.Contains('windowText')) {
+            [string]$rawWindowAutomationStep['windowText']
+        } else {
+            ''
+        }
+        if ($windowText.Length -gt 128 -or [regex]::IsMatch($windowText, '[\x00-\x1F\x7F]')) {
+            throw 'Every PSADT reviewed uninstall windowText must be a bounded, single-line string.'
+        }
+        $rawButtonIndex = $rawWindowAutomationStep['buttonIndex']
+        if (($rawButtonIndex -isnot [byte] -and
+             $rawButtonIndex -isnot [int16] -and
+             $rawButtonIndex -isnot [int32] -and
+             $rawButtonIndex -isnot [int64]) -or
+            [int]$rawButtonIndex -lt 1 -or [int]$rawButtonIndex -gt 20) {
+            throw 'Every PSADT reviewed uninstall buttonIndex must be an integer from 1 to 20.'
+        }
+        $rawTimeoutSeconds = $rawWindowAutomationStep['timeoutSeconds']
+        if (($rawTimeoutSeconds -isnot [byte] -and
+             $rawTimeoutSeconds -isnot [int16] -and
+             $rawTimeoutSeconds -isnot [int32] -and
+             $rawTimeoutSeconds -isnot [int64]) -or
+            [int]$rawTimeoutSeconds -lt 1 -or [int]$rawTimeoutSeconds -gt 120) {
+            throw 'Every PSADT reviewed uninstall timeoutSeconds must be an integer from 1 to 120.'
+        }
+        $windowAutomationSteps += [ordered]@{
+            windowText = $windowText
+            buttonIndex = [int]$rawButtonIndex
+            timeoutSeconds = [int]$rawTimeoutSeconds
+        }
+    }
+    if ($windowAutomationSteps.Count -lt 1 -or $windowAutomationSteps.Count -gt 10) {
+        throw 'PSADT reviewedUninstallWindowAutomation.steps must contain from 1 to 10 entries.'
+    }
+    $reviewedUninstallWindowAutomation = [ordered]@{
+        processName = $windowAutomationProcessName
+        steps = $windowAutomationSteps
+    }
+    $reviewedUninstallWindowAutomationConfigured = $true
+}
+
+$reviewedUninstallServiceNames = @()
+if ($psadtConfig.Contains('reviewedUninstallServiceNames') -and
+    $null -ne $psadtConfig['reviewedUninstallServiceNames']) {
+    $rawReviewedServiceNames = $psadtConfig['reviewedUninstallServiceNames']
+    if ($rawReviewedServiceNames -is [string] -or
+        $rawReviewedServiceNames -isnot [System.Collections.IEnumerable]) {
+        throw 'PSADT reviewedUninstallServiceNames must be an array.'
+    }
+
+    $seenReviewedServiceNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($rawReviewedServiceName in @($rawReviewedServiceNames)) {
+        if ($rawReviewedServiceName -isnot [string]) {
+            throw 'Every PSADT reviewed uninstall service name must be a string.'
+        }
+        $reviewedServiceName = $rawReviewedServiceName.Trim()
+        if ($reviewedServiceName -notmatch '^[A-Za-z0-9_.-]{1,128}$') {
+            throw 'Every PSADT reviewed uninstall service name must be a safe service-name literal.'
+        }
+        if ($seenReviewedServiceNames.Add($reviewedServiceName)) {
+            $reviewedUninstallServiceNames += $reviewedServiceName
+        }
+    }
+    if ($reviewedUninstallServiceNames.Count -gt 10) {
+        throw 'PSADT reviewedUninstallServiceNames must contain at most 10 entries.'
+    }
+}
+$reviewedUninstallServiceNamesLiteral = @(
+    $reviewedUninstallServiceNames | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }
+) -join ', '
+
 $reviewedUninstallProcessGuardConfigured = $false
 $reviewedUninstallProcessGuardName = ''
 $reviewedUninstallProcessGuardPattern = ''
 $reviewedUninstallProcessGuardGraceSeconds = 0
+$reviewedUninstallProcessGuardCreationLookbackSeconds = 2
 if ($psadtConfig.Contains('reviewedUninstallProcessGuard') -and
     $null -ne $psadtConfig['reviewedUninstallProcessGuard']) {
     $rawProcessGuard = $psadtConfig['reviewedUninstallProcessGuard']
@@ -277,6 +452,11 @@ if ($psadtConfig.Contains('reviewedUninstallProcessGuard') -and
     $reviewedUninstallProcessGuardName = ([string]$rawProcessGuard['processName']).Trim()
     $reviewedUninstallProcessGuardPattern = ([string]$rawProcessGuard['argumentsPattern']).Trim()
     $rawProcessGuardGraceSeconds = $rawProcessGuard['graceSeconds']
+    $rawProcessGuardCreationLookbackSeconds = if ($rawProcessGuard.Contains('creationLookbackSeconds')) {
+        $rawProcessGuard['creationLookbackSeconds']
+    } else {
+        2
+    }
     if ($reviewedUninstallProcessGuardName -notmatch '^[A-Za-z0-9 _().-]+\.exe$' -or
         $reviewedUninstallProcessGuardName.Length -gt 128) {
         throw 'PSADT reviewedUninstallProcessGuard.processName must be a bounded executable leaf name.'
@@ -301,6 +481,15 @@ if ($psadtConfig.Contains('reviewedUninstallProcessGuard') -and
         throw 'PSADT reviewedUninstallProcessGuard.graceSeconds must be an integer from 5 to 120.'
     }
     $reviewedUninstallProcessGuardGraceSeconds = [int]$rawProcessGuardGraceSeconds
+    if (($rawProcessGuardCreationLookbackSeconds -isnot [byte] -and
+         $rawProcessGuardCreationLookbackSeconds -isnot [int16] -and
+         $rawProcessGuardCreationLookbackSeconds -isnot [int32] -and
+         $rawProcessGuardCreationLookbackSeconds -isnot [int64]) -or
+        [int]$rawProcessGuardCreationLookbackSeconds -lt 2 -or
+        [int]$rawProcessGuardCreationLookbackSeconds -gt 600) {
+        throw 'PSADT reviewedUninstallProcessGuard.creationLookbackSeconds must be an integer from 2 to 600.'
+    }
+    $reviewedUninstallProcessGuardCreationLookbackSeconds = [int]$rawProcessGuardCreationLookbackSeconds
     $reviewedUninstallProcessGuardConfigured = $true
 }
 
@@ -314,7 +503,8 @@ if ($reviewedUninstallProcessGuardConfigured) {
         "        `$reviewedGuardProcessName = '$reviewedUninstallProcessGuardNameLiteral'"
         "        `$reviewedGuardArgumentsPattern = '$reviewedUninstallProcessGuardPatternLiteral'"
         "        `$reviewedGuardGraceSeconds = $reviewedUninstallProcessGuardGraceSeconds"
-        '        $reviewedGuardStartedAt = [DateTime]::UtcNow.AddSeconds(-2)'
+        "        `$reviewedGuardCreationLookbackSeconds = $reviewedUninstallProcessGuardCreationLookbackSeconds"
+        '        $reviewedGuardStartedAt = [DateTime]::UtcNow.AddSeconds(-$reviewedGuardCreationLookbackSeconds)'
         '        $reviewedGuardJob = Start-Job -ScriptBlock {'
         '            param($ProcessName, $ArgumentsPattern, $StartedAt, $GraceSeconds)'
         '            $deadline = [DateTime]::UtcNow.AddMinutes(3)'
@@ -405,6 +595,119 @@ if ($reviewedMultiProductInstallDisplayNamePrefixes.Count -gt 0) {
     $reviewedMultiProductInstallMinimumCount = [int]$rawMultiProductMinimumCount
 }
 
+$reviewedRegistryInstallEvidenceConfigured = $false
+$reviewedRegistryInstallEvidenceKeyPath = ''
+$reviewedRegistryInstallEvidenceProviderPath = ''
+$reviewedRegistryInstallEvidenceValueName = ''
+$reviewedRegistryInstallEvidenceMinimumDword = [uint64]0
+if ($psadtConfig.Contains('reviewedRegistryInstallEvidence') -and
+    $null -ne $psadtConfig['reviewedRegistryInstallEvidence']) {
+    $rawRegistryEvidence = $psadtConfig['reviewedRegistryInstallEvidence']
+    if ($rawRegistryEvidence -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedRegistryInstallEvidence must be a JSON object.'
+    }
+
+    $allowedRegistryEvidenceKeys = @('keyPath', 'valueName', 'minimumDword')
+    foreach ($registryEvidenceKey in @($rawRegistryEvidence.Keys)) {
+        if ([string]$registryEvidenceKey -notin $allowedRegistryEvidenceKeys) {
+            throw "PSADT reviewedRegistryInstallEvidence contains an unsupported property: $registryEvidenceKey"
+        }
+    }
+    foreach ($requiredRegistryEvidenceKey in $allowedRegistryEvidenceKeys) {
+        if (-not $rawRegistryEvidence.Contains($requiredRegistryEvidenceKey)) {
+            throw "PSADT reviewedRegistryInstallEvidence must include $requiredRegistryEvidenceKey."
+        }
+    }
+    if ($rawRegistryEvidence['keyPath'] -isnot [string] -or
+        $rawRegistryEvidence['valueName'] -isnot [string]) {
+        throw 'PSADT reviewedRegistryInstallEvidence keyPath and valueName must be strings.'
+    }
+
+    $reviewedRegistryInstallEvidenceKeyPath = ([string]$rawRegistryEvidence['keyPath']).Trim()
+    if ($reviewedRegistryInstallEvidenceKeyPath.Length -gt 260 -or
+        $reviewedRegistryInstallEvidenceKeyPath -notmatch '^HKLM:\\SOFTWARE\\[^\\/*?"<>|\x00-\x1F\x7F]+(?:\\[^\\/*?"<>|\x00-\x1F\x7F]+)*$' -or
+        @($reviewedRegistryInstallEvidenceKeyPath -split '\\') -contains '..') {
+        throw 'PSADT reviewedRegistryInstallEvidence keyPath must be a safe literal path below HKLM:\SOFTWARE.'
+    }
+    $reviewedRegistryInstallEvidenceValueName = ([string]$rawRegistryEvidence['valueName']).Trim()
+    if ([string]::IsNullOrWhiteSpace($reviewedRegistryInstallEvidenceValueName) -or
+        $reviewedRegistryInstallEvidenceValueName.Length -gt 128 -or
+        [regex]::IsMatch($reviewedRegistryInstallEvidenceValueName, '[\\/*?"<>|\x00-\x1F\x7F]')) {
+        throw 'PSADT reviewedRegistryInstallEvidence valueName must be a safe bounded literal name.'
+    }
+
+    $rawRegistryMinimumDword = $rawRegistryEvidence['minimumDword']
+    if (($rawRegistryMinimumDword -isnot [byte] -and
+         $rawRegistryMinimumDword -isnot [uint16] -and
+         $rawRegistryMinimumDword -isnot [int16] -and
+         $rawRegistryMinimumDword -isnot [uint32] -and
+         $rawRegistryMinimumDword -isnot [int32] -and
+         $rawRegistryMinimumDword -isnot [uint64] -and
+         $rawRegistryMinimumDword -isnot [int64]) -or
+        [int64]$rawRegistryMinimumDword -lt 1 -or
+        [uint64]$rawRegistryMinimumDword -gt [uint32]::MaxValue) {
+        throw 'PSADT reviewedRegistryInstallEvidence minimumDword must be an integer from 1 to 4294967295.'
+    }
+    $reviewedRegistryInstallEvidenceMinimumDword = [uint64]$rawRegistryMinimumDword
+    $reviewedRegistryInstallEvidenceProviderPath =
+        'Registry::HKEY_LOCAL_MACHINE\' + $reviewedRegistryInstallEvidenceKeyPath.Substring('HKLM:\'.Length)
+    $reviewedRegistryInstallEvidenceConfigured = $true
+}
+
+$reviewedAppxInstallEvidenceConfigured = $false
+$reviewedAppxInstallEvidencePackageName = ''
+$reviewedAppxInstallEvidencePublisherId = ''
+$reviewedAppxInstallEvidenceMinimumVersion = [version]'0.0.0.0'
+if ($psadtConfig.Contains('reviewedAppxInstallEvidence') -and
+    $null -ne $psadtConfig['reviewedAppxInstallEvidence']) {
+    $rawAppxEvidence = $psadtConfig['reviewedAppxInstallEvidence']
+    if ($rawAppxEvidence -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedAppxInstallEvidence must be a JSON object.'
+    }
+
+    $allowedAppxEvidenceKeys = @('packageName', 'publisherId', 'minimumVersion')
+    foreach ($appxEvidenceKey in @($rawAppxEvidence.Keys)) {
+        if ([string]$appxEvidenceKey -notin $allowedAppxEvidenceKeys) {
+            throw "PSADT reviewedAppxInstallEvidence contains an unsupported property: $appxEvidenceKey"
+        }
+    }
+    foreach ($requiredAppxEvidenceKey in $allowedAppxEvidenceKeys) {
+        if (-not $rawAppxEvidence.Contains($requiredAppxEvidenceKey) -or
+            $rawAppxEvidence[$requiredAppxEvidenceKey] -isnot [string]) {
+            throw "PSADT reviewedAppxInstallEvidence must include string property $requiredAppxEvidenceKey."
+        }
+    }
+
+    $reviewedAppxInstallEvidencePackageName = ([string]$rawAppxEvidence['packageName']).Trim()
+    $reviewedAppxInstallEvidencePublisherId = ([string]$rawAppxEvidence['publisherId']).Trim()
+    $reviewedAppxInstallEvidenceMinimumVersionText = ([string]$rawAppxEvidence['minimumVersion']).Trim()
+    if ($reviewedAppxInstallEvidencePackageName -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$') {
+        throw 'PSADT reviewedAppxInstallEvidence packageName must be a safe exact Appx package name.'
+    }
+    if ($reviewedAppxInstallEvidencePublisherId -notmatch '^[a-z0-9]{13}$') {
+        throw 'PSADT reviewedAppxInstallEvidence publisherId must be a 13-character package publisher ID.'
+    }
+    if ($reviewedAppxInstallEvidenceMinimumVersionText -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}$') {
+        throw 'PSADT reviewedAppxInstallEvidence minimumVersion must contain four numeric components.'
+    }
+    try {
+        $reviewedAppxInstallEvidenceMinimumVersion = [version]$reviewedAppxInstallEvidenceMinimumVersionText
+    } catch {
+        throw 'PSADT reviewedAppxInstallEvidence minimumVersion is invalid.'
+    }
+    $reviewedAppxInstallEvidenceConfigured = $true
+}
+
+if ($reviewedRegistryInstallEvidenceConfigured -and
+    $reviewedMultiProductInstallDisplayNamePrefixes.Count -gt 0) {
+    throw 'PSADT reviewed registry and multi-product install evidence cannot be combined.'
+}
+if ($reviewedAppxInstallEvidenceConfigured -and
+    ($reviewedRegistryInstallEvidenceConfigured -or
+     $reviewedMultiProductInstallDisplayNamePrefixes.Count -gt 0)) {
+    throw 'PSADT reviewed Appx install evidence cannot be combined with registry or multi-product evidence.'
+}
+
 $uninstallCompletionTimeoutMinutes = 5
 if ($psadtConfig.Contains('uninstallCompletionTimeoutMinutes') -and
     $null -ne $psadtConfig['uninstallCompletionTimeoutMinutes']) {
@@ -443,6 +746,298 @@ function Get-StrictPSADTBoolean {
 $preserveVendorInstallationOnUninstall = Get-StrictPSADTBoolean `
     -Config $psadtConfig `
     -Name 'preserveVendorInstallationOnUninstall'
+$reviewedPreferVisiblePrimaryUninstallRegistration = Get-StrictPSADTBoolean `
+    -Config $psadtConfig `
+    -Name 'reviewedPreferVisiblePrimaryUninstallRegistration'
+$reviewedRecoverCapturedUninstallByExactIdentity = Get-StrictPSADTBoolean `
+    -Config $psadtConfig `
+    -Name 'reviewedRecoverCapturedUninstallByExactIdentity'
+$reviewedRegistryUninstallDisplayName = ''
+if ($psadtConfig.Contains('reviewedRegistryUninstallDisplayName') -and
+    $null -ne $psadtConfig['reviewedRegistryUninstallDisplayName']) {
+    if ($psadtConfig['reviewedRegistryUninstallDisplayName'] -isnot [string]) {
+        throw 'PSADT reviewedRegistryUninstallDisplayName must be a string.'
+    }
+    $reviewedRegistryUninstallDisplayName = [string]$psadtConfig['reviewedRegistryUninstallDisplayName']
+    if ([string]::IsNullOrWhiteSpace($reviewedRegistryUninstallDisplayName) -or
+        $reviewedRegistryUninstallDisplayName.Length -gt 128 -or
+        $reviewedRegistryUninstallDisplayName -match '[\x00-\x1f\x7f]') {
+        throw 'PSADT reviewedRegistryUninstallDisplayName must be a non-empty display name of at most 128 characters.'
+    }
+    $reviewedRegistryUninstallDisplayName = $reviewedRegistryUninstallDisplayName.Trim()
+}
+if ($reviewedRegistryInstallEvidenceConfigured -and
+    -not $preserveVendorInstallationOnUninstall) {
+    throw 'PSADT reviewedRegistryInstallEvidence requires preserveVendorInstallationOnUninstall.'
+}
+if ($reviewedAppxInstallEvidenceConfigured -and
+    -not $preserveVendorInstallationOnUninstall) {
+    throw 'PSADT reviewedAppxInstallEvidence requires preserveVendorInstallationOnUninstall.'
+}
+
+function Expand-ReviewedVersionPlaceholder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value,
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName
+    )
+
+    if (-not $Value.Contains('<VERSION>')) {
+        return $Value
+    }
+    if ([regex]::Matches($Value, '<VERSION>').Count -ne 1 -or
+        $Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$') {
+        throw "PSADT $FieldName contains an invalid version placeholder or package version."
+    }
+    return $Value.Replace('<VERSION>', $Version)
+}
+
+$reviewedManagedInstallDirectory = ''
+if ($psadtConfig.Contains('reviewedManagedInstallDirectory') -and
+    $null -ne $psadtConfig['reviewedManagedInstallDirectory']) {
+    if ($psadtConfig['reviewedManagedInstallDirectory'] -isnot [string]) {
+        throw 'PSADT reviewedManagedInstallDirectory must be a string.'
+    }
+    $reviewedManagedInstallDirectory = Expand-ReviewedVersionPlaceholder `
+        -Value ([string]$psadtConfig['reviewedManagedInstallDirectory']).Trim() `
+        -FieldName 'reviewedManagedInstallDirectory'
+    $isReviewedMachineManagedDirectory =
+        $reviewedManagedInstallDirectory -match '^(?:%(?:ProgramW6432|ProgramFiles|ProgramFiles\(x86\))%\\|%SystemDrive%\\SWSetup\\)[^*?"<>|\x00-\x1f]+$'
+    $isReviewedUserDesktopManagedDirectory =
+        $IsUserScope -and
+        $reviewedManagedInstallDirectory -match '^%USERPROFILE%\\Desktop\\[^*?"<>|\x00-\x1f]+$'
+    if ($reviewedManagedInstallDirectory.Length -gt 260 -or
+        -not ($isReviewedMachineManagedDirectory -or $isReviewedUserDesktopManagedDirectory) -or
+        @($reviewedManagedInstallDirectory -split '\\') -contains '..') {
+        throw 'PSADT reviewedManagedInstallDirectory must be a safe machine path or a reviewed user Desktop path for a user-scope package.'
+    }
+}
+
+$reviewedManagedInstallEvidenceFile = ''
+$reviewedManagedInstallCompletionProcess = ''
+$reviewedManagedInstallCompletionTimeoutMinutes = 0
+$hasManagedInstallCompletionContract =
+    ($psadtConfig.Contains('reviewedManagedInstallEvidenceFile') -and
+     $null -ne $psadtConfig['reviewedManagedInstallEvidenceFile']) -or
+    ($psadtConfig.Contains('reviewedManagedInstallCompletionProcess') -and
+     $null -ne $psadtConfig['reviewedManagedInstallCompletionProcess']) -or
+    ($psadtConfig.Contains('reviewedManagedInstallCompletionTimeoutMinutes') -and
+     $null -ne $psadtConfig['reviewedManagedInstallCompletionTimeoutMinutes'])
+if ($hasManagedInstallCompletionContract) {
+    if ([string]::IsNullOrWhiteSpace($reviewedManagedInstallDirectory)) {
+        throw 'PSADT reviewed managed install completion requires reviewedManagedInstallDirectory.'
+    }
+    if ($psadtConfig['reviewedManagedInstallEvidenceFile'] -isnot [string]) {
+        throw 'PSADT reviewedManagedInstallEvidenceFile must be a string.'
+    }
+    $reviewedManagedInstallEvidenceFile = Expand-ReviewedVersionPlaceholder `
+        -Value ([string]$psadtConfig['reviewedManagedInstallEvidenceFile']).Trim() `
+        -FieldName 'reviewedManagedInstallEvidenceFile'
+    if ($reviewedManagedInstallEvidenceFile.Length -gt 260 -or
+        $reviewedManagedInstallEvidenceFile -notmatch '^(?:%(?:ProgramW6432|ProgramFiles|ProgramFiles\(x86\))%\\|%SystemDrive%\\SWSetup\\)[^*?"<>|\x00-\x1f]+$' -or
+        @($reviewedManagedInstallEvidenceFile -split '\\') -contains '..' -or
+        -not $reviewedManagedInstallEvidenceFile.StartsWith(
+            $reviewedManagedInstallDirectory.TrimEnd('\') + '\',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'PSADT reviewedManagedInstallEvidenceFile must be a safe file below reviewedManagedInstallDirectory.'
+    }
+    if ($psadtConfig.Contains('reviewedManagedInstallCompletionProcess') -and
+        $null -ne $psadtConfig['reviewedManagedInstallCompletionProcess']) {
+        if ($psadtConfig['reviewedManagedInstallCompletionProcess'] -isnot [string]) {
+            throw 'PSADT reviewedManagedInstallCompletionProcess must be a string.'
+        }
+        $reviewedManagedInstallCompletionProcess = ([string]$psadtConfig['reviewedManagedInstallCompletionProcess']).Trim()
+        if ($reviewedManagedInstallCompletionProcess.Length -gt 260 -or
+            $reviewedManagedInstallCompletionProcess -notmatch '^%(?:ProgramW6432|ProgramFiles|ProgramFiles\(x86\))%\\[^*?"<>|\x00-\x1f]+\.exe$' -or
+            @($reviewedManagedInstallCompletionProcess -split '\\') -contains '..') {
+            throw 'PSADT reviewedManagedInstallCompletionProcess must be a safe executable below a Program Files environment variable.'
+        }
+    }
+    $rawManagedInstallCompletionTimeoutMinutes = $psadtConfig['reviewedManagedInstallCompletionTimeoutMinutes']
+    if (($rawManagedInstallCompletionTimeoutMinutes -isnot [byte] -and
+         $rawManagedInstallCompletionTimeoutMinutes -isnot [int16] -and
+         $rawManagedInstallCompletionTimeoutMinutes -isnot [int32] -and
+         $rawManagedInstallCompletionTimeoutMinutes -isnot [int64]) -or
+        [int]$rawManagedInstallCompletionTimeoutMinutes -lt 1 -or
+        [int]$rawManagedInstallCompletionTimeoutMinutes -gt 60) {
+        throw 'PSADT reviewedManagedInstallCompletionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+    $reviewedManagedInstallCompletionTimeoutMinutes = [int]$rawManagedInstallCompletionTimeoutMinutes
+}
+
+$reviewedManagedUninstallConfigured = $false
+$reviewedManagedUninstallExecutable = ''
+$reviewedManagedUninstallArguments = @()
+$reviewedManagedUninstallTimeoutMinutes = 0
+if ($psadtConfig.Contains('reviewedManagedUninstall') -and
+    $null -ne $psadtConfig['reviewedManagedUninstall']) {
+    $rawManagedUninstall = $psadtConfig['reviewedManagedUninstall']
+    if ($rawManagedUninstall -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedManagedUninstall must be an object.'
+    }
+    if ([string]::IsNullOrWhiteSpace($reviewedManagedInstallDirectory)) {
+        throw 'PSADT reviewedManagedUninstall requires reviewedManagedInstallDirectory.'
+    }
+    $reviewedManagedUninstallExecutable = ([string]$rawManagedUninstall['executablePath']).Trim()
+    if ($reviewedManagedUninstallExecutable.Contains('<VERSION>')) {
+        if ([regex]::Matches($reviewedManagedUninstallExecutable, '<VERSION>').Count -ne 1 -or
+            $Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$') {
+            throw 'PSADT reviewedManagedUninstall.executablePath contains an invalid version placeholder or package version.'
+        }
+        $reviewedManagedUninstallExecutable = $reviewedManagedUninstallExecutable.Replace('<VERSION>', $Version)
+    }
+    if ($reviewedManagedUninstallExecutable.Length -gt 260 -or
+        $reviewedManagedUninstallExecutable -notmatch '^%(?:ProgramW6432|ProgramFiles|ProgramFiles\(x86\))%\\[^*?"<>|\x00-\x1f]+\.exe$' -or
+        @($reviewedManagedUninstallExecutable -split '\\') -contains '..') {
+        throw 'PSADT reviewedManagedUninstall.executablePath must be a safe executable below a Program Files environment variable.'
+    }
+    $rawManagedUninstallArguments = $rawManagedUninstall['arguments']
+    if ($rawManagedUninstallArguments -is [string] -or
+        $rawManagedUninstallArguments -isnot [System.Collections.IEnumerable]) {
+        throw 'PSADT reviewedManagedUninstall.arguments must be an array.'
+    }
+    foreach ($rawManagedUninstallArgument in @($rawManagedUninstallArguments)) {
+        if ($rawManagedUninstallArgument -isnot [string]) {
+            throw 'Every PSADT reviewed managed uninstall argument must be a string.'
+        }
+        $managedUninstallArgument = $rawManagedUninstallArgument.Trim()
+        if ([string]::IsNullOrWhiteSpace($managedUninstallArgument) -or
+            $managedUninstallArgument.Length -gt 260 -or
+            [regex]::IsMatch($managedUninstallArgument, '[\x00-\x1F\x7F]')) {
+            throw 'Every PSADT reviewed managed uninstall argument must be non-empty, bounded, and single-line.'
+        }
+        $reviewedManagedUninstallArguments += $managedUninstallArgument
+    }
+    if ($reviewedManagedUninstallArguments.Count -gt 20) {
+        throw 'PSADT reviewedManagedUninstall.arguments must contain at most 20 entries.'
+    }
+    $rawManagedUninstallTimeoutMinutes = $rawManagedUninstall['completionTimeoutMinutes']
+    if (($rawManagedUninstallTimeoutMinutes -isnot [byte] -and
+         $rawManagedUninstallTimeoutMinutes -isnot [int16] -and
+         $rawManagedUninstallTimeoutMinutes -isnot [int32] -and
+         $rawManagedUninstallTimeoutMinutes -isnot [int64]) -or
+        [int]$rawManagedUninstallTimeoutMinutes -lt 1 -or
+        [int]$rawManagedUninstallTimeoutMinutes -gt 60) {
+        throw 'PSADT reviewedManagedUninstall.completionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+    $reviewedManagedUninstallTimeoutMinutes = [int]$rawManagedUninstallTimeoutMinutes
+    $reviewedManagedUninstallConfigured = $true
+}
+
+$reviewedExactUninstallConfigured = $false
+$reviewedExactUninstallExecutable = ''
+$reviewedExactUninstallArguments = @()
+$reviewedExactUninstallTimeoutMinutes = 0
+if ($psadtConfig.Contains('reviewedExactUninstall') -and
+    $null -ne $psadtConfig['reviewedExactUninstall']) {
+    $rawExactUninstall = $psadtConfig['reviewedExactUninstall']
+    if ($rawExactUninstall -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedExactUninstall must be an object.'
+    }
+    $reviewedExactUninstallExecutable = ([string]$rawExactUninstall['executablePath']).Trim()
+    $usesPackagedInstaller = $reviewedExactUninstallExecutable -eq '%PackageInstaller%'
+    if (-not $usesPackagedInstaller -and
+        ($reviewedExactUninstallExecutable.Length -gt 260 -or
+         $reviewedExactUninstallExecutable -notmatch '^%(?:ProgramW6432|ProgramFiles|ProgramFiles\(x86\))%\\[^*?"<>|\x00-\x1f]+\.exe$' -or
+         @($reviewedExactUninstallExecutable -split '\\') -contains '..')) {
+        throw 'PSADT reviewedExactUninstall.executablePath must be %PackageInstaller% or a safe executable below a Program Files environment variable.'
+    }
+    $rawExactUninstallArguments = $rawExactUninstall['arguments']
+    if ($rawExactUninstallArguments -is [string] -or
+        $rawExactUninstallArguments -isnot [System.Collections.IEnumerable]) {
+        throw 'PSADT reviewedExactUninstall.arguments must be an array.'
+    }
+    foreach ($rawExactUninstallArgument in @($rawExactUninstallArguments)) {
+        if ($rawExactUninstallArgument -isnot [string]) {
+            throw 'Every PSADT reviewed exact uninstall argument must be a string.'
+        }
+        $exactUninstallArgument = $rawExactUninstallArgument.Trim()
+        if ([string]::IsNullOrWhiteSpace($exactUninstallArgument) -or
+            $exactUninstallArgument.Length -gt 260 -or
+            [regex]::IsMatch($exactUninstallArgument, '[\x00-\x1F\x7F]')) {
+            throw 'Every PSADT reviewed exact uninstall argument must be non-empty, bounded, and single-line.'
+        }
+        $reviewedExactUninstallArguments += $exactUninstallArgument
+    }
+    if ($reviewedExactUninstallArguments.Count -gt 20) {
+        throw 'PSADT reviewedExactUninstall.arguments must contain at most 20 entries.'
+    }
+    $rawExactUninstallTimeoutMinutes = $rawExactUninstall['completionTimeoutMinutes']
+    if (($rawExactUninstallTimeoutMinutes -isnot [byte] -and
+         $rawExactUninstallTimeoutMinutes -isnot [int16] -and
+         $rawExactUninstallTimeoutMinutes -isnot [int32] -and
+         $rawExactUninstallTimeoutMinutes -isnot [int64]) -or
+        [int]$rawExactUninstallTimeoutMinutes -lt 1 -or
+        [int]$rawExactUninstallTimeoutMinutes -gt 60) {
+        throw 'PSADT reviewedExactUninstall.completionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+    $reviewedExactUninstallTimeoutMinutes = [int]$rawExactUninstallTimeoutMinutes
+    $reviewedExactUninstallConfigured = $true
+}
+
+$reviewedArchiveUninstallConfigured = $false
+$reviewedArchiveUninstallRelativePath = ''
+$reviewedArchiveUninstallArguments = @()
+$reviewedArchiveUninstallTimeoutMinutes = 0
+if ($psadtConfig.Contains('reviewedArchiveUninstall') -and
+    $null -ne $psadtConfig['reviewedArchiveUninstall']) {
+    $rawArchiveUninstall = $psadtConfig['reviewedArchiveUninstall']
+    if ($rawArchiveUninstall -isnot [System.Collections.IDictionary]) {
+        throw 'PSADT reviewedArchiveUninstall must be an object.'
+    }
+    $reviewedArchiveUninstallRelativePath = ([string]$rawArchiveUninstall['relativePath']).Trim() -replace '/', '\'
+    $archiveUninstallPathSegments = @($reviewedArchiveUninstallRelativePath -split '\\')
+    if ([string]::IsNullOrWhiteSpace($reviewedArchiveUninstallRelativePath) -or
+        $reviewedArchiveUninstallRelativePath.Length -gt 260 -or
+        [System.IO.Path]::IsPathRooted($reviewedArchiveUninstallRelativePath) -or
+        $reviewedArchiveUninstallRelativePath.StartsWith('\') -or
+        $archiveUninstallPathSegments -contains '..' -or
+        $reviewedArchiveUninstallRelativePath.Contains(':') -or
+        $reviewedArchiveUninstallRelativePath -notmatch '(?i)\.bat$' -or
+        $reviewedArchiveUninstallRelativePath -match '[*?"<>|\x00-\x1f]') {
+        throw 'PSADT reviewedArchiveUninstall.relativePath must be a safe relative batch-file path.'
+    }
+    $rawArchiveUninstallArguments = $rawArchiveUninstall['arguments']
+    if ($rawArchiveUninstallArguments -is [string] -or
+        $rawArchiveUninstallArguments -isnot [System.Collections.IEnumerable]) {
+        throw 'PSADT reviewedArchiveUninstall.arguments must be an array.'
+    }
+    foreach ($rawArchiveUninstallArgument in @($rawArchiveUninstallArguments)) {
+        if ($rawArchiveUninstallArgument -isnot [string]) {
+            throw 'Every PSADT reviewed archive uninstall argument must be a string.'
+        }
+        $archiveUninstallArgument = $rawArchiveUninstallArgument.Trim()
+        if ([string]::IsNullOrWhiteSpace($archiveUninstallArgument) -or
+            $archiveUninstallArgument.Length -gt 128 -or
+            $archiveUninstallArgument -notmatch '^[A-Za-z0-9._:=,+{}-]+$') {
+            throw 'Every PSADT reviewed archive uninstall argument must be a bounded safe token.'
+        }
+        $reviewedArchiveUninstallArguments += $archiveUninstallArgument
+    }
+    if ($reviewedArchiveUninstallArguments.Count -gt 20) {
+        throw 'PSADT reviewedArchiveUninstall.arguments must contain at most 20 entries.'
+    }
+    $rawArchiveUninstallTimeoutMinutes = $rawArchiveUninstall['completionTimeoutMinutes']
+    if (($rawArchiveUninstallTimeoutMinutes -isnot [byte] -and
+         $rawArchiveUninstallTimeoutMinutes -isnot [int16] -and
+         $rawArchiveUninstallTimeoutMinutes -isnot [int32] -and
+         $rawArchiveUninstallTimeoutMinutes -isnot [int64]) -or
+        [int]$rawArchiveUninstallTimeoutMinutes -lt 1 -or
+        [int]$rawArchiveUninstallTimeoutMinutes -gt 60) {
+        throw 'PSADT reviewedArchiveUninstall.completionTimeoutMinutes must be an integer from 1 to 60.'
+    }
+    $reviewedArchiveUninstallTimeoutMinutes = [int]$rawArchiveUninstallTimeoutMinutes
+    $reviewedArchiveUninstallConfigured = $true
+}
+if ($reviewedExactUninstallConfigured -and $reviewedArchiveUninstallConfigured) {
+    throw 'PSADT reviewed exact and archive uninstall contracts are mutually exclusive.'
+}
+if ($reviewedArchiveUninstallConfigured) {
+    # Both trusted override types share the generated registry-removal wait.
+    $reviewedExactUninstallTimeoutMinutes = $reviewedArchiveUninstallTimeoutMinutes
+}
 
 function ConvertTo-PSADTConfigValue {
     param(
@@ -676,7 +1271,11 @@ function Get-PSADTAssetFileName {
 # Reviewed application adapters may append bounded vendor properties to the
 # manifest-derived command. Do this before quote encoding so MSI properties are
 # passed identically by QA and customer packages.
-$effectiveSilentSwitches = $SilentSwitches.Trim()
+$effectiveSilentSwitches = if ($reviewedInstallArgumentsOverride) {
+    $reviewedInstallArgumentsOverride
+} else {
+    $SilentSwitches.Trim()
+}
 foreach ($reviewedInstallArgument in $reviewedInstallArguments) {
     $argumentPattern = '(?i)(^|\s)' + [regex]::Escape($reviewedInstallArgument) + '(\s|$)'
     if ($effectiveSilentSwitches -notmatch $argumentPattern) {
@@ -691,6 +1290,22 @@ $silentSwitchesEscaped = $effectiveSilentSwitches -replace "'", "''"
 $versionSingleQuoteEscaped = $Version -replace "'", "''"
 $uninstallCmd = [string]$UninstallCommand
 $uninstallCmdSingleQuoteEscaped = $uninstallCmd -replace "'", "''"
+$reviewedManagedInstallDirectoryEscaped = $reviewedManagedInstallDirectory -replace "'", "''"
+$reviewedManagedInstallEvidenceFileEscaped = $reviewedManagedInstallEvidenceFile -replace "'", "''"
+$reviewedManagedInstallCompletionProcessEscaped = $reviewedManagedInstallCompletionProcess -replace "'", "''"
+$reviewedManagedUninstallExecutableEscaped = $reviewedManagedUninstallExecutable -replace "'", "''"
+$reviewedManagedUninstallArgumentsLiteral = @(
+    $reviewedManagedUninstallArguments | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }
+) -join ', '
+$reviewedExactUninstallExecutableEscaped = $reviewedExactUninstallExecutable -replace "'", "''"
+$reviewedExactUninstallArgumentsLiteral = @(
+    $reviewedExactUninstallArguments | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }
+) -join ', '
+$reviewedRegistryInstallEvidenceProviderPathEscaped = $reviewedRegistryInstallEvidenceProviderPath -replace "'", "''"
+$reviewedRegistryInstallEvidenceValueNameEscaped = $reviewedRegistryInstallEvidenceValueName -replace "'", "''"
+$reviewedAppxInstallEvidencePackageNameEscaped = $reviewedAppxInstallEvidencePackageName -replace "'", "''"
+$reviewedAppxInstallEvidencePublisherIdEscaped = $reviewedAppxInstallEvidencePublisherId -replace "'", "''"
+$reviewedInstallShieldMsiExpectedFileNameEscaped = $reviewedInstallShieldMsiExpectedFileName -replace "'", "''"
 $displayNameEscaped = $DisplayName -replace "'", "''" -replace '`', '``' -replace '\$', '`$'
 $publisherEscaped = $Publisher -replace "'", "''" -replace '`', '``' -replace '\$', '`$'
 $publisherSingleQuoteEscaped = $Publisher -replace "'", "''"
@@ -871,6 +1486,14 @@ if ($installerTypeLower -eq 'zip' -and -not [string]::IsNullOrWhiteSpace($Nested
     }
 }
 
+$executesArgumentlessPlainExe = [string]::IsNullOrWhiteSpace($effectiveSilentSwitches) -and (
+    $installerTypeLower -eq 'exe' -or
+    ($installerTypeLower -eq 'zip' -and $NestedInstallerType.ToLowerInvariant() -eq 'exe')
+)
+if ($executesArgumentlessPlainExe -and -not $reviewedArgumentlessInstall) {
+    throw 'A plain EXE package without installer arguments requires a reviewed argumentless install contract.'
+}
+
 # Registry uninstall behavior belongs to the executable inside an archive, not
 # to the ZIP transport. Preserve the outer type for extraction while carrying
 # the effective nested engine into quiet-uninstall normalization.
@@ -884,6 +1507,9 @@ $registeredInstallerTypeLower = if ($installerTypeLower -eq 'zip' -and
 $isNestedPortable = $installerTypeLower -eq 'zip' -and
     -not [string]::IsNullOrWhiteSpace($NestedInstallerType) -and
     $NestedInstallerType.Trim().ToLowerInvariant() -eq 'portable'
+$isPlainPortableArchive = $installerTypeLower -eq 'zip' -and
+    [string]::IsNullOrWhiteSpace($NestedInstallerType) -and
+    [string]::IsNullOrWhiteSpace($NestedInstallerPath)
 
 $portableFolderName = ($DisplayName -replace '[<>:"/\\|?*\x00-\x1f]', '_').Trim().TrimEnd('.')
 if ([string]::IsNullOrWhiteSpace($portableFolderName) -or
@@ -905,17 +1531,24 @@ $registryUninstallDisplayName = ''
 $registryUninstallProductCode = ''
 $msixPackageName = ''
 
-if ($installerTypeLower -eq 'portable' -or $isNestedPortable) {
+if ($installerTypeLower -eq 'portable' -or $isNestedPortable -or $isPlainPortableArchive) {
     $usePortableUninstall = $true
     Write-Host "Using portable uninstall (folder removal)"
 } elseif ($uninstallCmd -match '^REGISTRY_UNINSTALL_PRODUCT:(\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}):(.+)$') {
     $useRegistryUninstall = $true
     $registryUninstallProductCode = $Matches[1]
     $registryUninstallDisplayName = $Matches[2]
+} elseif ($uninstallCmd -match '^REGISTRY_UNINSTALL_KEY:((?:[A-Za-z0-9][A-Za-z0-9 ._{}()+-]{0,255}|\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}_[A-Za-z0-9._+-]{1,32})):(.+)$') {
+    # Non-MSI WinGet manifests can expose a stable, edition-specific ARP key,
+    # including keys with spaces or a version suffix. Reuse the existing exact
+    # PSChildName lifecycle rather than broadening name matching.
+    $useRegistryUninstall = $true
+    $registryUninstallProductCode = $Matches[1]
+    $registryUninstallDisplayName = $Matches[2]
 } elseif ($uninstallCmd -match '^REGISTRY_UNINSTALL:(.+)$') {
     $useRegistryUninstall = $true
     $registryUninstallDisplayName = $Matches[1]
-} elseif ($uninstallCmd -match '^REGISTRY_UNINSTALL_PRODUCT:') {
+} elseif ($uninstallCmd -match '^REGISTRY_UNINSTALL_(PRODUCT|KEY):') {
     throw 'The exact vendor uninstall identity is malformed; refusing to interpret any embedded GUID as an MSI product code.'
 } elseif ($installerTypeLower -in @('msi', 'wix') -and $uninstallCmd -match '(\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\})') {
     # Deployment profiles commonly carry the concrete msiexec uninstall command
@@ -943,6 +1576,108 @@ if ($fileExtension -eq '.msi') {
     } else {
         throw 'The MSI database did not expose a valid ProductCode; refusing ambiguous detection or removal.'
     }
+}
+
+# A reviewed rename adapter may deliberately replace a stale transitional MSI
+# ProductCode with the exact ARP display identity created by the vendor's
+# chained install. Ordinary MSI packages keep the database ProductCode above.
+if (-not [string]::IsNullOrWhiteSpace($reviewedRegistryUninstallDisplayName)) {
+    $useRegistryUninstall = $true
+    $registryUninstallProductCode = ''
+    $registryUninstallDisplayName = $reviewedRegistryUninstallDisplayName
+    Write-Host "Using reviewed registry display identity: $registryUninstallDisplayName"
+}
+
+$useManagedDirectoryLifecycle = -not [string]::IsNullOrWhiteSpace($reviewedManagedInstallDirectory)
+if ($useManagedDirectoryLifecycle) {
+    # A reviewed extractor lifecycle is deliberately not an ARP lifecycle.
+    # Never let unrelated background servicing become the captured identity.
+    $useRegistryUninstall = $false
+    Write-Host "Using reviewed managed-directory lifecycle: $reviewedManagedInstallDirectory"
+}
+
+if ($reviewedAppxInstallEvidenceConfigured) {
+    # A reviewed Appx framework lifecycle is deliberately not an ARP lifecycle.
+    # Never capture unrelated background servicing such as WebView2.
+    $useRegistryUninstall = $false
+    if ($IsUserScope) {
+        throw 'PSADT reviewedAppxInstallEvidence requires a machine-scope package.'
+    }
+    Write-Host "Using reviewed Appx framework evidence: $reviewedAppxInstallEvidencePackageName"
+}
+
+if ($reviewedRegistryInstallEvidenceConfigured) {
+    if (-not $useRegistryUninstall -or $IsUserScope) {
+        throw 'PSADT reviewedRegistryInstallEvidence requires a machine-scope registry uninstall package.'
+    }
+    Write-Host "Using reviewed registry installation evidence: $reviewedRegistryInstallEvidenceKeyPath"
+}
+
+if ($reviewedInstallShieldAdministrativeImageConfigured) {
+    if ($IsUserScope -or $installerTypeLower -ne 'exe' -or $fileExtension -ne '.exe') {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage requires a machine-scope EXE package.'
+    }
+    if (-not $useRegistryUninstall -or
+        $registryUninstallProductCode -notmatch '^\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}$') {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage requires an exact manifest MSI product code.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
+        throw 'PSADT reviewedInstallShieldAdministrativeImage cannot be combined with a custom install command.'
+    }
+    Write-Host "Using reviewed InstallShield administrative-image lifecycle: $reviewedInstallShieldMsiExpectedFileName"
+}
+
+if ($reviewedUninstallWindowAutomationConfigured) {
+    if ($IsUserScope -or
+        -not $useRegistryUninstall -or
+        $registeredInstallerTypeLower -in @('msi', 'wix', 'burn') -or
+        -not [string]::IsNullOrWhiteSpace($customUninstallCommand) -or
+        $preserveVendorInstallationOnUninstall) {
+        throw 'PSADT reviewedUninstallWindowAutomation requires a machine-scope registry EXE uninstall lifecycle.'
+    }
+
+    $supportFilesDir = Join-Path $packageDir 'SupportFiles'
+    $null = New-Item -ItemType Directory -Path $supportFilesDir -Force
+    $windowAutomationConfigPath = Join-Path $supportFilesDir 'ReviewedUninstallWindowAutomation.json'
+    $reviewedUninstallWindowAutomation |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $windowAutomationConfigPath -Encoding UTF8
+
+    $windowAutomationHelperSource = Join-Path $PSScriptRoot 'Invoke-IntuneGetReviewedUninstallWindowAutomation.ps1'
+    if (-not (Test-Path -LiteralPath $windowAutomationHelperSource -PathType Leaf)) {
+        throw 'The reviewed uninstall window-automation helper source is missing.'
+    }
+    Copy-Item -LiteralPath $windowAutomationHelperSource -Destination (Join-Path $supportFilesDir 'Invoke-IntuneGetReviewedUninstallWindowAutomation.ps1') -Force
+    Write-Host "Embedded reviewed uninstall window automation for: $windowAutomationProcessName"
+}
+
+if ($reviewedArchiveUninstallConfigured) {
+    if ($IsUserScope -or
+        $installerTypeLower -ne 'zip' -or
+        $fileExtension -ne '.zip' -or
+        -not $useRegistryUninstall -or
+        $registeredInstallerTypeLower -in @('msi', 'wix', 'burn') -or
+        -not [string]::IsNullOrWhiteSpace($customUninstallCommand) -or
+        $preserveVendorInstallationOnUninstall) {
+        throw 'PSADT reviewedArchiveUninstall requires a machine-scope registry EXE lifecycle sourced from a ZIP archive.'
+    }
+
+    $supportFilesDir = Join-Path $packageDir 'SupportFiles'
+    $null = New-Item -ItemType Directory -Path $supportFilesDir -Force
+    $archiveUninstallConfigPath = Join-Path $supportFilesDir 'ReviewedArchiveUninstall.json'
+    [ordered]@{
+        relativePath = $reviewedArchiveUninstallRelativePath
+        arguments = @($reviewedArchiveUninstallArguments)
+    } |
+        ConvertTo-Json -Depth 3 |
+        Set-Content -LiteralPath $archiveUninstallConfigPath -Encoding UTF8
+
+    $archiveUninstallHelperSource = Join-Path $PSScriptRoot 'Invoke-IntuneGetReviewedArchiveUninstall.ps1'
+    if (-not (Test-Path -LiteralPath $archiveUninstallHelperSource -PathType Leaf)) {
+        throw 'The reviewed archive uninstall helper source is missing.'
+    }
+    Copy-Item -LiteralPath $archiveUninstallHelperSource -Destination (Join-Path $supportFilesDir 'Invoke-IntuneGetReviewedArchiveUninstall.ps1') -Force
+    Write-Host "Embedded reviewed archive uninstall contract for: $reviewedArchiveUninstallRelativePath"
 }
 
 if ($useRegistryUninstall) {
@@ -982,7 +1717,11 @@ if ($useRegistryUninstall) {
     Write-Host "Using portable uninstall (folder removal)"
 }
 
-if ($installerTypeLower -in @('msix', 'appx') -and
+$usesAppxLifecycle = $installerTypeLower -in @('msix', 'appx') -or
+    ($installerTypeLower -eq 'zip' -and
+     -not [string]::IsNullOrWhiteSpace($NestedInstallerType) -and
+     $NestedInstallerType.Trim().ToLowerInvariant() -in @('msix', 'appx'))
+if ($usesAppxLifecycle -and
     [string]::IsNullOrWhiteSpace($msixPackageName) -and
     ([string]::IsNullOrWhiteSpace($customInstallCommand) -or [string]::IsNullOrWhiteSpace($customUninstallCommand))) {
     throw "The MSIX/APPX package identity is missing; refusing to generate install or uninstall commands from a display-name guess."
@@ -1516,7 +2255,29 @@ foreach ($dependency in @($PackageDependencies | Sort-Object order)) {
             "            try { `$dependencyNeedsInstall = [version]`$existingDependency.Version -lt [version]'$dependencyVersionEscaped' } catch { `$dependencyNeedsInstall = `$true }"
             '        }'
             '        if ($dependencyNeedsInstall) {'
-            '            Add-AppxProvisionedPackage -Online -PackagePath $dependencyNestedPath -SkipLicense -ErrorAction Stop | Out-Null'
+            '            $dependencyProvisioningJob = Start-Job -ScriptBlock {'
+            '                param([string]$packagePath)'
+            '                $ErrorActionPreference = ''Stop'''
+            '                Add-AppxProvisionedPackage -Online -PackagePath $packagePath -SkipLicense -ErrorAction Stop | Out-Null'
+            '            } -ArgumentList $dependencyNestedPath'
+            '            try {'
+            '                while ($dependencyProvisioningJob.State -eq ''Running'') {'
+            '                    $null = Wait-Job -Job $dependencyProvisioningJob -Timeout 30'
+            '                    if ($dependencyProvisioningJob.State -eq ''Running'') {'
+            "                        Write-ADTLogEntry -Message 'Bundled APPX dependency [$dependencyIdEscaped] provisioning is still in progress.' -Severity 'Info' -Source 'Install-ADTDeployment'"
+            '                    }'
+            '                }'
+            '                if ($dependencyProvisioningJob.State -ne ''Completed'') {'
+            '                    $dependencyProvisioningFailure = $dependencyProvisioningJob.ChildJobs | Select-Object -First 1 -ExpandProperty JobStateInfo | Select-Object -ExpandProperty Reason'
+            '                    if ($dependencyProvisioningFailure) { throw $dependencyProvisioningFailure }'
+            '                    throw "Bundled APPX dependency provisioning failed with job state [$($dependencyProvisioningJob.State)]."'
+            '                }'
+            '                Receive-Job -Job $dependencyProvisioningJob -ErrorAction Stop | Out-Null'
+            '            }'
+            '            finally {'
+            '                if ($dependencyProvisioningJob.State -eq ''Running'') { Stop-Job -Job $dependencyProvisioningJob -ErrorAction SilentlyContinue }'
+            '                Remove-Job -Job $dependencyProvisioningJob -Force -ErrorAction SilentlyContinue'
+            '            }'
             "            Write-ADTLogEntry -Message 'Provisioned bundled APPX dependency [$dependencyIdEscaped].' -Severity 'Success' -Source 'Install-ADTDeployment'"
             '        }'
             '        else {'
@@ -1532,7 +2293,12 @@ foreach ($dependency in @($PackageDependencies | Sort-Object order)) {
         )
     }
     else {
-        $dependencyInstallLines += "    `$dependencyResult = Start-ADTProcess -FilePath `$dependencyPath -ArgumentList '$dependencyArgumentsEscaped' -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 10) -TimeoutAction Stop -SuccessExitCodes @($dependencySuccessLiteral) -RebootExitCodes @($dependencyRebootLiteral) -PassThru"
+        $dependencyArgumentListFragment = if ([string]::IsNullOrWhiteSpace($dependencyArgumentsEscaped)) {
+            ''
+        } else {
+            " -ArgumentList '$dependencyArgumentsEscaped'"
+        }
+        $dependencyInstallLines += "    `$dependencyResult = Start-ADTProcess -FilePath `$dependencyPath$dependencyArgumentListFragment -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 10) -TimeoutAction Stop -SuccessExitCodes @($dependencySuccessLiteral) -RebootExitCodes @($dependencyRebootLiteral) -PassThru"
     }
     $dependencyInstallLines += @(
         "    if (`$dependencyResult.ExitCode -in @($dependencyRebootLiteral)) {"
@@ -1621,7 +2387,50 @@ $lines += @(
 )
 $lines += $dependencyInstallLines
 
-if ($useRegistryUninstall) {
+if ($reviewedAppxInstallEvidenceConfigured) {
+    $lines += @(
+        '    # Verify the exact adapter-reviewed shared Appx framework identity.'
+        '    function Test-IntuneGetReviewedAppxInstallEvidence {'
+        "        `$minimumAppxVersion = [version]'$reviewedAppxInstallEvidenceMinimumVersion'"
+        "        `$matchingPackages = @(Get-AppxPackage -AllUsers -Name '$reviewedAppxInstallEvidencePackageNameEscaped' -ErrorAction SilentlyContinue | Where-Object {"
+        "            [string]`$_.Name -eq '$reviewedAppxInstallEvidencePackageNameEscaped' -and"
+        "            [string]`$_.PublisherId -eq '$reviewedAppxInstallEvidencePublisherIdEscaped' -and"
+        '            [bool]$_.IsFramework -and'
+        '            [version]$_.Version -ge $minimumAppxVersion'
+        '        })'
+        '        return $matchingPackages.Count -gt 0'
+        '    }'
+        ''
+    )
+} elseif ($useRegistryUninstall -and $reviewedRegistryInstallEvidenceConfigured) {
+    $lines += @(
+        '    # Verify the adapter-reviewed Windows runtime signal instead of guessing an ARP identity.'
+        '    $capturedUninstallKey = $null'
+        '    $capturedUninstallName = $null'
+        '    $capturedUninstallPublisher = $null'
+        '    $reviewedRegistryInstallationVerified = $false'
+        '    function Test-IntuneGetReviewedRegistryInstallEvidence {'
+        '        try {'
+        "            `$evidenceKey = Get-Item -LiteralPath '$reviewedRegistryInstallEvidenceProviderPathEscaped' -ErrorAction Stop"
+        "            if (`$evidenceKey.GetValueKind('$reviewedRegistryInstallEvidenceValueNameEscaped') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { return `$false }"
+        "            `$evidenceValue = `$evidenceKey.GetValue('$reviewedRegistryInstallEvidenceValueNameEscaped', `$null)"
+        "            return `$null -ne `$evidenceValue -and [uint64]`$evidenceValue -ge [uint64]$reviewedRegistryInstallEvidenceMinimumDword"
+        '        } catch {'
+        '            return $false'
+        '        }'
+        '    }'
+        ''
+    )
+} elseif ($useRegistryUninstall) {
+    # A reviewed long-running bootstrapper can hand work to a detached child
+    # before its own process handle completes. Reuse the reviewed completion
+    # ceiling for exact ARP registration instead of reverting to the generic
+    # one-minute capture window after the parent exits.
+    $registryUninstallVerificationAttempts = if ($reviewedInstallCompletionTimeoutMinutes -gt 0) {
+        [Math]::Max(30, $reviewedInstallCompletionTimeoutMinutes * 30)
+    } else {
+        30
+    }
     $lines += @(
         '    # Snapshot uninstall entries so the exact vendor entry created or updated by this installer can be reused later.'
         '    $preInstallApplications = @(Get-ADTApplication -ErrorAction SilentlyContinue)'
@@ -1630,6 +2439,7 @@ if ($useRegistryUninstall) {
         "    `$configuredUninstallLocaleHint = '$registryUninstallLocaleHintEscaped'"
         '    $capturedUninstallKey = $null'
         '    $capturedUninstallName = $null'
+        '    $capturedUninstallPublisher = $null'
         '    $multiProductInstallationVerified = $false'
         ''
     )
@@ -1654,8 +2464,58 @@ if ($removeExistingInstall) {
     )
 }
 
-# Generate install command - custom override takes precedence over installer type synthesis
-if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
+# Generate install command. Reviewed administrative-image adapters take
+# precedence over generic launcher synthesis; application adapters remove
+# customer overrides.
+if ($reviewedInstallShieldAdministrativeImageConfigured) {
+    $lines += @(
+        '    # Create the reviewed administrative image in the target context; never run the vendor launcher as the installer.'
+        '    $embeddedMsiAdminDir = [System.IO.Path]::Combine($env:TEMP, "IntuneGet_AdminImage_" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))'
+        '    $null = New-Item -Path $embeddedMsiAdminDir -ItemType Directory -Force'
+        '    try {'
+        '        # InstallShield /a creates an administrative image. /s and /qn keep both launcher and MSI UI headless under LocalSystem.'
+        '        $embeddedMsiAdminArguments = ''/a"'' + $embeddedMsiAdminDir + ''" /s /v"/qn TARGETDIR='' + $embeddedMsiAdminDir + '' REBOOT=ReallySuppress"'''
+        '        Write-ADTLogEntry -Message "Creating reviewed InstallShield administrative image in a bounded temporary directory." -Severity ''Info'' -Source ''Install-ADTDeployment'''
+        '        Start-ADTProcess -FilePath $installerPath -ArgumentList $embeddedMsiAdminArguments -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 5) -TimeoutAction Stop'
+        '        $embeddedMsiFiles = @(Get-ChildItem -LiteralPath $embeddedMsiAdminDir -Filter ''*.msi'' -File -Recurse -ErrorAction Stop)'
+        "        if (`$embeddedMsiFiles.Count -ne 1 -or `$embeddedMsiFiles[0].Name -ine '$reviewedInstallShieldMsiExpectedFileNameEscaped') {"
+        "            throw 'Reviewed InstallShield administrative image did not produce exactly one $reviewedInstallShieldMsiExpectedFileNameEscaped file.'"
+        '        }'
+        '        $embeddedMsiPath = $embeddedMsiFiles[0].FullName'
+        "        `$expectedEmbeddedMsiProductCode = '$registryUninstallProductCode'"
+        '        $embeddedMsiInstaller = $null'
+        '        $embeddedMsiDatabase = $null'
+        '        $embeddedMsiView = $null'
+        '        $embeddedMsiRecord = $null'
+        '        try {'
+        '            $embeddedMsiInstaller = New-Object -ComObject WindowsInstaller.Installer'
+        '            $embeddedMsiDatabase = $embeddedMsiInstaller.GetType().InvokeMember(''OpenDatabase'', [System.Reflection.BindingFlags]::InvokeMethod, $null, $embeddedMsiInstaller, @($embeddedMsiPath, 0))'
+        '            $embeddedMsiView = $embeddedMsiDatabase.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = ''ProductCode''")'
+        '            [void]$embeddedMsiView.Execute()'
+        '            $embeddedMsiRecord = $embeddedMsiView.Fetch()'
+        '            $embeddedMsiProductCode = if ($embeddedMsiRecord) { [string]$embeddedMsiRecord.StringData(1) } else { $null }'
+        '        }'
+        '        finally {'
+        '            if ($embeddedMsiView) { try { [void]$embeddedMsiView.Close() } catch { } }'
+        '            foreach ($embeddedMsiComObject in @($embeddedMsiRecord, $embeddedMsiView, $embeddedMsiDatabase, $embeddedMsiInstaller)) {'
+        '                if ($embeddedMsiComObject -and [System.Runtime.InteropServices.Marshal]::IsComObject($embeddedMsiComObject)) {'
+        '                    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($embeddedMsiComObject)'
+        '                }'
+        '            }'
+        '        }'
+        '        if (-not [string]::Equals($embeddedMsiProductCode, $expectedEmbeddedMsiProductCode, [System.StringComparison]::OrdinalIgnoreCase)) {'
+        '            throw "Administrative-image MSI product code [$embeddedMsiProductCode] does not match the manifest identity [$expectedEmbeddedMsiProductCode]."'
+        '        }'
+        '        Write-ADTLogEntry -Message "Validated the reviewed administrative-image MSI product identity; installing through PSADT." -Severity ''Info'' -Source ''Install-ADTDeployment'''
+        '        Start-ADTMsiProcess -Action ''Install'' -FilePath $embeddedMsiPath -AdditionalArgumentList ''REBOOT=ReallySuppress'''
+        '    }'
+        '    finally {'
+        '        if (Test-Path -LiteralPath $embeddedMsiAdminDir) {'
+        '            Remove-Item -LiteralPath $embeddedMsiAdminDir -Recurse -Force -ErrorAction SilentlyContinue'
+        '        }'
+        '    }'
+    )
+} elseif (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
     Write-Host "Using custom install command override from PSADT config"
     $lines += @(
         '    # Custom install command override (user-specified)'
@@ -1663,7 +2523,7 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
         "    Start-ADTProcess -FilePath `"`$env:SystemRoot\System32\cmd.exe`" -ArgumentList '/c $customInstallCommandEscaped' -WorkingDirectory `$adtSession.DirFiles -WindowStyle Hidden"
     )
 } else {
-    $installerArgumentList = "'$silentSwitchesEscaped'"
+    $effectiveInstallerArgumentsEscaped = $silentSwitchesEscaped
     if ($installerTypeLower -eq 'inno') {
         $innoSwitches = $effectiveSilentSwitches.Trim()
         if ($innoSwitches -notmatch '(?i)(^|\s)/SP-(\s|$)') { $innoSwitches = "$innoSwitches /SP-".Trim() }
@@ -1673,19 +2533,82 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
         # User-provided switches remain byte-for-byte authoritative apart from the
         # idempotent /SP- safety switch and PowerShell single-quote encoding.
         $innoSwitchesEscaped = $innoSwitches -replace "'", "''"
-        $installerArgumentList = "'$innoSwitchesEscaped'"
+        $effectiveInstallerArgumentsEscaped = $innoSwitchesEscaped
+    }
+    $installerArgumentList = "'$effectiveInstallerArgumentsEscaped'"
+    if ($effectiveInstallerArgumentsEscaped -match '%[A-Za-z][A-Za-z0-9()_]*%') {
+        $lines += "    `$effectiveInstallerArguments = [Environment]::ExpandEnvironmentVariables('$effectiveInstallerArgumentsEscaped')"
+        $installerArgumentList = '$effectiveInstallerArguments'
+    }
+    $installerArgumentListFragment = if ([string]::IsNullOrWhiteSpace($effectiveInstallerArgumentsEscaped)) {
+        ''
+    } else {
+        " -ArgumentList $installerArgumentList"
     }
     switch ($installerTypeLower) {
         { $_ -in 'msi', 'wix' } {
-            $msiProperties = ($silentSwitchesEscaped -replace '/q[nbrfu]?\s*', '' -replace '/quiet\s*', '').Trim()
+            # Strip only complete MSI UI tokens. Matching /q before /quiet used to
+            # leave the trailing token "iet", producing a malformed hidden MSI
+            # command that could stall indefinitely under LocalSystem.
+            $msiProperties = ($silentSwitchesEscaped -replace '(?i)(?<!\S)/(?:quiet|q[nbrfu]?)(?=\s|$)\s*', '').Trim()
+            $msiPreparationLines = @()
+            $reviewedMsiAdditionalArgumentLine = '    $msiAdditionalArgumentList = $null'
             if ($msiProperties) {
+                $msiPropertiesEscaped = $msiProperties -replace "'", "''"
+                if ($msiPropertiesEscaped -match '%[A-Za-z][A-Za-z0-9()_]*%') {
+                    $msiPreparationLines = @(
+                        "    `$effectiveMsiProperties = [Environment]::ExpandEnvironmentVariables('$msiPropertiesEscaped')"
+                    )
+                    $msiInstallLine = "    Start-ADTMsiProcess -Action 'Install' -FilePath '$installerFileNameSingleQuoteEscaped' -AdditionalArgumentList `$effectiveMsiProperties"
+                    $reviewedMsiAdditionalArgumentLine = '    $msiAdditionalArgumentList = $effectiveMsiProperties'
+                } else {
+                    $msiInstallLine = "    Start-ADTMsiProcess -Action 'Install' -FilePath '$installerFileNameSingleQuoteEscaped' -AdditionalArgumentList '$msiPropertiesEscaped'"
+                    $reviewedMsiAdditionalArgumentLine = "    `$msiAdditionalArgumentList = '$msiPropertiesEscaped'"
+                }
+            } else {
+                $msiInstallLine = "    Start-ADTMsiProcess -Action 'Install' -FilePath '$installerFileNameSingleQuoteEscaped'"
+            }
+            $lines += $msiPreparationLines
+            if ($reviewedInstallCompletionTimeoutMinutes -gt 0) {
+                # PSADT 4.1.8's Start-ADTMsiProcess FilePath_NoWait branch does not
+                # resolve the FilePath parameter and passes a null MSI path into
+                # Start-ADTProcess. Use the supported process handle directly while
+                # retaining PSADT's MSI defaults and verbose logging contract.
                 $lines += @(
-                    "    Start-ADTMsiProcess -Action 'Install' -FilePath '$installerFileNameSingleQuoteEscaped' -AdditionalArgumentList '$msiProperties'"
+                    '    # IntuneGet reviewed asynchronous MSI start'
+                    "    `$msiInstallerPath = Join-Path `$adtSession.DirFiles '$installerFileNameSingleQuoteEscaped'"
+                    '    $msiLogFileName = ''{0}_Install_{1:yyyyMMddHHmmssfff}.log'' -f [IO.Path]::GetFileNameWithoutExtension($msiInstallerPath), [DateTime]::UtcNow'
+                    '    $msiLogPath = Join-Path $adtSession.LogPath $msiLogFileName'
+                    $reviewedMsiAdditionalArgumentLine
+                    '    $msiArgumentList = ''/i "{0}" REBOOT=ReallySuppress /QN'' -f $msiInstallerPath'
+                    '    if (-not [string]::IsNullOrWhiteSpace($msiAdditionalArgumentList)) {'
+                    '        $msiArgumentList = "$msiArgumentList $msiAdditionalArgumentList"'
+                    '    }'
+                    '    $msiArgumentList = "$msiArgumentList /L*V `"$msiLogPath`""'
+                    "    `$installDeadline = [DateTime]::UtcNow.AddMinutes($reviewedInstallCompletionTimeoutMinutes)"
+                    '    $installHandle = Start-ADTProcess -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $msiArgumentList -WorkingDirectory $adtSession.DirFiles -WindowStyle Hidden -WaitForMsiExec -NoWait -PassThru'
+                    '    $nextInstallProgressLog = [DateTime]::UtcNow'
+                    '    while (-not $installHandle.Task.IsCompleted) {'
+                    '        if ([DateTime]::UtcNow -ge $installDeadline) {'
+                    "            throw 'The reviewed MSI installer did not complete within $reviewedInstallCompletionTimeoutMinutes minutes.'"
+                    '        }'
+                    '        if ([DateTime]::UtcNow -ge $nextInstallProgressLog) {'
+                    '            Write-ADTLogEntry -Message "The reviewed MSI installer is still working." -Source ''Install-ADTDeployment'''
+                    '            $nextInstallProgressLog = [DateTime]::UtcNow.AddSeconds(15)'
+                    '        }'
+                    '        Start-Sleep -Seconds 5'
+                    '    }'
+                    '    $installProcessExitCode = $installHandle.Task.GetAwaiter().GetResult().ExitCode'
+                    '    if ($installProcessExitCode -in @(1641, 3010)) {'
+                    '        $script:InstallRebootExitCode = 3010'
+                    '        Write-ADTLogEntry -Message "The reviewed MSI installer requested a reboot with exit code [$installProcessExitCode]." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+                    '    } elseif ($installProcessExitCode -ne 0) {'
+                    '        throw "The reviewed MSI installer exited with code [$installProcessExitCode]."'
+                    '    }'
+                    '    # IntuneGet reviewed asynchronous MSI end'
                 )
             } else {
-                $lines += @(
-                    "    Start-ADTMsiProcess -Action 'Install' -FilePath '$installerFileNameSingleQuoteEscaped'"
-                )
+                $lines += $msiInstallLine
             }
         }
         { $_ -in 'msix', 'appx' } {
@@ -1737,7 +2660,29 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                     '            }'
                     '        }'
                     '        if ($shouldInstallPackage) {'
-                    '            Add-AppxProvisionedPackage -Online -PackagePath $msixPath -SkipLicense -ErrorAction Stop'
+                    '            $provisioningJob = Start-Job -ScriptBlock {'
+                    '                param([string]$packagePath)'
+                    '                $ErrorActionPreference = ''Stop'''
+                    '                Add-AppxProvisionedPackage -Online -PackagePath $packagePath -SkipLicense -ErrorAction Stop | Out-Null'
+                    '            } -ArgumentList $msixPath'
+                    '            try {'
+                    '                while ($provisioningJob.State -eq ''Running'') {'
+                    '                    $null = Wait-Job -Job $provisioningJob -Timeout 30'
+                    '                    if ($provisioningJob.State -eq ''Running'') {'
+                    '                        Write-ADTLogEntry -Message "Machine-scoped MSIX/APPX provisioning is still in progress for [$packageName]." -Severity ''Info'' -Source ''Install-ADTDeployment'''
+                    '                    }'
+                    '                }'
+                    '                if ($provisioningJob.State -ne ''Completed'') {'
+                    '                    $provisioningFailure = $provisioningJob.ChildJobs | Select-Object -First 1 -ExpandProperty JobStateInfo | Select-Object -ExpandProperty Reason'
+                    '                    if ($provisioningFailure) { throw $provisioningFailure }'
+                    '                    throw "Machine-scoped MSIX/APPX provisioning failed with job state [$($provisioningJob.State)]."'
+                    '                }'
+                    '                Receive-Job -Job $provisioningJob -ErrorAction Stop | Out-Null'
+                    '            }'
+                    '            finally {'
+                    '                if ($provisioningJob.State -eq ''Running'') { Stop-Job -Job $provisioningJob -ErrorAction SilentlyContinue }'
+                    '                Remove-Job -Job $provisioningJob -Force -ErrorAction SilentlyContinue'
+                    '            }'
                     '            Write-ADTLogEntry -Message "Machine-scoped MSIX/APPX package provisioned successfully" -Severity ''Success'' -Source ''Install-ADTDeployment'''
                     '        }'
                     '    } catch {'
@@ -1748,20 +2693,12 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
             }
         }
         'zip' {
-            # Zip archives carry a nested installer (winget nestedInstallerType/nestedInstallerPath)
-            # Never execute the .zip itself - extract it and run the declared nested installer
-            if ([string]::IsNullOrWhiteSpace($NestedInstallerPath)) {
-                Write-Host "Zip installer without nested installer path - emitting install-time error"
-                $lines += @(
-                    '    # Zip archives cannot be executed directly and no nested installer was declared'
-                    '    throw "Zip package does not declare a nested installer; cannot install"'
-                )
-            } else {
-                $nestedInstallerPathEscaped = $NestedInstallerPath -replace "'", "''"
-                $nestedInstallerTypeLower = if ($NestedInstallerType) { $NestedInstallerType.ToLower() } else { '' }
-                Write-Host "Zip installer with nested installer: type='$nestedInstallerTypeLower' path='$NestedInstallerPath'"
-
-                if ($isNestedPortable) {
+            # Archives without a nested contract and nested portable archives are
+            # safely staged as complete portable application folders.
+            $nestedInstallerPathEscaped = $NestedInstallerPath -replace "'", "''"
+            $nestedInstallerTypeLower = if ($NestedInstallerType) { $NestedInstallerType.ToLower() } else { '' }
+            if ($isNestedPortable -or $isPlainPortableArchive) {
+                    Write-Host "Staging zip as portable archive"
                     $lines += @(
                         ''
                         '    # Safely stage every portable archive entry before replacing the installed app'
@@ -1795,13 +2732,19 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                         '        finally {'
                         '            if ($archive) { $archive.Dispose() }'
                         '        }'
-                        "        `$declaredNestedPath = [System.IO.Path]::GetFullPath((Join-Path `$stageRoot '$nestedInstallerPathEscaped'))"
-                        '        if (-not $declaredNestedPath.StartsWith($stageRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {'
-                        '            throw "Nested installer path escapes the portable staging directory"'
-                        '        }'
-                        '        if (-not (Test-Path -LiteralPath $declaredNestedPath -PathType Leaf)) {'
-                        "            throw `"Nested installer not found in archive: $nestedInstallerPathEscaped`""
-                        '        }'
+                    )
+                    if ($isNestedPortable) {
+                        $lines += @(
+                            "        `$declaredNestedPath = [System.IO.Path]::GetFullPath((Join-Path `$stageRoot '$nestedInstallerPathEscaped'))"
+                            '        if (-not $declaredNestedPath.StartsWith($stageRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {'
+                            '            throw "Nested installer path escapes the portable staging directory"'
+                            '        }'
+                            '        if (-not (Test-Path -LiteralPath $declaredNestedPath -PathType Leaf)) {'
+                            "            throw `"Nested installer not found in archive: $nestedInstallerPathEscaped`""
+                            '        }'
+                        )
+                    }
+                    $lines += @(
                         '        $installParent = [System.IO.Path]::GetDirectoryName($installPath)'
                         '        if ($installParent) { $null = New-Item -Path $installParent -ItemType Directory -Force }'
                         '        $replacementStarted = $true'
@@ -1826,18 +2769,107 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                     # Build the execution line for a non-portable nested installer.
                     switch ($nestedInstallerTypeLower) {
                         { $_ -in 'msi', 'wix' } {
-                            $msiProperties = ($silentSwitchesEscaped -replace '/q[nbrfu]?\s*', '' -replace '/quiet\s*', '').Trim()
+                            $msiProperties = ($silentSwitchesEscaped -replace '(?i)(?<!\S)/(?:quiet|q[nbrfu]?)(?=\s|$)\s*', '').Trim()
                             if ($msiProperties) {
                                 $nestedExecuteLine = "        Start-ADTMsiProcess -Action 'Install' -FilePath `$nestedInstallerPath -AdditionalArgumentList '$msiProperties'"
                             } else {
                                 $nestedExecuteLine = "        Start-ADTMsiProcess -Action 'Install' -FilePath `$nestedInstallerPath"
                             }
                         }
-                        default {
+                        { $_ -in 'msix', 'appx' } {
                             if ($IsUserScope) {
-                                $nestedExecuteLine = "        Start-ADTProcess -FilePath `$nestedInstallerPath -ArgumentList '$silentSwitchesEscaped' -UseShellExecute -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                                $nestedExecuteLine = @(
+                                    '        $msixPath = $nestedInstallerPath'
+                                    "        `$packageName = '$msixPackageName'"
+                                    "        `$targetVersion = '$versionSingleQuoteEscaped'"
+                                    '        Write-ADTLogEntry -Message "Registering nested user-scoped MSIX/APPX package: $msixPath" -Severity ''Info'' -Source ''Install-ADTDeployment'''
+                                    '        $existingPackage = Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1'
+                                    '        $shouldInstallPackage = $true'
+                                    '        if ($existingPackage) {'
+                                    '            try { $shouldInstallPackage = [version]$existingPackage.Version -lt [version]$targetVersion }'
+                                    '            catch { $shouldInstallPackage = [string]$existingPackage.Version -ne $targetVersion }'
+                                    '        }'
+                                    '        if ($shouldInstallPackage) {'
+                                    '            Add-AppxPackage -Path $msixPath -ForceApplicationShutdown -ErrorAction Stop'
+                                    '        } else {'
+                                    '            Write-ADTLogEntry -Message "Nested MSIX/APPX package [$packageName] version [$($existingPackage.Version)] already satisfies target [$targetVersion]." -Severity ''Success'' -Source ''Install-ADTDeployment'''
+                                    '        }'
+                                )
                             } else {
-                                $nestedExecuteLine = "        Start-ADTProcess -FilePath `$nestedInstallerPath -ArgumentList '$silentSwitchesEscaped' -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                                $nestedExecuteLine = @(
+                                    '        $msixPath = $nestedInstallerPath'
+                                    "        `$packageName = '$msixPackageName'"
+                                    "        `$targetVersion = '$versionSingleQuoteEscaped'"
+                                    '        Write-ADTLogEntry -Message "Provisioning nested machine-scoped MSIX/APPX package for all users: $msixPath" -Severity ''Info'' -Source ''Install-ADTDeployment'''
+                                    '        $existingPackage = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $packageName } | Sort-Object Version -Descending | Select-Object -First 1'
+                                    '        $shouldInstallPackage = $true'
+                                    '        if ($existingPackage) {'
+                                    '            try { $shouldInstallPackage = [version]$existingPackage.Version -lt [version]$targetVersion }'
+                                    '            catch { $shouldInstallPackage = [string]$existingPackage.Version -ne $targetVersion }'
+                                    '        }'
+                                    '        if ($shouldInstallPackage) {'
+                                    '            $provisioningJob = Start-Job -ScriptBlock {'
+                                    '                param([string]$packagePath)'
+                                    '                $ErrorActionPreference = ''Stop'''
+                                    '                Add-AppxProvisionedPackage -Online -PackagePath $packagePath -SkipLicense -ErrorAction Stop | Out-Null'
+                                    '            } -ArgumentList $msixPath'
+                                    '            try {'
+                                    '                while ($provisioningJob.State -eq ''Running'') {'
+                                    '                    $null = Wait-Job -Job $provisioningJob -Timeout 30'
+                                    '                    if ($provisioningJob.State -eq ''Running'') {'
+                                    '                        Write-ADTLogEntry -Message "Nested machine-scoped MSIX/APPX provisioning is still in progress for [$packageName]." -Severity ''Info'' -Source ''Install-ADTDeployment'''
+                                    '                    }'
+                                    '                }'
+                                    '                if ($provisioningJob.State -ne ''Completed'') {'
+                                    '                    $provisioningFailure = $provisioningJob.ChildJobs | Select-Object -First 1 -ExpandProperty JobStateInfo | Select-Object -ExpandProperty Reason'
+                                    '                    if ($provisioningFailure) { throw $provisioningFailure }'
+                                    '                    throw "Nested machine-scoped MSIX/APPX provisioning failed with job state [$($provisioningJob.State)]."'
+                                    '                }'
+                                    '                Receive-Job -Job $provisioningJob -ErrorAction Stop | Out-Null'
+                                    '            }'
+                                    '            finally {'
+                                    '                if ($provisioningJob.State -eq ''Running'') { Stop-Job -Job $provisioningJob -ErrorAction SilentlyContinue }'
+                                    '                Remove-Job -Job $provisioningJob -Force -ErrorAction SilentlyContinue'
+                                    '            }'
+                                    '        } else {'
+                                    '            Write-ADTLogEntry -Message "Nested provisioned MSIX/APPX package [$packageName] version [$($existingPackage.Version)] already satisfies target [$targetVersion]." -Severity ''Success'' -Source ''Install-ADTDeployment'''
+                                    '        }'
+                                )
+                            }
+                        }
+                        default {
+                            $nestedInstallerArgumentListFragment = if ([string]::IsNullOrWhiteSpace($silentSwitchesEscaped)) {
+                                ''
+                            } else {
+                                " -ArgumentList '$silentSwitchesEscaped'"
+                            }
+                            if ($IsUserScope) {
+                                $nestedExecuteLine = "        Start-ADTProcess -FilePath `$nestedInstallerPath$nestedInstallerArgumentListFragment -UseShellExecute -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                            } elseif ($reviewedInstallCompletionTimeoutMinutes -gt 0) {
+                                $nestedExecuteLine = @(
+                                    "        `$installDeadline = [DateTime]::UtcNow.AddMinutes($reviewedInstallCompletionTimeoutMinutes)"
+                                    "        `$installHandle = Start-ADTProcess -FilePath `$nestedInstallerPath$nestedInstallerArgumentListFragment -WindowStyle Hidden -WaitForMsiExec -NoWait -PassThru"
+                                    '        $nextInstallProgressLog = [DateTime]::UtcNow'
+                                    '        while (-not $installHandle.Task.IsCompleted) {'
+                                    '            if ([DateTime]::UtcNow -ge $installDeadline) {'
+                                    "                throw 'The reviewed nested vendor installer did not complete within $reviewedInstallCompletionTimeoutMinutes minutes.'"
+                                    '            }'
+                                    '            if ([DateTime]::UtcNow -ge $nextInstallProgressLog) {'
+                                    '                Write-ADTLogEntry -Message "The reviewed nested vendor installer is still working." -Source ''Install-ADTDeployment'''
+                                    '                $nextInstallProgressLog = [DateTime]::UtcNow.AddSeconds(15)'
+                                    '            }'
+                                    '            Start-Sleep -Seconds 5'
+                                    '        }'
+                                    '        $installProcessExitCode = $installHandle.Task.GetAwaiter().GetResult().ExitCode'
+                                    '        if ($installProcessExitCode -in @(1641, 3010)) {'
+                                    '            $script:InstallRebootExitCode = 3010'
+                                    '            Write-ADTLogEntry -Message "The reviewed nested vendor installer requested a reboot with exit code [$installProcessExitCode]." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+                                    '        } elseif ($installProcessExitCode -ne 0) {'
+                                    '            throw "The reviewed nested vendor installer exited with code [$installProcessExitCode]."'
+                                    '        }'
+                                )
+                            } else {
+                                $nestedExecuteLine = "        Start-ADTProcess -FilePath `$nestedInstallerPath$nestedInstallerArgumentListFragment -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
                             }
                         }
                     }
@@ -1877,7 +2909,6 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                         '    }'
                     )
                 }
-            }
         }
         'portable' {
             $lines += @(
@@ -1927,8 +2958,46 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                     ''
                     '    try {'
                     '        Write-ADTLogEntry -Message "Running per-user installer from user temp directory" -Severity ''Info'' -Source ''Install-ADTDeployment'''
-                    '        # Use -UseShellExecute for shell context which inherits environment variables'
-                    "        Start-ADTProcess -FilePath `$installerDest -ArgumentList $installerArgumentList -UseShellExecute -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                )
+                if ($reviewedInstallCompletionTimeoutMinutes -gt 0) {
+                    $lines += @(
+                        '        # Keep the reviewed per-user installer observable while preserving its shell environment.'
+                        "        `$installDeadline = [DateTime]::UtcNow.AddMinutes($reviewedInstallCompletionTimeoutMinutes)"
+                        "        `$installHandle = Start-ADTProcess -FilePath `$installerDest$installerArgumentListFragment -UseShellExecute -WaitForMsiExec -NoWait -PassThru"
+                        '        $nextInstallProgressLog = [DateTime]::UtcNow'
+                        '        while (-not $installHandle.Task.IsCompleted) {'
+                        '            if ([DateTime]::UtcNow -ge $installDeadline) {'
+                        '                try {'
+                        '                    if (-not $installHandle.Process.HasExited) {'
+                        '                        $installHandle.Process.Kill($true)'
+                        '                        $installHandle.Process.WaitForExit()'
+                        '                    }'
+                        '                } catch {'
+                        '                    Write-ADTLogEntry -Message "Could not stop the reviewed per-user vendor installer after its bounded timeout: $_" -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+                        '                }'
+                        "                throw 'The reviewed per-user vendor installer did not complete within $reviewedInstallCompletionTimeoutMinutes minutes.'"
+                        '            }'
+                        '            if ([DateTime]::UtcNow -ge $nextInstallProgressLog) {'
+                        '                Write-ADTLogEntry -Message "The reviewed per-user vendor installer is still working." -Source ''Install-ADTDeployment'''
+                        '                $nextInstallProgressLog = [DateTime]::UtcNow.AddSeconds(15)'
+                        '            }'
+                        '            Start-Sleep -Seconds 5'
+                        '        }'
+                        '        $installProcessExitCode = $installHandle.Task.GetAwaiter().GetResult().ExitCode'
+                        '        if ($installProcessExitCode -in @(1641, 3010)) {'
+                        '            $script:InstallRebootExitCode = 3010'
+                        '            Write-ADTLogEntry -Message "The reviewed per-user vendor installer requested a reboot with exit code [$installProcessExitCode]." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+                        '        } elseif ($installProcessExitCode -ne 0) {'
+                        '            throw "The reviewed per-user vendor installer exited with code [$installProcessExitCode]."'
+                        '        }'
+                    )
+                } else {
+                    $lines += @(
+                        '        # Use -UseShellExecute for shell context which inherits environment variables'
+                        "        Start-ADTProcess -FilePath `$installerDest$installerArgumentListFragment -UseShellExecute -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                    )
+                }
+                $lines += @(
                     '    }'
                     '    finally {'
                     '        # Cleanup temp directory'
@@ -1938,9 +3007,35 @@ if (-not [string]::IsNullOrWhiteSpace($customInstallCommand)) {
                     '    }'
                 )
             } else {
-                $lines += @(
-                    "    Start-ADTProcess -FilePath `"`$(`$adtSession.DirFiles)\$installerFileName`" -ArgumentList $installerArgumentList -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
-                )
+                if ($reviewedInstallCompletionTimeoutMinutes -gt 0) {
+                    $lines += @(
+                        "    `$installerPath = Join-Path `$adtSession.DirFiles '$installerFileNameSingleQuoteEscaped'"
+                        "    `$installDeadline = [DateTime]::UtcNow.AddMinutes($reviewedInstallCompletionTimeoutMinutes)"
+                        "    `$installHandle = Start-ADTProcess -FilePath `$installerPath$installerArgumentListFragment -WindowStyle Hidden -WaitForMsiExec -NoWait -PassThru"
+                        '    $nextInstallProgressLog = [DateTime]::UtcNow'
+                        '    while (-not $installHandle.Task.IsCompleted) {'
+                        '        if ([DateTime]::UtcNow -ge $installDeadline) {'
+                        "            throw 'The reviewed vendor installer did not complete within $reviewedInstallCompletionTimeoutMinutes minutes.'"
+                        '        }'
+                        '        if ([DateTime]::UtcNow -ge $nextInstallProgressLog) {'
+                        '            Write-ADTLogEntry -Message "The reviewed vendor installer is still working." -Source ''Install-ADTDeployment'''
+                        '            $nextInstallProgressLog = [DateTime]::UtcNow.AddSeconds(15)'
+                        '        }'
+                        '        Start-Sleep -Seconds 5'
+                        '    }'
+                        '    $installProcessExitCode = $installHandle.Task.GetAwaiter().GetResult().ExitCode'
+                        '    if ($installProcessExitCode -in @(1641, 3010)) {'
+                        '        $script:InstallRebootExitCode = 3010'
+                        '        Write-ADTLogEntry -Message "The reviewed vendor installer requested a reboot with exit code [$installProcessExitCode]." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+                        '    } elseif ($installProcessExitCode -ne 0) {'
+                        '        throw "The reviewed vendor installer exited with code [$installProcessExitCode]."'
+                        '    }'
+                    )
+                } else {
+                    $lines += @(
+                        "    Start-ADTProcess -FilePath `"`$(`$adtSession.DirFiles)\$installerFileName`"$installerArgumentListFragment -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+                    )
+                }
             }
         }
     }
@@ -1953,10 +3048,86 @@ $lines += @(
     '    Close-ADTInstallationProgress'
 )
 
+if ($useManagedDirectoryLifecycle) {
+    $lines += @('', "    `$managedInstallDirectory = [Environment]::ExpandEnvironmentVariables('$reviewedManagedInstallDirectoryEscaped')")
+    if ($hasManagedInstallCompletionContract) {
+        $lines += @(
+            "    `$managedInstallEvidenceFile = [Environment]::ExpandEnvironmentVariables('$reviewedManagedInstallEvidenceFileEscaped')"
+            "    `$managedInstallCompletionProcess = [Environment]::ExpandEnvironmentVariables('$reviewedManagedInstallCompletionProcessEscaped')"
+            "    `$managedInstallDeadline = [DateTime]::UtcNow.AddMinutes($reviewedManagedInstallCompletionTimeoutMinutes)"
+            '    $managedInstallReadyObservations = 0'
+            '    do {'
+            '        $managedInstallEvidenceReady = Test-Path -LiteralPath $managedInstallEvidenceFile -PathType Leaf'
+            '        $managedInstallProcessActive = $false'
+            '        if (-not [string]::IsNullOrWhiteSpace($managedInstallCompletionProcess)) {'
+            '            $managedInstallProcessActive = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {'
+            '                [string]::Equals([string]$_.ExecutablePath, $managedInstallCompletionProcess, [System.StringComparison]::OrdinalIgnoreCase)'
+            '            }).Count -gt 0'
+            '        }'
+            '        if ($managedInstallEvidenceReady -and -not $managedInstallProcessActive) {'
+            '            $managedInstallReadyObservations++'
+            '        } else {'
+            '            $managedInstallReadyObservations = 0'
+            '        }'
+            '        if ($managedInstallReadyObservations -ge 2) { break }'
+            '        Start-Sleep -Seconds 5'
+            '    } while ([DateTime]::UtcNow -lt $managedInstallDeadline)'
+            '    if ($managedInstallReadyObservations -lt 2) {'
+            '        throw "The reviewed managed installation did not reach stable completion before the deadline: $managedInstallEvidenceFile"'
+            '    }'
+            '    Write-ADTLogEntry -Message "Verified stable managed installation evidence at [$managedInstallEvidenceFile]." -Severity ''Success'' -Source ''Install-ADTDeployment'''
+        )
+    } else {
+        $lines += @(
+            '    if (-not (Test-Path -LiteralPath $managedInstallDirectory -PathType Container)) {'
+            '        throw "The reviewed managed install directory was not created: $managedInstallDirectory"'
+            '    }'
+            '    $managedPayloadFile = Get-ChildItem -LiteralPath $managedInstallDirectory -File -Recurse -ErrorAction Stop | Select-Object -First 1'
+            '    if (-not $managedPayloadFile) {'
+            '        throw "The reviewed managed install directory contains no payload files: $managedInstallDirectory"'
+            '    }'
+            '    Write-ADTLogEntry -Message "Verified managed extracted payload at [$managedInstallDirectory]." -Severity ''Success'' -Source ''Install-ADTDeployment'''
+        )
+    }
+}
+
 # Optional post-install verification (opt-in via PSADT config)
 # Throwing here routes through the standard catch -> Close-ADTSession error exit,
 # and the detection marker write below is skipped because it never runs
-if ($useRegistryUninstall) {
+if ($reviewedAppxInstallEvidenceConfigured) {
+    $lines += @(
+        '    # Wait briefly for the exact shared Appx framework to become visible.'
+        '    $reviewedAppxInstallationVerified = $false'
+        '    foreach ($verificationAttempt in 1..30) {'
+        '        if (Test-IntuneGetReviewedAppxInstallEvidence) {'
+        '            $reviewedAppxInstallationVerified = $true'
+        '            break'
+        '        }'
+        '        if ($verificationAttempt -lt 30) { Start-Sleep -Seconds 2 }'
+        '    }'
+        '    if (-not $reviewedAppxInstallationVerified) {'
+        "        throw 'Reviewed Appx install verification failed: expected framework $reviewedAppxInstallEvidencePackageNameEscaped from publisher $reviewedAppxInstallEvidencePublisherIdEscaped at version $reviewedAppxInstallEvidenceMinimumVersion or newer.'"
+        '    }'
+        "    Write-ADTLogEntry -Message 'Verified reviewed shared Appx framework evidence.' -Severity 'Success' -Source 'Install-ADTDeployment'"
+        ''
+    )
+} elseif ($useRegistryUninstall -and $reviewedRegistryInstallEvidenceConfigured) {
+    $lines += @(
+        '    # Wait briefly for the documented Windows runtime registry signal to become visible.'
+        '    foreach ($verificationAttempt in 1..30) {'
+        '        if (Test-IntuneGetReviewedRegistryInstallEvidence) {'
+        '            $reviewedRegistryInstallationVerified = $true'
+        '            break'
+        '        }'
+        '        if ($verificationAttempt -lt 30) { Start-Sleep -Seconds 2 }'
+        '    }'
+        '    if (-not $reviewedRegistryInstallationVerified) {'
+        "        throw 'Reviewed registry install verification failed: expected a DWORD value of at least $reviewedRegistryInstallEvidenceMinimumDword.'"
+        '    }'
+        "    Write-ADTLogEntry -Message 'Verified reviewed Windows runtime registry evidence.' -Severity 'Success' -Source 'Install-ADTDeployment'"
+        ''
+    )
+} elseif ($useRegistryUninstall) {
     $lines += @(
         '    # Capture the registry uninstall entry created or version-updated by this installer.'
         '    # Manifest identity is a preference; the observed ARP delta is authoritative when metadata is stale.'
@@ -1967,6 +3138,10 @@ if ($useRegistryUninstall) {
         '    $configuredUninstallPublisherAgnosticName = if ($configuredUninstallPublisherName) {'
         '        ($configuredUninstallComparableName -replace (''(?i)^'' + [regex]::Escape($configuredUninstallPublisherName) + ''(?:\s+|[._-]+)''), '''').Trim()'
         '    } else { $configuredUninstallComparableName }'
+        '    $configuredUninstallVersion = [string]$adtSession.AppVersion'
+        '    $configuredUninstallVersionedName = if (-not [string]::IsNullOrWhiteSpace($configuredUninstallVersion)) {'
+        '        "$configuredUninstallComparableName $configuredUninstallVersion"'
+        '    } else { $null }'
         '    # Some language-specific WinGet manifests carry a default-locale ARP name even though'
         '    # the selected installer registers its requested locale (for example en-US versus de).'
         '    # Only enable locale-agnostic comparison when the package ID has a locale suffix and the'
@@ -1979,7 +3154,7 @@ if ($useRegistryUninstall) {
         '    $candidateLocaleSuffixPattern = if ($configuredUninstallLocaleAgnosticName) {'
         '        ''\(\s*(?:(?:x86_64|aarch64|amd64|arm64|x64|x86|win64|win32|64-bit|32-bit)\s+)?'' + [regex]::Escape($configuredUninstallLocaleHint) + ''\s*\)$'''
         '    } else { $null }'
-        '    foreach ($verificationAttempt in 1..30) {'
+        "    foreach (`$verificationAttempt in 1..$registryUninstallVerificationAttempts) {"
         '        $postInstallApplications = @(Get-ADTApplication -ErrorAction SilentlyContinue)'
         '        $changedApplications = @($postInstallApplications | Where-Object {'
         '            $candidateApplication = $_'
@@ -2011,6 +3186,37 @@ if ($useRegistryUninstall) {
         '            })'
         '            if ($publisherAgnosticMatches.Count -eq 1) { $selectedApplications = $publisherAgnosticMatches }'
         '        }'
+        '        if ($selectedApplications.Count -eq 0 -and $configuredUninstallVersionedName) {'
+        '            # Some MSI packages append their exact package version to the ARP display name.'
+        '            # Accept only one observed delta whose normalized name and DisplayVersion both'
+        '            # equal the requested package identity; a different version remains rejected.'
+        '            $versionSuffixedMatches = @($changedApplications | Where-Object {'
+        '                $candidateDisplayName = [string]$_.DisplayName'
+        '                $candidateComparableName = (($candidateDisplayName -replace ''(?i)(?<![A-Za-z0-9])(x86_64|aarch64|amd64|arm64|x64|x86|win64|win32|64-bit|32-bit)(?![A-Za-z0-9])'', '''' -replace ''\(\s*\)'', '''' -replace ''\(\s+'', ''('' -replace ''\s+\)'', '')'' -replace ''\s{2,}'', '' '')).Trim()'
+        '                $candidateComparableName -eq $configuredUninstallVersionedName -and'
+        '                    [string]$_.DisplayVersion -eq $configuredUninstallVersion'
+        '            })'
+        '            if ($versionSuffixedMatches.Count -eq 1) { $selectedApplications = $versionSuffixedMatches }'
+        '        }'
+        '        if ($selectedApplications.Count -eq 0 -and $configuredUninstallComparableName -and $configuredUninstallVersion) {'
+        '            # Some bootstrapper manifests use a catalog name while the installed MSI appends a'
+        '            # marketing version to its ARP display name. Accept only one visible observed delta'
+        '            # whose normalized name begins on a strict boundary and whose registered version'
+        '            # exactly equals the requested package version. This excludes bundled prerequisites.'
+        '            $versionAlignedPrefixMatches = @($changedApplications | Where-Object {'
+        '                $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
+        '                $isVisibleApplication = -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
+        '                $candidateDisplayName = [string]$_.DisplayName'
+        '                $candidateComparableName = (($candidateDisplayName -replace ''(?i)(?<![A-Za-z0-9])(x86_64|aarch64|amd64|arm64|x64|x86|win64|win32|64-bit|32-bit)(?![A-Za-z0-9])'', '''' -replace ''\(\s*\)'', '''' -replace ''\(\s+'', ''('' -replace ''\s+\)'', '')'' -replace ''\s{2,}'', '' '')).Trim()'
+        '                $hasConfiguredNameBoundary = ('
+        '                    $candidateComparableName.StartsWith($configuredUninstallComparableName + '' '', [System.StringComparison]::OrdinalIgnoreCase) -or'
+        '                    $candidateComparableName.StartsWith($configuredUninstallComparableName + ''('', [System.StringComparison]::OrdinalIgnoreCase)'
+        '                )'
+        '                $isVisibleApplication -and $hasConfiguredNameBoundary -and'
+        '                    [string]$_.DisplayVersion -eq $configuredUninstallVersion'
+        '            })'
+        '            if ($versionAlignedPrefixMatches.Count -eq 1) { $selectedApplications = $versionAlignedPrefixMatches }'
+        '        }'
         '        if ($selectedApplications.Count -eq 0 -and $candidateLocaleSuffixPattern) {'
         '            $localeAgnosticMatches = @($changedApplications | Where-Object {'
         '                $candidateDisplayName = [string]$_.DisplayName'
@@ -2033,12 +3239,12 @@ if ($useRegistryUninstall) {
     # This is a packager-time decision. Do not emit $originalInstallerType into the
     # generated deployment script: that variable exists only in this generator and
     # StrictMode would turn the fallback check into a post-install 60001 failure.
-    if ($originalInstallerType -eq 'burn') {
+    if ($registeredInstallerTypeLower -in @('burn', 'exe')) {
         $lines += @(
             '        if ($selectedApplications.Count -gt 1) {'
-            '            # A Burn bundle and its chained MSI can intentionally share the same ARP display name.'
-            '            # Prefer the single non-MSI entry from the already identity-matched set; never widen'
-            '            # an ambiguous match to an unrelated uninstall entry.'
+            '            # A top-level executable wrapper and its chained MSI can intentionally share the same ARP display name.'
+            '            # Prefer the single visible non-MSI entry from the already identity-matched set; never widen'
+            '            # an ambiguous match to an unrelated uninstall entry or guess between multiple wrappers.'
             '            $bundleCandidates = @($selectedApplications | Where-Object {'
             '                $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
             '                $isVisibleApplication = -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
@@ -2046,9 +3252,30 @@ if ($useRegistryUninstall) {
             '            })'
             '            if ($bundleCandidates.Count -eq 1) { $selectedApplications = $bundleCandidates }'
             '        }'
-            '        if ($selectedApplications.Count -eq 0) {'
-            '            $bundleCandidates = @($changedApplications | Where-Object { -not $_.WindowsInstaller })'
-            '            if ($bundleCandidates.Count -eq 1) { $selectedApplications = $bundleCandidates }'
+        '        if ($selectedApplications.Count -eq 0 -and -not $configuredUninstallProductCode -and $configuredUninstallPublisherName) {'
+        '            # A wrapper fallback must remain vendor-bound. Background updaters can be the only'
+        '            # non-MSI ARP delta while the real installer is still working; accepting one by count'
+        '            # alone can capture and later remove an unrelated shared application.'
+        '            $bundleCandidates = @($changedApplications | Where-Object {'
+        '                -not $_.WindowsInstaller -and'
+        '                    [string]$_.Publisher -eq $configuredUninstallPublisherName'
+        '            })'
+        '            if ($bundleCandidates.Count -eq 1) { $selectedApplications = $bundleCandidates }'
+        '        }'
+        )
+    }
+
+    if ($reviewedPreferVisiblePrimaryUninstallRegistration) {
+        $lines += @(
+            '        if ($selectedApplications.Count -gt 1) {'
+            '            # This reviewed package registers one visible primary application plus a hidden system'
+            '            # component under the same exact identity. Narrow only the already identity-matched set'
+            '            # and accept it only when exactly one visible registration remains.'
+            '            $visiblePrimaryMatches = @($selectedApplications | Where-Object {'
+            '                $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
+            '                -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
+            '            })'
+            '            if ($visiblePrimaryMatches.Count -eq 1) { $selectedApplications = $visiblePrimaryMatches }'
             '        }'
         )
     }
@@ -2109,20 +3336,33 @@ if ($useRegistryUninstall) {
     }
 
     $lines += @(
-        '        if ($selectedApplications.Count -eq 0 -and $changedApplications.Count -eq 1) {'
-        '            $selectedApplications = @($changedApplications[0])'
-        '        }'
         '        if ($selectedApplications.Count -eq 1) { break }'
         '        if ($multiProductInstallationVerified) { break }'
-        '        if ($verificationAttempt -lt 30) { Start-Sleep -Seconds 2 }'
+        "        if (`$verificationAttempt -lt $registryUninstallVerificationAttempts) { Start-Sleep -Seconds 2 }"
         '    }'
         '    if ($selectedApplications.Count -eq 1) {'
         '        $capturedUninstallKey = [string]$selectedApplications[0].PSChildName'
         '        $capturedUninstallName = [string]$selectedApplications[0].DisplayName'
+        '        $capturedUninstallPublisher = [string]$selectedApplications[0].Publisher'
         '        Write-ADTLogEntry -Message "Captured vendor uninstall entry [$capturedUninstallName] ($capturedUninstallKey)." -Source ''Install-ADTDeployment'''
         '    } elseif ($multiProductInstallationVerified) {'
         '        Write-ADTLogEntry -Message "Verified reviewed multi-product installation from $($reviewedMultiProductMatches.Count) matching vendor registrations." -Source ''Install-ADTDeployment'''
         '    } else {'
+        '        $diagnosticApplications = if ($selectedApplications.Count -gt 0) {'
+        '            @($selectedApplications | Select-Object -First 20)'
+        '        } else {'
+        '            @($changedApplications | Select-Object -First 20)'
+        '        }'
+        '        foreach ($ambiguousApplication in $diagnosticApplications) {'
+        '            $ambiguousSystemComponent = if ($ambiguousApplication.PSObject.Properties[''SystemComponent'']) { [bool]$ambiguousApplication.SystemComponent } else { $false }'
+        '            $ambiguousUninstallLeaf = if (-not [string]::IsNullOrWhiteSpace([string]$ambiguousApplication.QuietUninstallStringFilePath)) {'
+        '                Split-Path -Leaf ([string]$ambiguousApplication.QuietUninstallStringFilePath)'
+        '            } else { Split-Path -Leaf ([string]$ambiguousApplication.UninstallStringFilePath) }'
+        '            Write-ADTLogEntry -Message "Ambiguous vendor uninstall candidate: name=[$($ambiguousApplication.DisplayName)]; publisher=[$($ambiguousApplication.Publisher)]; version=[$($ambiguousApplication.DisplayVersion)]; key=[$($ambiguousApplication.PSChildName)]; windowsInstaller=[$([bool]$ambiguousApplication.WindowsInstaller)]; systemComponent=[$ambiguousSystemComponent]; uninstallLeaf=[$ambiguousUninstallLeaf]." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+        '        }'
+        '        if ($changedApplications.Count -gt $diagnosticApplications.Count) {'
+        '            Write-ADTLogEntry -Message "ARP delta diagnostics truncated after $($diagnosticApplications.Count) of $($changedApplications.Count) changed entries." -Severity ''Warning'' -Source ''Install-ADTDeployment'''
+        '        }'
         '        throw "Could not select one vendor uninstall entry. The installer changed $($changedApplications.Count) entries and $($selectedApplications.Count) matched the configured identity."'
         '    }'
         ''
@@ -2131,8 +3371,26 @@ if ($useRegistryUninstall) {
 
 if ($verifyInstall) {
     Write-Host "Post-install verification enabled"
-    if ($useRegistryUninstall) {
-        if ($reviewedMultiProductInstallDisplayNamePrefixes.Count -gt 0) {
+    if ($reviewedAppxInstallEvidenceConfigured) {
+        $lines += @(
+            ''
+            '    ## Recheck the exact adapter-reviewed shared Appx framework evidence.'
+            '    if (-not (Test-IntuneGetReviewedAppxInstallEvidence)) {'
+            '        throw "Post-install verification failed: the reviewed shared Appx framework was not found."'
+            '    }'
+            "    Write-ADTLogEntry -Message 'Post-install verification passed for reviewed shared Appx framework evidence' -Source 'Install-ADTDeployment'"
+        )
+    } elseif ($useRegistryUninstall) {
+        if ($reviewedRegistryInstallEvidenceConfigured) {
+            $lines += @(
+                ''
+                '    ## Recheck the exact adapter-reviewed Windows runtime evidence.'
+                '    if (-not (Test-IntuneGetReviewedRegistryInstallEvidence)) {'
+                '        throw "Post-install verification failed: the reviewed Windows runtime registry evidence was not found."'
+                '    }'
+                "    Write-ADTLogEntry -Message 'Post-install verification passed for reviewed Windows runtime registry evidence' -Source 'Install-ADTDeployment'"
+            )
+        } elseif ($reviewedMultiProductInstallDisplayNamePrefixes.Count -gt 0) {
             $lines += @(
                 ''
                 '    ## Verify the reviewed multi-product bundle evidence established above.'
@@ -2191,11 +3449,13 @@ $machineUninstallMarkerLines = @()
 if ($useRegistryUninstall) {
     $userUninstallMarkerLines = @(
         '            if ($capturedUninstallKey) { Set-ADTRegistryKey -LiteralPath ''HKCU\' + $registryMarkerPathEscaped + '\' + $sanitizedWingetId + ''' -Name ''UninstallRegistryKey'' -Value $capturedUninstallKey -Type String -SID $_.SID }',
-        '            if ($capturedUninstallName) { Set-ADTRegistryKey -LiteralPath ''HKCU\' + $registryMarkerPathEscaped + '\' + $sanitizedWingetId + ''' -Name ''UninstallDisplayName'' -Value $capturedUninstallName -Type String -SID $_.SID }'
+        '            if ($capturedUninstallName) { Set-ADTRegistryKey -LiteralPath ''HKCU\' + $registryMarkerPathEscaped + '\' + $sanitizedWingetId + ''' -Name ''UninstallDisplayName'' -Value $capturedUninstallName -Type String -SID $_.SID }',
+        '            if ($capturedUninstallPublisher) { Set-ADTRegistryKey -LiteralPath ''HKCU\' + $registryMarkerPathEscaped + '\' + $sanitizedWingetId + ''' -Name ''UninstallPublisher'' -Value $capturedUninstallPublisher -Type String -SID $_.SID }'
     )
     $machineUninstallMarkerLines = @(
         '        if ($capturedUninstallKey) { Set-ADTRegistryKey -LiteralPath $regPath -Name ''UninstallRegistryKey'' -Value $capturedUninstallKey -Type String }',
-        '        if ($capturedUninstallName) { Set-ADTRegistryKey -LiteralPath $regPath -Name ''UninstallDisplayName'' -Value $capturedUninstallName -Type String }'
+        '        if ($capturedUninstallName) { Set-ADTRegistryKey -LiteralPath $regPath -Name ''UninstallDisplayName'' -Value $capturedUninstallName -Type String }',
+        '        if ($capturedUninstallPublisher) { Set-ADTRegistryKey -LiteralPath $regPath -Name ''UninstallPublisher'' -Value $capturedUninstallPublisher -Type String }'
     )
 }
 if ($IsUserScope) {
@@ -2269,11 +3529,123 @@ if ($preUninstallPromptCalls) {
     $lines += $preUninstallPromptCalls
 }
 
+if ($reviewedUninstallServiceNames.Count -gt 0) {
+    $lines += @(
+        ''
+        '    ## Stop vendor services required by the reviewed uninstall contract'
+        "    foreach (`$reviewedServiceName in @($reviewedUninstallServiceNamesLiteral)) {"
+        '        $reviewedService = Get-Service -Name $reviewedServiceName -ErrorAction SilentlyContinue'
+        '        if ($null -ne $reviewedService -and $reviewedService.Status -ne ''Stopped'') {'
+        '            Write-ADTLogEntry -Message "Stopping reviewed vendor service [$reviewedServiceName] before uninstall." -Source ''Uninstall-ADTDeployment'''
+        '            Stop-Service -Name $reviewedServiceName -Force -ErrorAction Stop'
+        '            $reviewedService.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))'
+        '        }'
+        '    }'
+    )
+}
+
 # Generate uninstall command. A reviewed shared-runtime adapter takes
 # precedence because executing the vendor command could remove a prerequisite
 # used by Windows or unrelated applications. The ordinary marker cleanup below
 # still makes Intune's exact package detection transition to not installed.
-if ($preserveVendorInstallationOnUninstall) {
+$reviewedExactUninstallOverrideLines = @(
+    '    $useReviewedExactUninstall = $false'
+)
+if ($reviewedExactUninstallConfigured) {
+    $reviewedExactUninstallOverrideLines += @(
+        '    $useReviewedExactUninstall = $true'
+        $(if ($reviewedExactUninstallExecutable -eq '%PackageInstaller%') {
+            "    `$registeredUninstallFile = Join-Path `$adtSession.DirFiles '$installerFileNameSingleQuoteEscaped'"
+        } else {
+            "    `$registeredUninstallFile = [Environment]::ExpandEnvironmentVariables('$reviewedExactUninstallExecutableEscaped')"
+        })
+        "    [string[]]`$registeredUninstallArguments = @($reviewedExactUninstallArgumentsLiteral) | ForEach-Object { [Environment]::ExpandEnvironmentVariables(`$_) }"
+        '    $hasQuietUninstall = $true'
+        '    $isVivaldiUninstall = $false'
+        '    $isAdobeCreativeCloudUninstall = $false'
+        '    Write-ADTLogEntry -Message "Using the reviewed exact vendor uninstall command [$registeredUninstallFile]." -Source ''Uninstall-ADTDeployment'''
+    )
+} elseif ($reviewedArchiveUninstallConfigured) {
+    $reviewedExactUninstallOverrideLines += @(
+        '    $useReviewedExactUninstall = $true'
+        '    $reviewedArchiveUninstallScript = Join-Path $adtSession.DirSupportFiles ''Invoke-IntuneGetReviewedArchiveUninstall.ps1'''
+        "    `$reviewedArchivePath = Join-Path `$adtSession.DirFiles '$installerFileNameSingleQuoteEscaped'"
+        '    if (-not (Test-Path -LiteralPath $reviewedArchiveUninstallScript -PathType Leaf)) {'
+        '        throw "The reviewed archive uninstall helper was not found: $reviewedArchiveUninstallScript"'
+        '    }'
+        '    if (-not (Test-Path -LiteralPath $reviewedArchivePath -PathType Leaf)) {'
+        '        throw "The retained vendor archive was not found: $reviewedArchivePath"'
+        '    }'
+        '    $registeredUninstallFile = Join-Path $env:SystemRoot ''System32\WindowsPowerShell\v1.0\powershell.exe'''
+        '    [string[]]$registeredUninstallArguments = @(''-NoLogo'', ''-NoProfile'', ''-NonInteractive'', ''-ExecutionPolicy'', ''Bypass'', ''-File'', $reviewedArchiveUninstallScript, ''-ArchivePath'', $reviewedArchivePath)'
+        '    $hasQuietUninstall = $true'
+        '    $isVivaldiUninstall = $false'
+        '    $isAdobeCreativeCloudUninstall = $false'
+        '    Write-ADTLogEntry -Message "Using the reviewed packaged archive uninstall command [$reviewedArchiveUninstallScript]." -Source ''Uninstall-ADTDeployment'''
+    )
+}
+$reviewedUninstallWindowAutomationLines = @(
+    '        $uninstallHandle = Start-ADTProcess @uninstallProcessParameters'
+)
+if ($reviewedUninstallWindowAutomationConfigured) {
+    $reviewedUninstallWindowAutomationLines = @(
+        '        $uninstallInvocationStartedAt = [DateTime]::UtcNow.AddSeconds(-2)'
+        '        $uninstallHandle = Start-ADTProcess @uninstallProcessParameters'
+        '        $windowAutomationScript = Join-Path $adtSession.DirSupportFiles ''Invoke-IntuneGetReviewedUninstallWindowAutomation.ps1'''
+        '        if (-not (Test-Path -LiteralPath $windowAutomationScript -PathType Leaf)) {'
+        '            throw "The reviewed uninstall window-automation helper was not found: $windowAutomationScript"'
+        '        }'
+        '        Write-ADTLogEntry -Message "Starting reviewed window automation for the exact vendor uninstaller." -Source ''Uninstall-ADTDeployment'''
+        '        $windowAutomationEvents = @(& $windowAutomationScript -ExpectedProcessPath $registeredUninstallFile -MinimumStartTimeUtc $uninstallInvocationStartedAt)'
+        '        foreach ($windowAutomationEvent in $windowAutomationEvents) {'
+        '            Write-ADTLogEntry -Message $windowAutomationEvent -Severity ''Success'' -Source ''Uninstall-ADTDeployment'''
+        '        }'
+    )
+}
+if ($useManagedDirectoryLifecycle) {
+    Write-Host 'Using reviewed managed-directory removal'
+    $lines += @('', "    `$managedInstallDirectory = [Environment]::ExpandEnvironmentVariables('$reviewedManagedInstallDirectoryEscaped')")
+    if ($hasManagedInstallCompletionContract) {
+        $lines += @(
+            "    `$managedInstallEvidenceFile = [Environment]::ExpandEnvironmentVariables('$reviewedManagedInstallEvidenceFileEscaped')"
+            '    $managedUninstallCompletionTarget = $managedInstallEvidenceFile'
+        )
+    } else {
+        $lines += '    $managedUninstallCompletionTarget = $managedInstallDirectory'
+    }
+    if ($reviewedManagedUninstallConfigured) {
+        $lines += @(
+            "    `$managedUninstallExecutable = [Environment]::ExpandEnvironmentVariables('$reviewedManagedUninstallExecutableEscaped')"
+            "    `$managedUninstallArguments = @($reviewedManagedUninstallArgumentsLiteral) | ForEach-Object { [Environment]::ExpandEnvironmentVariables(`$_) }"
+            '    if (-not (Test-Path -LiteralPath $managedUninstallExecutable -PathType Leaf)) {'
+            '        throw "The reviewed managed uninstaller was not found: $managedUninstallExecutable"'
+            '    }'
+            '    if (Test-Path -LiteralPath $managedInstallDirectory) {'
+            '        Write-ADTLogEntry -Message "Starting reviewed managed uninstaller [$managedUninstallExecutable]." -Source ''Uninstall-ADTDeployment'''
+            '        $null = Start-ADTProcess -FilePath $managedUninstallExecutable -ArgumentList $managedUninstallArguments -WindowStyle Hidden -NoWait -PassThru'
+            "        `$managedUninstallDeadline = [DateTime]::UtcNow.AddMinutes($reviewedManagedUninstallTimeoutMinutes)"
+            '        while ((Test-Path -LiteralPath $managedUninstallCompletionTarget) -and [DateTime]::UtcNow -lt $managedUninstallDeadline) {'
+            '            Start-Sleep -Seconds 5'
+            '        }'
+            '        if (Test-Path -LiteralPath $managedUninstallCompletionTarget) {'
+            '            throw "The reviewed managed uninstaller did not remove [$managedUninstallCompletionTarget] before the completion deadline."'
+            '        }'
+            '        Write-ADTLogEntry -Message "Reviewed managed uninstall completed for [$managedUninstallCompletionTarget]." -Severity ''Success'' -Source ''Uninstall-ADTDeployment'''
+            '    } else {'
+            '        Write-ADTLogEntry -Message "Managed installation was already absent: $managedInstallDirectory" -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '    }'
+        )
+    } else {
+        $lines += @(
+            '    if (Test-Path -LiteralPath $managedInstallDirectory) {'
+            '        Remove-Item -LiteralPath $managedInstallDirectory -Recurse -Force -ErrorAction Stop'
+            '        Write-ADTLogEntry -Message "Removed managed extracted payload from [$managedInstallDirectory]." -Severity ''Success'' -Source ''Uninstall-ADTDeployment'''
+            '    } else {'
+            '        Write-ADTLogEntry -Message "Managed extracted payload was already absent: $managedInstallDirectory" -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '    }'
+        )
+    }
+} elseif ($preserveVendorInstallationOnUninstall) {
     Write-Host 'Preserving the shared vendor installation during package removal'
     $lines += @(
         ''
@@ -2303,8 +3675,14 @@ if ($preserveVendorInstallationOnUninstall) {
         "    `$appName = '$registryUninstallDisplayNameEscaped'"
         "    `$configuredProductCode = '$registryUninstallProductCode'"
         "    `$markerProviderPath = '$markerProviderPath'"
+        '    $configuredVersion = [string]$adtSession.AppVersion'
+        '    $configuredVersionedAppName = if (-not [string]::IsNullOrWhiteSpace($configuredVersion)) { "$appName $configuredVersion" } else { $null }'
         ''
-        '    $capturedUninstallKey = (Get-ItemProperty -LiteralPath $markerProviderPath -ErrorAction SilentlyContinue).UninstallRegistryKey'
+        '    $markerValues = Get-ItemProperty -LiteralPath $markerProviderPath -ErrorAction SilentlyContinue'
+        '    $capturedUninstallKey = [string]$markerValues.UninstallRegistryKey'
+        '    $capturedUninstallName = [string]$markerValues.UninstallDisplayName'
+        '    $capturedUninstallPublisher = [string]$markerValues.UninstallPublisher'
+        "    `$expectedUninstallPublisher = '$publisherSingleQuoteEscaped'"
         '    $installedApps = if ($capturedUninstallKey) {'
         '        Write-ADTLogEntry -Message "Searching for captured vendor uninstall entry: $capturedUninstallKey" -Source ''Uninstall-ADTDeployment'''
         '        @(Get-ADTApplication -FilterScript { $_.PSChildName -eq $capturedUninstallKey })'
@@ -2314,6 +3692,13 @@ if ($preserveVendorInstallationOnUninstall) {
         '    } else {'
         '        Write-ADTLogEntry -Message "No captured uninstall entry; searching by exact configured application name: $appName" -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
         '        @(Get-ADTApplication -Name $appName -NameMatch ''Exact'')'
+        '    }'
+        ''
+        '    if ($installedApps.Count -eq 0 -and -not $capturedUninstallKey -and -not $configuredProductCode -and $configuredVersionedAppName) {'
+        '        $versionedMatches = @(Get-ADTApplication -Name $configuredVersionedAppName -NameMatch ''Exact'' | Where-Object {'
+        '            [string]$_.DisplayVersion -eq $configuredVersion'
+        '        })'
+        '        if ($versionedMatches.Count -eq 1) { $installedApps = $versionedMatches }'
         '    }'
         ''
         "    `$allowContainsFallback = '$registeredInstallerTypeLower' -notin @('msi', 'wix')"
@@ -2330,26 +3715,117 @@ if ($preserveVendorInstallationOnUninstall) {
         '            $installedApps = $containsMatches'
         '        }'
         '    }'
+    )
+    if ($reviewedRecoverCapturedUninstallByExactIdentity) {
+        $lines += @(
+            '    $recoveryUninstallPublisher = if (-not [string]::IsNullOrWhiteSpace($capturedUninstallPublisher)) { $capturedUninstallPublisher } else { $expectedUninstallPublisher }'
+            '    if ($installedApps.Count -eq 0 -and $capturedUninstallKey -and $capturedUninstallName -and $recoveryUninstallPublisher) {'
+            '        # This reviewed vendor replaces its ARP key after install. Recover only the exact observed'
+            '        # name and observed publisher, require one visible non-MSI entry, and otherwise fail closed.'
+            '        $capturedIdentityMatches = @(Get-ADTApplication -Name $capturedUninstallName -NameMatch ''Exact'' | Where-Object {'
+            '            $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
+            '            $isVisibleApplication = -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
+            '            $isVisibleApplication -and'
+            '                -not $_.WindowsInstaller -and'
+            '                [string]::Equals([string]$_.DisplayName, $capturedUninstallName, [System.StringComparison]::OrdinalIgnoreCase) -and'
+            '                [string]::Equals([string]$_.Publisher, $recoveryUninstallPublisher, [System.StringComparison]::OrdinalIgnoreCase)'
+            '        })'
+            '        if ($capturedIdentityMatches.Count -eq 1) {'
+            '            $installedApps = $capturedIdentityMatches'
+            '            Write-ADTLogEntry -Message "Recovered replaced vendor uninstall entry [$($installedApps[0].PSChildName)] from captured key [$capturedUninstallKey] using exact observed name and publisher identity." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '        } elseif ($capturedIdentityMatches.Count -gt 0) {'
+            '            Write-ADTLogEntry -Message "Found $($capturedIdentityMatches.Count) exact captured-name and publisher matches; refusing ambiguous recovery." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '        }'
+            '    }'
+            ''
+        )
+    }
+    if ($registeredInstallerTypeLower -in @('burn', 'exe')) {
+        $lines += @(
+            '    if ($installedApps.Count -gt 1) {'
+            '        # Recover a missing marker only when one exact, visible top-level wrapper is distinguishable'
+            '        # from chained MSI registrations with the same display name. Multiple wrappers remain fail-closed.'
+            '        $topLevelWrapperMatches = @($installedApps | Where-Object {'
+            '            $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
+            '            $isVisibleApplication = -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
+            '            $isVisibleApplication -and -not $_.WindowsInstaller'
+            '        })'
+            '        if ($topLevelWrapperMatches.Count -eq 1) { $installedApps = $topLevelWrapperMatches }'
+            '    }'
+        )
+    }
+    if ($reviewedPreferVisiblePrimaryUninstallRegistration) {
+        $lines += @(
+            '    if ($installedApps.Count -gt 1) {'
+            '        # Apply the reviewed primary-registration rule only to the exact/captured identity set.'
+            '        # Never widen the search, and retain fail-closed behavior unless one visible entry remains.'
+            '        $visiblePrimaryMatches = @($installedApps | Where-Object {'
+            '            $systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']'
+            '            -not $systemComponentProperty -or -not [bool]$systemComponentProperty.Value'
+            '        })'
+            '        if ($visiblePrimaryMatches.Count -eq 1) { $installedApps = $visiblePrimaryMatches }'
+            '    }'
+        )
+    }
+    $lines += @(
         '    if ($installedApps.Count -ne 1) {'
+        '        foreach ($ambiguousApplication in @($installedApps)) {'
+        '            $ambiguousSystemComponent = if ($ambiguousApplication.PSObject.Properties[''SystemComponent'']) { [bool]$ambiguousApplication.SystemComponent } else { $false }'
+        '            $ambiguousUninstallLeaf = if (-not [string]::IsNullOrWhiteSpace([string]$ambiguousApplication.QuietUninstallStringFilePath)) {'
+        '                Split-Path -Leaf ([string]$ambiguousApplication.QuietUninstallStringFilePath)'
+        '            } else { Split-Path -Leaf ([string]$ambiguousApplication.UninstallStringFilePath) }'
+        '            Write-ADTLogEntry -Message "Ambiguous vendor uninstall candidate: name=[$($ambiguousApplication.DisplayName)]; publisher=[$($ambiguousApplication.Publisher)]; version=[$($ambiguousApplication.DisplayVersion)]; key=[$($ambiguousApplication.PSChildName)]; windowsInstaller=[$([bool]$ambiguousApplication.WindowsInstaller)]; systemComponent=[$ambiguousSystemComponent]; uninstallLeaf=[$ambiguousUninstallLeaf]." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+        '        }'
         '        throw "Could not find one unambiguous vendor uninstall registry entry for [$appName]. Found $($installedApps.Count); refusing broad removal."'
         '    }'
         '    Write-ADTLogEntry -Message "Found exact vendor registry entry [$($installedApps[0].DisplayName)], uninstalling..." -Source ''Uninstall-ADTDeployment'''
     )
-    if ($originalInstallerType -eq 'burn') {
+    if ($registeredInstallerTypeLower -eq 'burn') {
         $lines += @(
             '    # Prefer an exact registered vendor removal helper while it exists. Retain the hash-verified'
             '    # packaged bundle as a durable fallback for disposable per-account Package Cache entries.'
             '    $registeredApplication = $installedApps[0]'
+            '    $registeredUninstallRegistryKey = [string]$registeredApplication.PSChildName'
             '    $registeredUninstallProperty = if (-not [string]::IsNullOrWhiteSpace($registeredApplication.QuietUninstallStringFilePath)) {'
             '        ''QuietUninstallString'''
             '    } elseif (-not [string]::IsNullOrWhiteSpace($registeredApplication.UninstallStringFilePath)) {'
             '        ''UninstallString'''
             '    } else {'
+            '        $null'
+            '    }'
+            '    $registeredUninstallFile = if ($registeredUninstallProperty) { [string]$registeredApplication."$($registeredUninstallProperty)FilePath" } else { '''' }'
+            '    $registeredUninstallLeaf = Split-Path -Leaf $registeredUninstallFile'
+            '    $capturedMsiProductCode = if ($registeredApplication.WindowsInstaller -and $registeredApplication.ProductCode) {'
+            '        $registeredApplication.ProductCode'
+            '    } elseif ($registeredApplication.WindowsInstaller -and [string]$registeredApplication.PSChildName -match ''^\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}$'') {'
+            '        [string]$registeredApplication.PSChildName'
+            '    } elseif ($registeredUninstallLeaf -in @(''msiexec'', ''msiexec.exe'') -and [string]$registeredApplication.PSChildName -match ''^\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}$'') {'
+            '        # Older chained MSI registrations can omit the WindowsInstaller value.'
+            '        # The exact GUID key plus an MsiExec command is still an authoritative MSI identity.'
+            '        [string]$registeredApplication.PSChildName'
+            '    } else {'
+            '        $null'
+            '    }'
+            '    if ($capturedMsiProductCode) {'
+            '        # Some manifests label an EXE bootstrapper as Burn even though the captured vendor'
+            '        # registration is an exact Windows Installer product. Prefer that MSI identity instead'
+            '        # of appending Burn switches to MsiExec, which would produce invalid arguments.'
+            '        Write-ADTLogEntry -Message "The Burn-labeled package registered Windows Installer product [$capturedMsiProductCode]; executing its exact MSI uninstall." -Source ''Uninstall-ADTDeployment'''
+            $reviewedUninstallProcessGuardMsiLines
+            '    } else {'
+            '    if (-not $registeredUninstallProperty) {'
             '        throw "The captured Burn bundle does not provide an uninstall command."'
             '    }'
             '    [string[]]$registeredUninstallArguments = @($registeredApplication."$($registeredUninstallProperty)ArgumentList" | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })'
-            '    if ($registeredUninstallArguments.Count -eq 0) {'
-            '        $registeredUninstallArguments = @(''/uninstall'', ''/quiet'', ''/norestart'')'
+            '    # Registered Burn commands are not consistently complete. Always normalize the standard'
+            '    # unattended removal contract so a vendor helper cannot prompt or restart an Intune device.'
+            '    foreach ($requiredBurnArgument in @(''/uninstall'', ''/quiet'', ''/norestart'')) {'
+            '        $normalizedRequiredBurnArgument = $requiredBurnArgument -replace ''^[/-]+'', '''''
+            '        if (@($registeredUninstallArguments | Where-Object {'
+            '            (([string]$_) -replace ''^[/-]+'', '''') -ieq $normalizedRequiredBurnArgument'
+            '        }).Count -eq 0) {'
+            '            $registeredUninstallArguments += $requiredBurnArgument'
+            '        }'
             '    }'
             "    `$reviewedUninstallArguments = @($reviewedUninstallArgumentsLiteral)"
             '    foreach ($reviewedArgument in $reviewedUninstallArguments) {'
@@ -2361,7 +3837,6 @@ if ($preserveVendorInstallationOnUninstall) {
             '    if (-not (Test-Path -LiteralPath $bundledUninstaller -PathType Leaf)) {'
             '        throw "The packaged Burn uninstaller was not found: $bundledUninstaller"'
             '    }'
-            '    $registeredUninstallFile = [string]$registeredApplication."$($registeredUninstallProperty)FilePath"'
             '    if (-not [string]::IsNullOrWhiteSpace($registeredUninstallFile) -and (Test-Path -LiteralPath $registeredUninstallFile -PathType Leaf)) {'
             '        $burnUninstaller = $registeredUninstallFile'
             '        $burnUninstallWorkingDirectory = Split-Path -Parent $registeredUninstallFile'
@@ -2374,7 +3849,6 @@ if ($preserveVendorInstallationOnUninstall) {
             '        $burnUninstallWorkingDirectory = $adtSession.DirFiles'
             '        Write-ADTLogEntry -Message "The registered Burn uninstaller is unavailable; using the hash-verified packaged bundle." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
             '    }'
-            '    $registeredUninstallRegistryKey = [string]$registeredApplication.PSChildName'
             "    `$uninstallDeadline = [DateTime]::UtcNow.AddMinutes($uninstallCompletionTimeoutMinutes)"
             '    $uninstallHandle = Start-ADTProcess -FilePath $burnUninstaller -ArgumentList $registeredUninstallArguments -WorkingDirectory $burnUninstallWorkingDirectory -WindowStyle Hidden -WaitForMsiExec -NoWait -PassThru'
             '    $uninstallProcessExitLogged = $false'
@@ -2409,14 +3883,17 @@ if ($preserveVendorInstallationOnUninstall) {
             '    } elseif ($null -ne $uninstallProcessExitCode -and $uninstallProcessExitCode -notin @(0, 1605, 1614)) {'
             '        Write-ADTLogEntry -Message "The Burn uninstall parent process exited with code [$uninstallProcessExitCode]; exact removal verification remains authoritative." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
             '    }'
+            '    }'
             '    $remainingApplications = @()'
             '    foreach ($verificationAttempt in 1..5) {'
             '        $remainingApplications = @(Get-ADTApplication -FilterScript { $_.PSChildName -eq $registeredUninstallRegistryKey })'
             '        if ($remainingApplications.Count -eq 0) { break }'
             '        if ($verificationAttempt -lt 5) { Start-Sleep -Seconds 2 }'
             '    }'
-            '    if ($remainingApplications.Count -gt 0) {'
-            '        throw "The Burn uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."'
+            '    if ($remainingApplications.Count -gt 0 -and $uninstallProcessExitCode -in @(1641, 3010)) {'
+            '        Write-ADTLogEntry -Message "The Burn uninstaller returned reboot-required exit code [$uninstallProcessExitCode]; the exact registration remains pending reboot." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '    } elseif ($remainingApplications.Count -gt 0) {'
+            '        throw "The captured Burn/MSI uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."'
             '    }'
         )
     } else {
@@ -2431,19 +3908,77 @@ if ($preserveVendorInstallationOnUninstall) {
             '    } else {'
             '        $null'
             '    }'
+            '    if ($capturedMsiProductCode) {'
+            '        # An exact MSI identity is sufficient for Start-ADTMsiProcess. Do not inspect the'
+            '        # registered EXE command: Windows Installer entries can legitimately expose an empty'
+            '        # parsed UninstallStringFilePath even though their ProductCode is authoritative.'
+            '        Write-ADTLogEntry -Message "Executing MSI uninstall with captured product code [$capturedMsiProductCode]." -Source ''Uninstall-ADTDeployment'''
+            $reviewedUninstallProcessGuardMsiLines
+            '    } else {'
             '    [string[]]$additionalUninstallArguments = @()'
             '    $isVivaldiUninstall = $false'
+            '    $isInstall4jUninstall = $false'
+            '    $isCutePdfWriterUninstall = $false'
+            '    $isAutodeskOdisUninstall = $false'
             '    $hasQuietUninstall = -not [string]::IsNullOrWhiteSpace($registeredApplication.QuietUninstallStringFilePath)'
             '    $registeredUninstallProperty = if ($hasQuietUninstall) { ''QuietUninstallString'' } else { ''UninstallString'' }'
             '    $registeredUninstallFile = [string]$registeredApplication."$($registeredUninstallProperty)FilePath"'
             '    $isAdobeCreativeCloudUninstall = (Split-Path -Leaf $registeredUninstallFile) -ieq ''Creative Cloud Uninstaller.exe'''
             '    [string[]]$registeredUninstallArguments = @($registeredApplication."$($registeredUninstallProperty)ArgumentList" | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })'
+            $reviewedExactUninstallOverrideLines
             '    $registeredArgumentText = ($registeredUninstallArguments -join '' '').Trim()'
             '    if (-not $hasQuietUninstall) {'
             ''
             '        # PSADT correctly prefers QuietUninstallString. Some vendors only publish an interactive'
             '        # UninstallString, so add narrowly verified unattended arguments for known signatures.'
-            '        if ((Split-Path -Leaf $registeredUninstallFile) -ieq ''setup.exe'' -and'
+            '        $registeredUninstallLeaf = Split-Path -Leaf $registeredUninstallFile'
+            '        $registeredUninstallParentPath = Split-Path -Parent $registeredUninstallFile'
+            '        $registeredUninstallParentLeaf = if ([string]::IsNullOrWhiteSpace($registeredUninstallParentPath)) {'
+            "            ''"
+            '        } else {'
+            '            Split-Path -Leaf $registeredUninstallParentPath'
+            '        }'
+            '        $autodeskOdisInstaller = [Environment]::ExpandEnvironmentVariables(''%ProgramW6432%\Autodesk\AdODIS\V1\Installer.exe'')'
+            '        $isAutodeskOdisUninstall = ('
+            '            $registeredUninstallFile -ieq $autodeskOdisInstaller -and'
+            '            $registeredArgumentText -match ''(?i)(^|\s)-i\s+uninstall(\s|$)'' -and'
+            '            $registeredArgumentText -match ''(?i)(^|\s)--trigger_point\s+system(\s|$)'' -and'
+            '            $registeredArgumentText -match ''(?i)(^|\s)-m(\s|$)'' -and'
+            '            $registeredArgumentText -match ''(?i)(^|\s)-x(\s|$)'''
+            '        )'
+            '        $isCutePdfWriterUninstall = ('
+            '            $registeredUninstallRegistryKey -ieq ''CutePDF Writer Installation'' -and'
+            '            $registeredUninstallLeaf -in @(''unInstcpw.exe'', ''unInstcpw64.exe'') -and'
+            '            $registeredArgumentText -match ''(?i)(^|\s)/uninstall(\s|$)'''
+            '        )'
+            "        `$installerUsesInstall4j = '$silentSwitchesEscaped' -match '(?i)(^|\s)-Dinstall4j\.'"
+            '        $isInstall4jUninstall = ('
+            '            $registeredUninstallLeaf -in @(''uninstaller.exe'', ''uninstall.exe'') -and'
+            '            ($registeredUninstallParentLeaf -ieq ''.install4j'' -or $installerUsesInstall4j)'
+            '        )'
+            '        if ($isCutePdfWriterUninstall) {'
+            '            # CutePDF uses a vendor-specific uninstaller even though its installer is Inno-based.'
+            '            # Its documented silent removal contract is /uninstall /s; Inno flags cause a prompt.'
+            '            $registeredUninstallArguments = @(''/uninstall'', ''/s'')'
+            '            $registeredArgumentText = ($registeredUninstallArguments -join '' '').Trim()'
+            '            Write-ADTLogEntry -Message "Using the verified CutePDF Writer silent uninstall command." -Source ''Uninstall-ADTDeployment'''
+            '        } elseif ($isAutodeskOdisUninstall) {'
+            '            # Autodesk documents -q for unattended ODIS removal. Access and other ODIS'
+            '            # packages register the exact manifest command without that quiet switch.'
+            '            if ($registeredArgumentText -notmatch ''(?i)(^|\s)(-q|--silent)(\s|$)'') {'
+            '                $additionalUninstallArguments += ''-q'''
+            '            }'
+            '            Write-ADTLogEntry -Message "Using the verified Autodesk ODIS silent uninstall switch." -Source ''Uninstall-ADTDeployment'''
+            '        } elseif ($isInstall4jUninstall) {'
+            '            # install4j uses -q for unattended installers and uninstallers. Require a canonical'
+            '            # uninstall executable plus either its .install4j parent or a manifest install4j'
+            '            # property, so this does not broaden silent arguments to arbitrary vendor executables.'
+            '            foreach ($argument in @(''-q'', ''-Dinstall4j.suppressUnattendedReboot=true'')) {'
+            '                if ($registeredArgumentText -notmatch "(?i)(^|\s)$([regex]::Escape($argument))(\s|$)") {'
+            '                    $additionalUninstallArguments += $argument'
+            '                }'
+            '            }'
+            '        } elseif ($registeredUninstallLeaf -ieq ''setup.exe'' -and'
             '            $registeredArgumentText -match ''(?i)(^|\s)--vivaldi(\s|$)'') {'
             '            $isVivaldiUninstall = $true'
             '        } elseif ((Split-Path -Leaf $registeredUninstallFile) -ine ''msiexec.exe'' -and'
@@ -2455,7 +3990,7 @@ if ($preserveVendorInstallationOnUninstall) {
             '        # For an explicit vendor uninstall command, only reuse manifest switches that are'
             '        # independently safe for removal. Never forward install-only values such as Adobe''s'
             '        # --mode=stub to an uninstaller.'
-            '        if ((Split-Path -Leaf $registeredUninstallFile) -ine ''msiexec.exe'' -and'
+            '        if (-not $isCutePdfWriterUninstall -and (Split-Path -Leaf $registeredUninstallFile) -ine ''msiexec.exe'' -and'
             '            $registeredArgumentText -match ''(?i)(^|\s)(/uninstall|-uninstall|--uninstall|/x)(\s|$|\{)'') {'
             "            `$safeManifestUninstallArguments = @('$silentSwitchesEscaped' -split '\s+' | Where-Object { `$_ -match '^(?i:/q[nbrfu]?|/quiet|/silent|/verysilent|/norestart|/s|--quiet|--silent)$' })"
             '            foreach ($argument in $safeManifestUninstallArguments) {'
@@ -2465,7 +4000,7 @@ if ($preserveVendorInstallationOnUninstall) {
             '            }'
             '        }'
             '    }'
-            '    if (-not $isVivaldiUninstall -and (Split-Path -Leaf $registeredUninstallFile) -ine ''msiexec.exe'' -and $registeredInstallerType -eq ''inno'') {'
+            '    if (-not $useReviewedExactUninstall -and -not $isVivaldiUninstall -and -not $isCutePdfWriterUninstall -and (Split-Path -Leaf $registeredUninstallFile) -ine ''msiexec.exe'' -and $registeredInstallerType -eq ''inno'') {'
             '        # Inno''s registered QuietUninstallString is not consistently fully unattended.'
             '        # Normalize weak /SILENT registrations to the vendor-documented, message-box-free'
             '        # switches so SYSTEM deployments cannot wait behind an invisible prompt.'
@@ -2478,10 +4013,6 @@ if ($preserveVendorInstallationOnUninstall) {
             '        }'
             '    }'
             ''
-            '    if ($capturedMsiProductCode) {'
-            '        Write-ADTLogEntry -Message "Executing MSI uninstall with captured product code [$capturedMsiProductCode]." -Source ''Uninstall-ADTDeployment'''
-            $reviewedUninstallProcessGuardMsiLines
-            '    } else {'
             '        # Vendor uninstallers can keep their bootstrapper open after removal or return before a'
             '        # child finishes. Launch the exact quiet/fallback command asynchronously and use the'
             '        # captured registry identity as the authoritative completion signal for every EXE path.'
@@ -2498,13 +4029,16 @@ if ($preserveVendorInstallationOnUninstall) {
             '            Write-ADTLogEntry -Message "Executing the Adobe Creative Cloud desktop client silent uninstall command." -Source ''Uninstall-ADTDeployment'''
             '        }'
             "        `$reviewedUninstallArguments = @($reviewedUninstallArgumentsLiteral)"
-            '        foreach ($reviewedArgument in $reviewedUninstallArguments) {'
-            '            if (@($registeredUninstallArguments | Where-Object { [string]$_ -ieq $reviewedArgument }).Count -eq 0) {'
-            '                $registeredUninstallArguments += $reviewedArgument'
+            '        if (-not $useReviewedExactUninstall) {'
+            '            foreach ($reviewedArgument in $reviewedUninstallArguments) {'
+            '                if (@($registeredUninstallArguments | Where-Object { [string]$_ -ieq $reviewedArgument }).Count -eq 0) {'
+            '                    $registeredUninstallArguments += $reviewedArgument'
+            '                }'
             '            }'
             '        }'
             '        $registeredUninstallLeaf = Split-Path -Leaf $registeredUninstallFile'
             '        $isRegisteredMsiExec = $registeredUninstallLeaf -in @(''msiexec'', ''msiexec.exe'')'
+            '        $isRegisteredPowerShellHost = $registeredUninstallLeaf -in @(''powershell'', ''powershell.exe'')'
             '        if ($isRegisteredMsiExec) {'
             '            $registeredMsiProductCode = if ($registeredUninstallRegistryKey -match ''(?i)^\{[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\}$'') {'
             '                $registeredUninstallRegistryKey'
@@ -2515,6 +4049,81 @@ if ($preserveVendorInstallationOnUninstall) {
             '            }'
             '            $registeredUninstallFile = Join-Path $env:SystemRoot ''System32\msiexec.exe'''
             '            $registeredUninstallArguments = @(''/x'', $registeredMsiProductCode, ''/qn'', ''/norestart'')'
+            '        } elseif ($isRegisteredPowerShellHost -and -not $useReviewedExactUninstall) {'
+            '            # Some vendors register an inbox PowerShell launcher instead of a literal EXE path.'
+            '            # Resolve only a single -File command whose script is an existing .ps1 below the'
+            '            # exact captured InstallLocation. Host-side switches are allowlisted so an ARP entry'
+            '            # cannot turn this compatibility path into arbitrary -Command execution.'
+            '            $powerShellFileSwitchIndexes = @('
+            '                for ($argumentIndex = 0; $argumentIndex -lt $registeredUninstallArguments.Count; $argumentIndex++) {'
+            '                    if ([string]$registeredUninstallArguments[$argumentIndex] -ieq ''-File'') { $argumentIndex }'
+            '                }'
+            '            )'
+            '            if ($powerShellFileSwitchIndexes.Count -ne 1 -or'
+            '                $powerShellFileSwitchIndexes[0] + 1 -ge $registeredUninstallArguments.Count) {'
+            '                throw "The registered PowerShell uninstall command must contain one exact -File script path."'
+            '            }'
+            '            $powerShellFileSwitchIndex = [int]$powerShellFileSwitchIndexes[0]'
+            '            for ($argumentIndex = 0; $argumentIndex -lt $powerShellFileSwitchIndex; $argumentIndex++) {'
+            '                $hostArgument = [string]$registeredUninstallArguments[$argumentIndex]'
+            '                if ($hostArgument -in @(''-NoProfile'', ''-NonInteractive'', ''-NoLogo'')) { continue }'
+            '                if ($hostArgument -ieq ''-ExecutionPolicy'') {'
+            '                    $argumentIndex++'
+            '                    if ($argumentIndex -ge $powerShellFileSwitchIndex -or'
+            '                        [string]$registeredUninstallArguments[$argumentIndex] -ine ''Bypass'') {'
+            '                        throw "The registered PowerShell uninstall command contains an unsupported execution policy."'
+            '                    }'
+            '                    continue'
+            '                }'
+            '                if ($hostArgument -ieq ''-WindowStyle'') {'
+            '                    $argumentIndex++'
+            '                    if ($argumentIndex -ge $powerShellFileSwitchIndex -or'
+            '                        [string]$registeredUninstallArguments[$argumentIndex] -ine ''Hidden'') {'
+            '                        throw "The registered PowerShell uninstall command contains an unsupported window style."'
+            '                    }'
+            '                    continue'
+            '                }'
+            '                throw "The registered PowerShell uninstall command contains an unsupported host switch: $hostArgument"'
+            '            }'
+            '            $registeredPowerShellScript = [Environment]::ExpandEnvironmentVariables('
+            '                [string]$registeredUninstallArguments[$powerShellFileSwitchIndex + 1]'
+            '            )'
+            '            $registeredInstallLocation = [Environment]::ExpandEnvironmentVariables('
+            '                [string]$registeredApplication.InstallLocation'
+            '            )'
+            '            $registeredInstallLocationUri = $null'
+            '            if ([string]::IsNullOrWhiteSpace($registeredInstallLocation) -or'
+            '                -not [Uri]::TryCreate($registeredInstallLocation, [UriKind]::Absolute, [ref]$registeredInstallLocationUri) -or'
+            '                -not $registeredInstallLocationUri.IsFile -or'
+            '                -not (Test-Path -LiteralPath $registeredInstallLocation -PathType Container)) {'
+            '                throw "The registered PowerShell uninstall command does not expose an exact install location."'
+            '            }'
+            '            $registeredPowerShellScriptUri = $null'
+            '            if ([string]::IsNullOrWhiteSpace($registeredPowerShellScript) -or'
+            '                -not [Uri]::TryCreate($registeredPowerShellScript, [UriKind]::Absolute, [ref]$registeredPowerShellScriptUri) -or'
+            '                -not $registeredPowerShellScriptUri.IsFile -or'
+            '                [IO.Path]::GetExtension($registeredPowerShellScript) -ine ''.ps1'' -or'
+            '                -not (Test-Path -LiteralPath $registeredPowerShellScript -PathType Leaf)) {'
+            '                throw "The registered PowerShell uninstall script is missing or invalid."'
+            '            }'
+            '            $registeredInstallRoot = [IO.Path]::GetFullPath($registeredInstallLocation).TrimEnd([char[]]''\/'')'
+            '            $registeredVolumeRoot = [IO.Path]::GetPathRoot($registeredInstallRoot).TrimEnd([char[]]''\/'')'
+            '            if ($registeredInstallRoot -ieq $registeredVolumeRoot) {'
+            '                throw "The registered PowerShell uninstall command exposes an unsafe volume-root install location."'
+            '            }'
+            '            $registeredPowerShellScript = [IO.Path]::GetFullPath($registeredPowerShellScript)'
+            '            if (-not $registeredPowerShellScript.StartsWith('
+            '                $registeredInstallRoot + [IO.Path]::DirectorySeparatorChar,'
+            '                [StringComparison]::OrdinalIgnoreCase'
+            '            )) {'
+            '                throw "The registered PowerShell uninstall script is outside the captured install location."'
+            '            }'
+            '            $registeredUninstallArguments[$powerShellFileSwitchIndex + 1] = $registeredPowerShellScript'
+            '            $registeredUninstallFile = Join-Path $env:SystemRoot ''System32\WindowsPowerShell\v1.0\powershell.exe'''
+            '            if (-not (Test-Path -LiteralPath $registeredUninstallFile -PathType Leaf)) {'
+            '                throw "The inbox Windows PowerShell host was not found."'
+            '            }'
+            '            Write-ADTLogEntry -Message "Resolved the registered PowerShell -File uninstaller below captured install location [$registeredInstallRoot]." -Source ''Uninstall-ADTDeployment'''
             '        } else {'
             '            if (-not (Test-Path -LiteralPath $registeredUninstallFile -PathType Leaf)) {'
             '                throw "The registered vendor uninstaller was not found: $registeredUninstallFile"'
@@ -2526,7 +4135,13 @@ if ($preserveVendorInstallationOnUninstall) {
             '        if (-not $hasQuietUninstall -and -not $isVivaldiUninstall -and -not $isAdobeCreativeCloudUninstall -and $additionalUninstallArguments.Count -gt 0) {'
             '            Write-ADTLogEntry -Message "The vendor registered no quiet uninstall; applying verified unattended arguments [$($additionalUninstallArguments -join '' '')]." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
             '        }'
-            '        $registeredUninstallWorkingDirectory = Split-Path -Parent $registeredUninstallFile'
+            '        # Run vendor removal from the package support directory, outside the application tree.'
+            '        # Some uninstallers cannot remove their own installation directory when it is also the'
+            '        # process working directory. This safe directory is present for both QA and customer packages.'
+            '        $registeredUninstallWorkingDirectory = $adtSession.DirSupportFiles'
+            '        if ([string]::IsNullOrWhiteSpace($registeredUninstallWorkingDirectory) -or -not (Test-Path -LiteralPath $registeredUninstallWorkingDirectory -PathType Container)) {'
+            '            $registeredUninstallWorkingDirectory = $adtSession.DirFiles'
+            '        }'
             '        $uninstallProcessParameters = @{'
             '            FilePath = $registeredUninstallFile'
             '            WorkingDirectory = $registeredUninstallWorkingDirectory'
@@ -2537,8 +4152,9 @@ if ($preserveVendorInstallationOnUninstall) {
             '        if ($registeredUninstallArguments.Count -gt 0) {'
             '            $uninstallProcessParameters.ArgumentList = $registeredUninstallArguments'
             '        }'
-            "        `$uninstallDeadline = [DateTime]::UtcNow.AddMinutes($uninstallCompletionTimeoutMinutes)"
-            '        $uninstallHandle = Start-ADTProcess @uninstallProcessParameters'
+            "        `$effectiveUninstallCompletionTimeoutMinutes = if (`$useReviewedExactUninstall) { $reviewedExactUninstallTimeoutMinutes } else { $uninstallCompletionTimeoutMinutes }"
+            '        $uninstallDeadline = [DateTime]::UtcNow.AddMinutes($effectiveUninstallCompletionTimeoutMinutes)'
+            $reviewedUninstallWindowAutomationLines
             '        $uninstallProcessExitLogged = $false'
             '        $nextUninstallProgressLog = [DateTime]::UtcNow'
             '        do {'
@@ -2578,7 +4194,9 @@ if ($preserveVendorInstallationOnUninstall) {
             '        if ($remainingApplications.Count -eq 0) { break }'
             '        if ($verificationAttempt -lt 5) { Start-Sleep -Seconds 2 }'
             '    }'
-            '    if ($remainingApplications.Count -gt 0) {'
+            '    if ($remainingApplications.Count -gt 0 -and $uninstallProcessExitCode -in @(1641, 3010)) {'
+            '        Write-ADTLogEntry -Message "The vendor uninstaller returned reboot-required exit code [$uninstallProcessExitCode]; the exact registration remains pending reboot." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
+            '    } elseif ($remainingApplications.Count -gt 0) {'
             '        throw "The vendor uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."'
             '    }'
         )
@@ -2595,6 +4213,10 @@ if ($preserveVendorInstallationOnUninstall) {
             '        foreach ($pkg in @($packages)) {'
             '            Write-ADTLogEntry -Message "Removing current-user package: $($pkg.PackageFullName)" -Severity ''Info'' -Source ''Uninstall-ADTDeployment'''
             '            Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop'
+            '        }'
+            '        $remainingPackages = @(Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue)'
+            '        if ($remainingPackages.Count -gt 0) {'
+            '            throw "User-scoped MSIX/APPX removal verification failed for exact package identity [$packageName]."'
             '        }'
             '        Write-ADTLogEntry -Message "User-scoped MSIX package removal completed" -Severity ''Success'' -Source ''Uninstall-ADTDeployment'''
             '    } catch {'
@@ -2618,6 +4240,11 @@ if ($preserveVendorInstallationOnUninstall) {
             '        foreach ($pkg in @($packages)) {'
             '            Write-ADTLogEntry -Message "Removing installed package: $($pkg.PackageFullName)" -Severity ''Info'' -Source ''Uninstall-ADTDeployment'''
             '            Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop'
+            '        }'
+            '        $remainingProvPackages = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $packageName })'
+            '        $remainingPackages = @(Get-AppxPackage -Name $packageName -AllUsers -ErrorAction SilentlyContinue)'
+            '        if ($remainingProvPackages.Count -gt 0 -or $remainingPackages.Count -gt 0) {'
+            '            throw "Machine-scoped MSIX/APPX removal verification failed for exact package identity [$packageName]."'
             '        }'
             '        Write-ADTLogEntry -Message "Machine-scoped MSIX package removal completed" -Severity ''Success'' -Source ''Uninstall-ADTDeployment'''
             '    } catch {'
@@ -2823,5 +4450,16 @@ $lines += @(
 )
 
 $scriptContent = $lines -join "`r`n"
-Set-Content -Path "$packageDir\Invoke-AppDeployToolkit.ps1" -Value $scriptContent -Encoding UTF8
+# Invoke-AppDeployToolkit.exe can host Windows PowerShell, which treats a UTF-8
+# script without a BOM as the active ANSI code page. Preserve non-ASCII catalog
+# identities so registry capture, detection, and uninstall compare the exact
+# vendor display name that was embedded at package creation time.
+$deploymentScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    (Join-Path $packageDir 'Invoke-AppDeployToolkit.ps1')
+)
+[System.IO.File]::WriteAllText(
+    $deploymentScriptPath,
+    $scriptContent,
+    [System.Text.UTF8Encoding]::new($true)
+)
 Write-Host "Generated PSADT v4 deployment script"

@@ -44,6 +44,7 @@ vi.mock('@/lib/auth-utils', () => ({
 vi.mock('@/lib/supabase', () => ({
   createServerClient: createServerClientMock,
   isSupabaseConfigured: isSupabaseConfiguredMock,
+  isSupabaseServerConfigured: isSupabaseConfiguredMock,
 }));
 
 vi.mock('@/lib/db', () => ({
@@ -764,15 +765,40 @@ describe('POST /api/updates/trigger', () => {
       expect(createJobMock.mock.calls[0][0].package_config.allowAvailableUninstall).toBe(false);
     });
 
-    it('passes the carry-over setting into the deployment config builder', async () => {
+    it('applies the current carry-over setting when the deployment stored no choice', async () => {
+      // The builder no longer takes the global value: it only reports an
+      // explicit per-app choice, so the live setting is applied here instead
+      // of being frozen into the stored config.
       getUserSettingsMock.mockResolvedValue({ carryOverAssignments: true });
 
       await POST(triggerRequest());
 
-      expect(buildDeploymentConfigForAppMock).toHaveBeenCalledWith(
-        null,
-        expect.objectContaining({ globalCarryOver: true })
-      );
+      expect(createJobMock.mock.calls[0][0].package_config.assignmentMigration).toEqual({
+        carryOverAssignments: true,
+        removeAssignmentsFromPreviousApp: true,
+      });
+    });
+
+    it('lets an explicit per-app choice win over the global carry-over setting', async () => {
+      getUserSettingsMock.mockResolvedValue({ carryOverAssignments: true });
+      buildDeploymentConfigForAppMock.mockResolvedValue({
+        status: 'ok',
+        deploymentConfig: {
+          ...deploymentConfig,
+          assignmentMigration: {
+            carryOverAssignments: false,
+            removeAssignmentsFromPreviousApp: false,
+          },
+        },
+        originalUploadHistoryId: 'upload-1',
+      });
+
+      await POST(triggerRequest());
+
+      expect(createJobMock.mock.calls[0][0].package_config.assignmentMigration).toEqual({
+        carryOverAssignments: false,
+        removeAssignmentsFromPreviousApp: false,
+      });
     });
   });
 });

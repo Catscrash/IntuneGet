@@ -2,15 +2,13 @@ import { NextRequest } from 'next/server';
 
 const {
   parseAccessTokenMock,
-  createServerClientMock,
-  isSupabaseConfiguredMock,
+  getServerClientOrNullMock,
   resolveTargetTenantIdMock,
   getDatabaseMock,
   getByUserIdMock,
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
-  createServerClientMock: vi.fn(),
-  isSupabaseConfiguredMock: vi.fn(),
+  getServerClientOrNullMock: vi.fn(),
   resolveTargetTenantIdMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getByUserIdMock: vi.fn(),
@@ -21,8 +19,7 @@ vi.mock('@/lib/auth-utils', () => ({
 }));
 
 vi.mock('@/lib/supabase', () => ({
-  createServerClient: createServerClientMock,
-  isSupabaseConfigured: isSupabaseConfiguredMock,
+  getServerClientOrNull: getServerClientOrNullMock,
 }));
 
 vi.mock('@/lib/msp/tenant-resolution', () => ({
@@ -38,7 +35,7 @@ import { GET } from '@/app/api/intune/apps/deployed/config/route';
 describe('GET /api/intune/apps/deployed/config', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isSupabaseConfiguredMock.mockReturnValue(true);
+    getServerClientOrNullMock.mockReturnValue({ from: vi.fn() });
     getDatabaseMock.mockReturnValue({ jobs: { getByUserId: getByUserIdMock } });
     getByUserIdMock.mockResolvedValue([]);
     parseAccessTokenMock.mockResolvedValue({
@@ -109,7 +106,7 @@ describe('GET /api/intune/apps/deployed/config', () => {
   });
 
   it('resolves config without touching Supabase when running Supabase-less (DATABASE_MODE=sqlite, no MSP config)', async () => {
-    isSupabaseConfiguredMock.mockReturnValue(false);
+    getServerClientOrNullMock.mockReturnValue(null);
     getByUserIdMock.mockResolvedValue([
       {
         tenant_id: 'tenant-home',
@@ -131,7 +128,7 @@ describe('GET /api/intune/apps/deployed/config', () => {
 
     expect(response.status).toBe(200);
     expect(body.intuneAppId).toBe('app-1');
-    expect(createServerClientMock).not.toHaveBeenCalled();
+    expect(resolveTargetTenantIdMock).not.toHaveBeenCalled();
     expect(resolveTargetTenantIdMock).not.toHaveBeenCalled();
   });
 });

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo, useId } from 'react';
 import {
+  ArrowUpCircle,
   X,
   Settings,
   Terminal,
@@ -41,6 +42,7 @@ import {
 import { cn } from '@/lib/utils';
 import { AppIcon } from '@/components/AppIcon';
 import { AssignmentConfig } from '@/components/AssignmentConfig';
+import { CartUpdatePolicyPicker, type CartUpdatePolicyValue } from '@/components/updates/CartUpdatePolicyPicker';
 import { CategoryConfig } from '@/components/CategoryConfig';
 import { DependencyConfig } from '@/components/DependencyConfig';
 import { EspProfileSelector } from '@/components/EspProfileSelector';
@@ -60,12 +62,14 @@ import type {
 import type { CartItem, IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
 import type { AppRelationship } from '@/types/intune';
 import type { EspProfileSelection } from '@/types/esp';
-import { DEFAULT_PSADT_CONFIG, getDefaultProcessesToClose } from '@/types/psadt';
+import { DEFAULT_PSADT_CONFIG, getDefaultProcessesToClose, sanitizeProcessesToClose } from '@/types/psadt';
 import { useCartStore, createStoreCartItem } from '@/stores/cart-store';
+import { useUserSettings } from '@/components/providers/UserSettingsProvider';
 import { useUpdateAppSettings } from '@/hooks/use-update-app-settings';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { generateDetectionRules, generateInstallCommand, generateUninstallCommand } from '@/lib/detection-rules';
 import { INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
+import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
 
 // Strip the auto-appended "Source: IntuneGet.com" marker so the description
 // editor shows only the human-authored text. The marker is re-appended at
@@ -100,6 +104,7 @@ type ConfigSection =
   | 'assignment'
   | 'category'
   | 'esp'
+  | 'updates'
   | 'dependencies'
   | 'branding'
   | 'advanced';
@@ -203,14 +208,23 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   const [relationships, setRelationships] = useState<AppRelationship[]>(
     deployedConfig?.relationships || []
   );
+  const [updatePolicy, setUpdatePolicy] = useState<CartUpdatePolicyValue>(
+    deployedConfig?.updatePolicy
+  );
+  const { settings: userSettings } = useUserSettings();
+  const [carryOverAssignments, setCarryOverAssignments] = useState<boolean>(
+    deployedConfig?.assignmentMigration?.carryOverAssignments ??
+      Boolean(userSettings.carryOverAssignments)
+  );
 
   // UI state
   const [expandedSection, setExpandedSection] = useState<ConfigSection | null>(isStoreApp ? 'assignment' : 'detection');
   const [isAddingToCart, setIsAddingToCart] = useState(false);
+  const [processesError, setProcessesError] = useState<string | null>(null);
   const [addedToCartSuccess, setAddedToCartSuccess] = useState(false);
   const [configMode, setConfigMode] = useState<'quick' | 'advanced'>('quick');
 
-  const quickSections: ConfigSection[] = ['detection', 'assignment', 'category', 'esp', 'dependencies'];
+  const quickSections: ConfigSection[] = ['detection', 'assignment', 'category', 'esp', 'updates', 'dependencies'];
   const isQuickSection = (section: ConfigSection) => quickSections.includes(section);
   const visibleSections = configMode === 'quick' ? quickSections : null; // null = show all
 
@@ -396,6 +410,20 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
     if (!isStoreApp && isFetchingVersionInstallers) return;
     if (!isStoreApp && inCart) return;
 
+    // The packaging pipeline rejects close-process entries without an
+    // executable name, so block adding to cart instead of storing a config
+    // that fails minutes later during packaging.
+    const sanitizedProcesses = isStoreApp
+      ? null
+      : sanitizeProcessesToClose(config.processesToClose);
+    if (sanitizedProcesses && sanitizedProcesses.invalid.length > 0) {
+      setProcessesError(
+        'Each process to close needs an executable name, for example chrome. Fill in the process name or remove the row.'
+      );
+      setExpandedSection('behavior');
+      return;
+    }
+
     setIsAddingToCart(true);
     try {
       if (isStoreApp) {
@@ -450,13 +478,29 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
           installCommand: config.installCommand || generateInstallCommand(selectedInstaller!, selectedScope),
           uninstallCommand: config.uninstallCommand || generateUninstallCommand(selectedInstaller!, pkg.name),
           detectionRules: config.detectionRules,
-          psadtConfig: config,
+          psadtConfig: sanitizedProcesses
+            ? { ...config, processesToClose: sanitizedProcesses.processes }
+            : config,
           assignments: assignments.length > 0 ? assignments : undefined,
+          requirementRules: buildCartItemRequirementRules(
+            displayName,
+            selectedInstaller!.type,
+            selectedInstaller!.productCode,
+            assignments
+          ),
           categories: categories.length > 0 ? categories : undefined,
           espProfiles: espProfiles.length > 0 ? espProfiles : undefined,
           relationships: relationships.length > 0 ? relationships : undefined,
           localeCode: selectedLocale || undefined,
           iconPath: pkg.iconPath,
+          updatePolicy,
+          assignmentMigration:
+            updatePolicy === 'auto_update'
+              ? {
+                  carryOverAssignments,
+                  removeAssignmentsFromPreviousApp: carryOverAssignments,
+                }
+              : undefined,
           ...(isDeployed ? { forceCreate: true } : {}),
         });
       }
@@ -500,6 +544,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   };
 
   const removeProcess = (index: number) => {
+    setProcessesError(null);
     setConfig((prev) => ({
       ...prev,
       processesToClose: prev.processesToClose.filter((_, i) => i !== index),
@@ -507,6 +552,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   };
 
   const updateProcess = (index: number, updates: Partial<ProcessToClose>) => {
+    setProcessesError(null);
     setConfig((prev) => ({
       ...prev,
       processesToClose: prev.processesToClose.map((p, i) =>
@@ -995,7 +1041,12 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                               value={process.name}
                               onChange={(e) => updateProcess(index, { name: e.target.value })}
                               placeholder="Process name (e.g., chrome)"
-                              className="flex-1 px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm"
+                              className={cn(
+                                'flex-1 px-3 py-2 bg-bg-elevated border rounded-lg text-text-primary text-sm',
+                                processesError && !process.name.trim() && process.description.trim()
+                                  ? 'border-red-500/60'
+                                  : 'border-overlay/15'
+                              )}
                             />
                             <input
                               type="text"
@@ -1012,6 +1063,9 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                             </button>
                           </div>
                         ))
+                      )}
+                      {processesError && (
+                        <p className="text-red-400 text-sm">{processesError}</p>
                       )}
                     </div>
                   </div>
@@ -1758,6 +1812,26 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                   mode="pre-deploy"
                   hasRequiredAssignment={assignments.some((a) => a.intent === 'required')}
                 />
+              </ConfigSection>}
+
+              {/* App Updates (quick + advanced, win32 only) */}
+              {!isStoreApp && (visibleSections === null || visibleSections.includes('updates')) && <ConfigSection
+                title="App Updates"
+                icon={<ArrowUpCircle className="w-4 h-4" />}
+                expanded={expandedSection === 'updates'}
+                onToggle={() => toggleSection('updates')}
+              >
+                <div className="space-y-3">
+                  <p className="text-sm text-text-secondary">
+                    Choose how IntuneGet handles future versions of this app.
+                  </p>
+                  <CartUpdatePolicyPicker
+                    value={updatePolicy}
+                    onChange={setUpdatePolicy}
+                    carryOverAssignments={carryOverAssignments}
+                    onCarryOverAssignmentsChange={setCarryOverAssignments}
+                  />
+                </div>
               </ConfigSection>}
 
               {/* Dependencies & Supersedence (quick + advanced, win32 only) */}

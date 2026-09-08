@@ -1,14 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { createServerClientMock, dispatchQaCandidateMock } = vi.hoisted(() => ({
+const { createServerClientMock, dispatchQaCandidateMock, getGitHubActionsHealthMock } = vi.hoisted(() => ({
   createServerClientMock: vi.fn(),
   dispatchQaCandidateMock: vi.fn(),
+  getGitHubActionsHealthMock: vi.fn(),
 }));
 
 vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock }));
 vi.mock('@/lib/qa/dispatch', () => ({ dispatchQaCandidate: dispatchQaCandidateMock }));
+vi.mock('@/lib/qa/github-actions-health', () => ({
+  getGitHubActionsHealth: getGitHubActionsHealthMock,
+}));
 
-import { GET } from './route';
+import { GET, maxDuration } from './route';
+import { InstallerPreflightError } from '@/lib/installer-preflight';
 import { buildQaPackageIdentity } from '@/lib/qa/package-profile';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 
@@ -81,6 +86,7 @@ function createSupabaseStub(
   additionalPages: Array<Array<ReturnType<typeof candidate>>> = [],
   options: {
     paused?: boolean;
+    requiredPackagerCommit?: string | null;
     claimNullIds?: string[];
     claimErrorById?: Record<string, { message: string; code?: string }>;
     supersedeError?: { message: string; code?: string };
@@ -90,6 +96,9 @@ function createSupabaseStub(
   const claimedIds: string[] = [];
   const claimAttemptIds: string[] = [];
   const rollbackIds: string[] = [];
+  const rollbackPayloads: Array<Record<string, unknown>> = [];
+  const terminalErrorIds: string[] = [];
+  const terminalErrorPayloads: Array<Record<string, unknown>> = [];
   const orFilters: string[] = [];
   const supersedePayloads: Array<Record<string, unknown>> = [];
   const queuePages = [queued, ...additionalPages];
@@ -103,6 +112,9 @@ function createSupabaseStub(
           data: {
             paused: options.paused === true,
             reason: options.paused ? 'Golden VM maintenance' : null,
+            required_packager_commit: options.requiredPackagerCommit ?? null,
+            scheduler_packager_commit: null,
+            scheduler_seen_at: null,
             updated_at: '2026-08-11T12:00:00.000Z',
           },
           error: null,
@@ -163,9 +175,20 @@ function createSupabaseStub(
           }
 
           if (values.status === 'queued') {
+            rollbackPayloads.push(values);
             const builder = query({ data: null, error: null }) as Record<string, unknown>;
             builder.eq = vi.fn((column: string, value: string) => {
               if (column === 'id') rollbackIds.push(value);
+              return builder;
+            });
+            return builder;
+          }
+
+          if (values.status === 'error') {
+            terminalErrorPayloads.push(values);
+            const builder = query({ data: null, error: null }) as Record<string, unknown>;
+            builder.eq = vi.fn((column: string, value: string) => {
+              if (column === 'id') terminalErrorIds.push(value);
               return builder;
             });
             return builder;
@@ -183,6 +206,9 @@ function createSupabaseStub(
     claimedIds,
     claimAttemptIds,
     rollbackIds,
+    rollbackPayloads,
+    terminalErrorIds,
+    terminalErrorPayloads,
     orFilters,
   };
 }
@@ -197,9 +223,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   process.env.CRON_SECRET = 'test-cron-secret';
   dispatchQaCandidateMock.mockResolvedValue(undefined);
+  getGitHubActionsHealthMock.mockResolvedValue({ operational: true, status: 'operational' });
+});
+
+it('allows large installer preflight the same bounded window as customer packaging', () => {
+  expect(maxDuration).toBe(300);
 });
 
 afterEach(() => {
+  delete process.env.QA_MAINTENANCE_MODE;
   delete process.env.CRON_SECRET;
 });
 
@@ -218,6 +250,68 @@ describe('GET /api/cron/qa-dispatch', () => {
       dispatched: false,
       reason: 'maintenance_paused',
       maintenanceReason: 'Golden VM maintenance',
+    });
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('does not reconcile or dispatch candidates while maintenance is paused by the server switch', async () => {
+    process.env.QA_MAINTENANCE_MODE = 'true';
+    const row = candidate('catalog-default');
+    const { client, claimedIds } = createSupabaseStub([row], [], { paused: false });
+    createServerClientMock.mockReturnValue(client);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      success: true,
+      dispatched: false,
+      reason: 'maintenance_paused',
+      maintenanceReason: null,
+    });
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('does not reconcile or dispatch when production serves the wrong packager release', async () => {
+    const row = candidate('catalog-default');
+    const { client, claimedIds } = createSupabaseStub([row], [], {
+      requiredPackagerCommit: 'F'.repeat(40),
+    });
+    createServerClientMock.mockReturnValue(client);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(body).toMatchObject({
+      success: true,
+      dispatched: false,
+      reason: 'packager_release_pending',
+    });
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('does not reconcile or dispatch while GitHub Actions is unavailable', async () => {
+    const row = candidate('catalog-default');
+    const { client, claimedIds } = createSupabaseStub([row]);
+    createServerClientMock.mockReturnValue(client);
+    getGitHubActionsHealthMock.mockResolvedValue({
+      operational: false,
+      status: 'major_outage',
+    });
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      success: true,
+      dispatched: false,
+      reason: 'github_actions_unavailable',
+      githubActionsStatus: 'major_outage',
     });
     expect(claimedIds).toEqual([]);
     expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
@@ -269,6 +363,28 @@ describe('GET /api/cron/qa-dispatch', () => {
     expect(body).toMatchObject({ dispatched: true, candidateId: deploymentConfig.id });
     expect(supersededIds).toEqual([]);
     expect(claimedIds).toEqual([deploymentConfig.id]);
+  });
+
+  it('supersedes an ARM64 payload instead of sending it to the x64 VM', async () => {
+    const arm64 = candidate('deployment-config');
+    arm64.architecture = 'arm64';
+    const { client, supersededIds, supersedePayloads, claimedIds } =
+      createSupabaseStub([arm64]);
+    createServerClientMock.mockReturnValue(client);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(body).toMatchObject({ dispatched: false, superseded: 1 });
+    expect(supersededIds).toEqual([arm64.id]);
+    expect(supersedePayloads).toEqual([
+      expect.objectContaining({
+        failure_summary:
+          'Superseded before dispatch: runner-architecture-unsupported.',
+      }),
+    ]);
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
   });
 
   it('supersedes a row whose canonical profile does not match its installer', async () => {
@@ -379,6 +495,169 @@ describe('GET /api/cron/qa-dispatch', () => {
     await expect(GET(cronRequest())).rejects.toThrow('GitHub unavailable');
 
     expect(rollbackIds).toEqual([row.id]);
+  });
+
+  it('defers a retryable installer preflight and dispatches the next candidate', async () => {
+    const unavailable = candidate('catalog-default');
+    unavailable.id = testUuid(50);
+    const valid = candidate('catalog-default');
+    valid.id = testUuid(51);
+    const { client, claimedIds, rollbackIds, rollbackPayloads } = createSupabaseStub([
+      unavailable,
+      valid,
+    ]);
+    createServerClientMock.mockReturnValue(client);
+    dispatchQaCandidateMock
+      .mockRejectedValueOnce(new InstallerPreflightError(
+        'PREFLIGHT_UNAVAILABLE',
+        'Installer download returned HTTP 403',
+        true,
+      ))
+      .mockResolvedValueOnce(undefined);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ dispatched: true, candidateId: valid.id });
+    expect(claimedIds).toEqual([unavailable.id, valid.id]);
+    expect(rollbackIds).toEqual([unavailable.id]);
+    expect(rollbackPayloads).toContainEqual(expect.objectContaining({
+      status: 'queued',
+      attempts: 1,
+      enqueued_at: expect.any(String),
+    }));
+  });
+
+  it('returns after a preflight wall-clock deadline so Vercel can release the claim', async () => {
+    const unavailable = candidate('catalog-default');
+    unavailable.id = testUuid(54);
+    const waiting = candidate('catalog-default');
+    waiting.id = testUuid(55);
+    const { client, claimedIds, rollbackIds, rollbackPayloads } = createSupabaseStub([
+      unavailable,
+      waiting,
+    ]);
+    createServerClientMock.mockReturnValue(client);
+    dispatchQaCandidateMock.mockRejectedValueOnce(new InstallerPreflightError(
+      'PREFLIGHT_DEADLINE_EXCEEDED',
+      'Installer verification exceeded the wall-clock deadline',
+      true,
+    ));
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      dispatched: false,
+      reason: 'installer_unavailable',
+      installerUnavailable: {
+        candidateId: unavailable.id,
+        code: 'PREFLIGHT_DEADLINE_EXCEEDED',
+        attempts: 1,
+        exhausted: false,
+      },
+    });
+    expect(claimedIds).toEqual([unavailable.id]);
+    expect(rollbackIds).toEqual([unavailable.id]);
+    expect(rollbackPayloads).toContainEqual(expect.objectContaining({
+      status: 'queued',
+      attempts: 1,
+      dispatched_at: null,
+    }));
+    expect(dispatchQaCandidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminates an exhausted installer preflight retry and continues dispatching', async () => {
+    const unavailable = candidate('catalog-default');
+    unavailable.id = testUuid(52);
+    unavailable.attempts = 1;
+    const valid = candidate('catalog-default');
+    valid.id = testUuid(53);
+    const { client, claimedIds, terminalErrorIds, terminalErrorPayloads } = createSupabaseStub([
+      unavailable,
+      valid,
+    ]);
+    createServerClientMock.mockReturnValue(client);
+    dispatchQaCandidateMock
+      .mockRejectedValueOnce(new InstallerPreflightError(
+        'PREFLIGHT_UNAVAILABLE',
+        'Installer download returned HTTP 403',
+        true,
+      ))
+      .mockResolvedValueOnce(undefined);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ dispatched: true, candidateId: valid.id });
+    expect(claimedIds).toEqual([unavailable.id, valid.id]);
+    expect(terminalErrorIds).toEqual([unavailable.id]);
+    expect(terminalErrorPayloads).toContainEqual(expect.objectContaining({
+      status: 'error',
+      attempts: 2,
+      finished_at: expect.any(String),
+    }));
+  });
+
+  it('supersedes an installer quarantined by the shared customer preflight', async () => {
+    const row = candidate('catalog-default');
+    const { client, supersededIds, rollbackIds } = createSupabaseStub([row]);
+    createServerClientMock.mockReturnValue(client);
+    dispatchQaCandidateMock.mockRejectedValueOnce(new InstallerPreflightError(
+      'HASH_MISMATCH',
+      'The publisher currently serves different bytes for this version.',
+      false,
+      'B'.repeat(64),
+    ));
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      success: true,
+      dispatched: false,
+      reason: 'installer_quarantined',
+      candidateId: row.id,
+      code: 'HASH_MISMATCH',
+      superseded: 1,
+    });
+    expect(supersededIds).toEqual([row.id]);
+    expect(rollbackIds).toEqual([]);
+  });
+
+  it('dispatches the next candidate after quarantining a deterministic bad tuple', async () => {
+    const quarantined = candidate('catalog-default');
+    quarantined.id = testUuid(40);
+    const valid = candidate('catalog-default');
+    valid.id = testUuid(41);
+    const { client, supersededIds, claimedIds } = createSupabaseStub([
+      quarantined,
+      valid,
+    ]);
+    createServerClientMock.mockReturnValue(client);
+    dispatchQaCandidateMock
+      .mockRejectedValueOnce(new InstallerPreflightError(
+        'MANIFEST_CHANGED',
+        'The exact tuple no longer exists in the trusted manifest.',
+        false,
+      ))
+      .mockResolvedValueOnce(undefined);
+
+    const response = await GET(cronRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      dispatched: true,
+      candidateId: valid.id,
+      superseded: 1,
+    });
+    expect(supersededIds).toEqual([quarantined.id]);
+    expect(claimedIds).toEqual([quarantined.id, valid.id]);
   });
 
   it('does not claim anything when superseding an invalid profile fails', async () => {

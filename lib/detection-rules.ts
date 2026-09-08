@@ -44,7 +44,14 @@ export function generateDetectionRules(
   version?: string,
   markerPath?: string
 ): DetectionRule[] {
-  switch (installer.type) {
+  // A ZIP is only the transport when WinGet declares a nested installer. Use
+  // the nested engine for lifecycle-specific detection so an archived AppX is
+  // verified by its package identity rather than by our wrapper marker alone.
+  const effectiveInstallerType = installer.type === 'zip' && installer.nestedInstallerType
+    ? installer.nestedInstallerType
+    : installer.type;
+
+  switch (effectiveInstallerType) {
     case 'msi':
     case 'wix':
       // MSI: Prefer registry marker (product codes go stale across versions),
@@ -311,6 +318,19 @@ function generateMsixDetectionScript(
 /**
  * Generate install command based on installer type
  */
+function appendMsiInstallScope(
+  silentArgs: string,
+  scope: WingetScope
+): string {
+  const normalizedArgs = silentArgs.trim() || '/qn /norestart';
+  if (/(?:^|\s)ALLUSERS\s*=/i.test(normalizedArgs)) {
+    return normalizedArgs;
+  }
+
+  const scopeProperty = scope === 'user' ? 'ALLUSERS=""' : 'ALLUSERS=1';
+  return `${normalizedArgs} ${scopeProperty}`;
+}
+
 export function generateInstallCommand(
   installer: NormalizedInstaller,
   scope: WingetScope = 'machine'
@@ -323,9 +343,10 @@ export function generateInstallCommand(
 
   switch (installer.type) {
     case 'msi':
-    case 'wix':
-      const msiScope = scope === 'user' ? 'ALLUSERS=""' : 'ALLUSERS=1';
-      return `msiexec /i "${installerName}" /qn ${msiScope} /norestart`;
+    case 'wix': {
+      const msiArgs = appendMsiInstallScope(silentArgs, scope);
+      return `msiexec /i "${installerName}" ${msiArgs}`.trim();
+    }
 
     case 'msix':
     case 'appx':
@@ -356,8 +377,8 @@ export function generateInstallCommand(
         switch (installer.nestedInstallerType) {
           case 'msi':
           case 'wix': {
-            const nestedMsiScope = scope === 'user' ? 'ALLUSERS=""' : 'ALLUSERS=1';
-            return `msiexec /i "${nestedPath}" ${silentArgs} ${nestedMsiScope}`.trim();
+            const nestedMsiArgs = appendMsiInstallScope(silentArgs, scope);
+            return `msiexec /i "${nestedPath}" ${nestedMsiArgs}`.trim();
           }
           case 'msix':
           case 'appx':
@@ -370,8 +391,13 @@ export function generateInstallCommand(
       }
       return `Expand-Archive -Path "${installerName}" -DestinationPath "%ProgramFiles%\\${installerName.replace(/\.[^/.]+$/, '')}" -Force`;
 
-    case 'portable':
-      return `Expand-Archive -Path "${installerName}" -DestinationPath "%ProgramFiles%\\${installerName.replace(/\.[^/.]+$/, '')}" -Force`;
+    case 'portable': {
+      const portableFolder = installerName.replace(/\.[^/.]+$/, '');
+      if (/\.zip$/i.test(installerName)) {
+        return `Expand-Archive -Path "${installerName}" -DestinationPath "%ProgramFiles%\\${portableFolder}" -Force`;
+      }
+      return `Copy-Item -Path "${installerName}" -Destination "%ProgramFiles%\\${portableFolder}\\${installerName}" -Force`;
+    }
 
     default:
       return `"${installerName}" ${silentArgs}`.trim();
@@ -416,6 +442,29 @@ export function generateUninstallCommand(
       // A display name is not an AppX package identity. Keep the marker
       // intentionally invalid so both packagers reject it before deployment.
       return 'MSIX_UNINSTALL:{PACKAGE_NAME}';
+
+    case 'zip':
+      // Archived MSIX/APPX packages retain their package family identity. A
+      // display name is not a safe substitute for provisioning or removal.
+      if (['msix', 'appx'].includes(installer.nestedInstallerType || '')) {
+        if (installer.packageFamilyName) {
+          return `MSIX_UNINSTALL:${installer.packageFamilyName.split('_')[0]}`;
+        }
+        return 'MSIX_UNINSTALL:{PACKAGE_NAME}';
+      }
+      // Archive packages execute their nested installer, so a nested MSI/WiX
+      // ProductCode is the authoritative installed-product identity. Preserve
+      // it for post-install capture and removal instead of falling back to a
+      // localized display name that may not match the registered MSI title.
+      if (displayName) {
+        const nestedMsiProductCode = ['msi', 'wix'].includes(
+          installer.nestedInstallerType || ''
+        )
+          ? installer.productCode
+          : undefined;
+        return generateRegistryUninstallCommand(displayName, nestedMsiProductCode);
+      }
+      return '# Manual uninstall required';
 
     case 'exe':
     case 'inno':
@@ -471,6 +520,19 @@ function generateRegistryUninstallCommand(
     const canonicalProductCode = `{${productCodeMatch[1].toUpperCase()}}`;
     return `REGISTRY_UNINSTALL_PRODUCT:${canonicalProductCode}:${normalizedDisplayName}`;
   }
+  const exactRegistryKey = productCode?.trim();
+  const isSafeNamedKey = exactRegistryKey
+    ? /^[A-Za-z0-9][A-Za-z0-9 ._{}()+-]{0,255}$/.test(exactRegistryKey)
+    : false;
+  const isSafeInnoKey = exactRegistryKey
+    ? /^\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\}_[A-Za-z0-9._+-]{1,32}$/.test(exactRegistryKey)
+    : false;
+  if (
+    exactRegistryKey &&
+    (isSafeNamedKey || isSafeInnoKey)
+  ) {
+    return `REGISTRY_UNINSTALL_KEY:${exactRegistryKey}:${normalizedDisplayName}`;
+  }
   return `REGISTRY_UNINSTALL:${normalizedDisplayName}`;
 }
 
@@ -482,7 +544,8 @@ function getDefaultSilentArgs(type: WingetInstallerType): string {
     msi: '/qn /norestart',
     msix: '',
     appx: '',
-    exe: '/S',
+    // Do not invent a vendor contract for an opaque EXE.
+    exe: '',
     inno: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
     nullsoft: '/S',
     wix: '/qn /norestart',

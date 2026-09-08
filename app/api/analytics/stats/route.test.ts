@@ -103,4 +103,16 @@ describe('GET /api/analytics/stats', () => {
     expect(response.status).toBe(401);
     expect(getAllByUserIdMock).not.toHaveBeenCalled();
   });
+
+  it('returns a well-formed zero payload with no jobs at all', async () => {
+    const body = await (await GET(makeRequest())).json();
+
+    expect(body).toEqual({
+      totalDeployed: 0,
+      thisMonth: 0,
+      pending: 0,
+      failed: 0,
+      recentActivity: [],
+    });
+  });
 });

@@ -1,4 +1,6 @@
 import { getGitHubActionsConfig } from '@/lib/github-actions';
+import { enforceInstallerPreflight } from '@/lib/installer-preflight';
+import { applyInstallerUrlOverride } from '@/lib/installer-url-overrides';
 import type { Json } from '@/types/database';
 
 export interface QaDispatchCandidate {
@@ -16,7 +18,70 @@ export interface QaDispatchCandidate {
   test_config: Json;
 }
 
+const DEFAULT_QA_COMMAND_TIMEOUT_MINUTES = 20;
+const REVIEWED_INSTALL_TIMEOUT_HEADROOM_MINUTES = 5;
+
+function qaCommandTimeoutMinutes(
+  testConfig: Record<string, Json | undefined>
+): number {
+  const psadtConfig = testConfig.psadtConfig;
+  if (!psadtConfig || typeof psadtConfig !== 'object' || Array.isArray(psadtConfig)) {
+    return DEFAULT_QA_COMMAND_TIMEOUT_MINUTES;
+  }
+
+  const reviewedTimeout = psadtConfig.reviewedInstallCompletionTimeoutMinutes;
+  if (
+    typeof reviewedTimeout !== 'number' ||
+    !Number.isInteger(reviewedTimeout) ||
+    reviewedTimeout < 1 ||
+    reviewedTimeout > 60
+  ) {
+    return DEFAULT_QA_COMMAND_TIMEOUT_MINUTES;
+  }
+
+  // The generated customer package owns the reviewed installer deadline. Keep
+  // the outer QA command guard beyond it so PSADT can report its bounded result
+  // and perform teardown instead of QA terminating a still-valid installer.
+  return Math.max(
+    DEFAULT_QA_COMMAND_TIMEOUT_MINUTES,
+    reviewedTimeout + REVIEWED_INSTALL_TIMEOUT_HEADROOM_MINUTES
+  );
+}
+
 export async function dispatchQaCandidate(candidate: QaDispatchCandidate): Promise<void> {
+  const testConfig = candidate.test_config && typeof candidate.test_config === 'object' && !Array.isArray(candidate.test_config)
+    ? candidate.test_config as Record<string, Json | undefined>
+    : {};
+  const installScope = testConfig.scope === 'user' ? 'user' : 'machine';
+  const sourceInstallerType = typeof testConfig.sourceInstallerType === 'string' && testConfig.sourceInstallerType.trim()
+    ? testConfig.sourceInstallerType.trim()
+    : candidate.installer_type;
+  const executionInstallerUrl = applyInstallerUrlOverride(
+    candidate.winget_id,
+    candidate.version,
+    candidate.architecture,
+    candidate.installer_url,
+  );
+
+  // Keep the QA dispatch boundary aligned with customer packaging. A vendor
+  // can replace the bytes behind a mutable URL after WinGet publishes its
+  // manifest. Verify the exact URL/hash tuple before consuming the runner so
+  // QA never tests bytes that a customer upload would reject.
+  await enforceInstallerPreflight({
+    wingetId: candidate.winget_id,
+    version: candidate.version,
+    architecture: candidate.architecture,
+    installerUrl: executionInstallerUrl,
+    manifestInstallerUrl: candidate.installer_url,
+    installerSha256: candidate.installer_sha256,
+    // The candidate column is the normalized execution type (for example,
+    // WinGet Wix becomes MSI). Preflight must compare the original WinGet
+    // manifest type or it will incorrectly quarantine a valid installer.
+    installerType: sourceInstallerType,
+    installScope,
+    sourceType: 'winget',
+  });
+
   const config = getGitHubActionsConfig();
   const url = `https://api.github.com/repos/${config.owner}/${config.workflowsRepo}/actions/workflows/intune-qa.yml/dispatches`;
   const response = await fetch(url, {
@@ -38,7 +103,7 @@ export async function dispatchQaCandidate(candidate: QaDispatchCandidate): Promi
           wingetId: candidate.winget_id,
           version: candidate.version,
           architecture: candidate.architecture,
-          installerUrl: candidate.installer_url,
+          installerUrl: executionInstallerUrl,
           installerSha256: candidate.installer_sha256,
           installerFileName: candidate.installer_file_name,
           installerType: candidate.installer_type,
@@ -46,7 +111,7 @@ export async function dispatchQaCandidate(candidate: QaDispatchCandidate): Promi
           packageProfileSha256: candidate.package_profile_sha256,
           testConfig: candidate.test_config,
         }),
-        timeout_minutes: '20',
+        timeout_minutes: String(qaCommandTimeoutMinutes(testConfig)),
       },
     }),
   });
