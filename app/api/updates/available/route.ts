@@ -4,7 +4,6 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { compareVersions } from '@/lib/version-compare';
@@ -32,10 +31,6 @@ export async function GET(request: NextRequest) {
     // apps are opt-in to avoid accidentally updating mismatched/customized apps.
     const includeUnmanaged = searchParams.get('include_unmanaged') === 'true';
 
-    // Detected updates live in the db abstraction, so this works in both
-    // backends. Auto-update policies below are Supabase-only.
-    const supabase = isSupabaseServerConfigured() ? createServerClient() : null;
-
     let updates;
     try {
       updates = await getDatabase().updateCheckResults.getByUserId(user.userId, tenantId);
@@ -62,26 +57,16 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Get policies for these updates. Auto-update policies are a Supabase-only
-    // feature (app_update_policies has no SQLite equivalent, and there is no
-    // scheduler to act on them in a self-hosted container), so without
-    // Supabase every update simply reports no policy.
+    // Policies go through the db abstraction, so pin and ignore actually take
+    // effect in Supabase-less SQLite installs. Filtered on the app ids in the
+    // query: a missing policy reads as "no policy", so a truncated page would
+    // silently un-ignore an app rather than merely shorten the answer.
     const wingetIds = [...new Set(updates.map((u) => u.winget_id))];
-    const { data: policies } = supabase
-      ? await (() => {
-          let policiesQuery = supabase
-            .from('app_update_policies')
-            .select('id, winget_id, tenant_id, policy_type, is_enabled, pinned_version, last_auto_update_at, last_auto_update_version, consecutive_failures')
-            .eq('user_id', user.userId)
-            .in('winget_id', wingetIds);
-
-          if (tenantId) {
-            policiesQuery = policiesQuery.eq('tenant_id', tenantId);
-          }
-
-          return policiesQuery;
-        })()
-      : { data: null };
+    const policies = await getDatabase().updatePolicies.getForWingetIds(
+      user.userId,
+      wingetIds,
+      tenantId
+    );
 
     // Deployment history tells us which apps went out through IntuneGet; it
     // exists in both backends. Query per tenant rather than fetching a capped
@@ -105,18 +90,15 @@ export async function GET(request: NextRequest) {
 
     // Create policy lookup
     const policyMap = new Map<string, AvailableUpdate['policy']>();
-    if (policies) {
-      policies.forEach((policy) => {
-        const key = `${policy.winget_id}:${policy.tenant_id}`;
-        policyMap.set(key, {
-          id: policy.id,
-          policy_type: policy.policy_type,
-          is_enabled: policy.is_enabled,
-          pinned_version: policy.pinned_version,
-          last_auto_update_at: policy.last_auto_update_at,
-          last_auto_update_version: policy.last_auto_update_version,
-          consecutive_failures: policy.consecutive_failures,
-        });
+    for (const policy of policies) {
+      policyMap.set(`${policy.winget_id}:${policy.tenant_id}`, {
+        id: policy.id,
+        policy_type: policy.policy_type,
+        is_enabled: policy.is_enabled,
+        pinned_version: policy.pinned_version,
+        last_auto_update_at: policy.last_auto_update_at,
+        last_auto_update_version: policy.last_auto_update_version,
+        consecutive_failures: policy.consecutive_failures,
       });
     }
 

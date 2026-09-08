@@ -111,6 +111,36 @@ export interface UpdateCheckResult {
 }
 
 /**
+ * Per-app update policy.
+ *
+ * Mirrors the app_update_policies table (supabase/migrations/012). One row per
+ * user, tenant and package - the policy decides what happens when a newer
+ * version is detected: deploy it, only notify, stay silent, or stay on a fixed
+ * version.
+ *
+ * deployment_config is the saved re-deployment recipe for auto_update. It is
+ * stored as JSON in both backends and returned parsed, so callers never have
+ * to know which backend answered.
+ */
+export interface UpdatePolicyRecord {
+  id: string;
+  user_id: string;
+  tenant_id: string;
+  winget_id: string;
+  policy_type: 'auto_update' | 'notify' | 'ignore' | 'pin_version';
+  /** Only set for pin_version; the version the app must stay on. */
+  pinned_version: string | null;
+  deployment_config: Record<string, unknown> | null;
+  original_upload_history_id: string | null;
+  last_auto_update_at: string | null;
+  last_auto_update_version: string | null;
+  is_enabled: boolean;
+  consecutive_failures: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
  * Per-user settings blob.
  *
  * Mirrors the user_settings table (supabase/migrations/020). A single JSON
@@ -295,5 +325,72 @@ export interface DatabaseAdapter {
       userId: string,
       dismissedAt: string | null
     ): Promise<UpdateCheckResult | null>;
+  };
+
+  updatePolicies: {
+    /**
+     * A user's policies, newest change first. tenantId narrows to one tenant;
+     * omit it for every tenant the user has policies in.
+     */
+    getByUserId(userId: string, tenantId?: string | null): Promise<UpdatePolicyRecord[]>;
+
+    /**
+     * One policy by id, scoped to its owner so a caller cannot read another
+     * user's policy by guessing an id.
+     */
+    getById(id: string, userId: string): Promise<UpdatePolicyRecord | null>;
+
+    /**
+     * The policies covering a set of packages, for annotating a list of
+     * detected updates. Filters in the query rather than in the caller: a
+     * missing policy reads as "no policy", so a truncated page would silently
+     * un-ignore an app rather than merely shorten the answer.
+     */
+    getForWingetIds(
+      userId: string,
+      wingetIds: string[],
+      tenantId?: string | null
+    ): Promise<UpdatePolicyRecord[]>;
+
+    /**
+     * Create the policy for a user, tenant and package, or replace the fields
+     * of the existing one. There is at most one policy per that triple, so
+     * callers set a policy rather than having to look one up first.
+     *
+     * Only the fields that describe the operator's choice. The auto-update
+     * bookkeeping (last_auto_update_at, last_auto_update_version,
+     * consecutive_failures) is owned by whatever runs the updates and is
+     * carried over untouched - resetting it here would re-offer a version that
+     * was just deployed.
+     */
+    upsert(
+      policy: Pick<
+        UpdatePolicyRecord,
+        | 'user_id'
+        | 'tenant_id'
+        | 'winget_id'
+        | 'policy_type'
+        | 'pinned_version'
+        | 'deployment_config'
+        | 'original_upload_history_id'
+        | 'is_enabled'
+      >
+    ): Promise<{ policy: UpdatePolicyRecord; created: boolean }>;
+
+    /**
+     * Patch an existing policy, scoped to its owner. Returns null when no row
+     * of that user has this id.
+     */
+    update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<UpdatePolicyRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<UpdatePolicyRecord | null>;
+
+    /**
+     * Remove a policy, scoped to its owner. Returns false when there was
+     * nothing of theirs to remove.
+     */
+    deleteById(id: string, userId: string): Promise<boolean>;
   };
 }

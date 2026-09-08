@@ -6,17 +6,25 @@ const {
   getPackageCompatibilityBlockMock,
   getPackageResultMock,
   packageEqMock,
+  serverClientMock,
 } = vi.hoisted(() => ({
   getQaResultMock: vi.fn(),
   getPackageCompatibilityBlockMock: vi.fn(),
   getPackageResultMock: vi.fn(),
   packageEqMock: vi.fn(),
+  serverClientMock: vi.fn(),
 }));
 vi.mock('@/lib/catalog', () => ({
   getCatalogSource: () => ({ getQaResult: getQaResultMock }),
 }));
 vi.mock('@/lib/supabase', () => ({
-  createServerClient: () => ({
+  // The gate reaches for its client through getServerClientOrNull() so it can
+  // fall back to the catalog snapshot when there is none.
+  getServerClientOrNull: () => serverClientMock(),
+}));
+
+function supabaseStub() {
+  return {
     from: () => {
       const builder: Record<string, unknown> = {};
       builder.select = vi.fn(() => builder);
@@ -30,8 +38,8 @@ vi.mock('@/lib/supabase', () => ({
       builder.maybeSingle = getPackageResultMock;
       return builder;
     },
-  }),
-}));
+  };
+}
 vi.mock('@/lib/package-eligibility', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/package-eligibility')>();
   return {
@@ -94,6 +102,8 @@ describe('enforceQaGate', () => {
     getPackageCompatibilityBlockMock.mockResolvedValue(null);
     getPackageResultMock.mockReset();
     packageEqMock.mockReset();
+    serverClientMock.mockReset();
+    serverClientMock.mockReturnValue(supabaseStub());
   });
 
   it('blocks a failed exact version and architecture', async () => {
@@ -235,6 +245,112 @@ describe('enforceQaGate', () => {
     await expect(
       enforceQaGate({ wingetId: 'OpenJS.NodeJS', version: '26.7.0', architecture: 'x64' })
     ).resolves.toBeUndefined();
+  });
+
+  describe('without Supabase (self-hosted, catalog snapshot only)', () => {
+    // qa_results ships in the published catalog snapshot, so a self-hosted
+    // install can honour the same verdicts the hosted one does. The
+    // operational tables (qa_package_results, qa_package_blocks) do not, so
+    // those checks simply do not run rather than crashing the deployment.
+    beforeEach(() => {
+      serverClientMock.mockReturnValue(null);
+    });
+
+    it('still blocks a build the catalog reports as failed', async () => {
+      getQaResultMock.mockResolvedValue(failedRow);
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          architecture: 'x64',
+          installerSha256,
+        })
+      ).rejects.toBeInstanceOf(QaGateError);
+    });
+
+    it('still blocks a build the catalog reports as malicious', async () => {
+      getQaResultMock.mockResolvedValue({
+        ...failedRow,
+        outcome: 'Passed',
+        virustotal_status: 'flagged',
+        virustotal_malicious: 4,
+        virustotal_total_engines: 70,
+      });
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          architecture: 'x64',
+          installerSha256,
+          // Even the operator's own override must not get past this one.
+          qaOverride: true,
+        })
+      ).rejects.toBeInstanceOf(QaSecurityGateError);
+    });
+
+    it('lets an untested app through rather than blocking every deployment', async () => {
+      // Nothing marks a package "passed" without a QA pipeline, so treating
+      // "no verdict" as a failure would block the whole catalog.
+      getQaResultMock.mockResolvedValue(null);
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          architecture: 'x64',
+          installerSha256,
+        })
+      ).resolves.toBeUndefined();
+    });
+
+    it('blocks a malicious verdict even when the caller names no architecture', async () => {
+      getQaResultMock.mockResolvedValue({
+        ...failedRow,
+        outcome: 'Passed',
+        architecture: 'arm64',
+        virustotal_status: 'flagged',
+        virustotal_malicious: 2,
+        virustotal_total_engines: 70,
+      });
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          installerSha256,
+          qaOverride: true,
+        })
+      ).rejects.toBeInstanceOf(QaSecurityGateError);
+    });
+
+    it('lets a build the catalog reports as passed through', async () => {
+      getQaResultMock.mockResolvedValue({ ...failedRow, outcome: 'Passed' });
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          architecture: 'x64',
+          installerSha256,
+        })
+      ).resolves.toBeUndefined();
+    });
+
+    it('never reaches for a Supabase client', async () => {
+      getQaResultMock.mockResolvedValue(null);
+
+      await enforceQaGate({
+        wingetId: 'OpenJS.NodeJS',
+        version: '26.7.0',
+        architecture: 'x64',
+        installerSha256,
+      });
+
+      expect(getPackageResultMock).not.toHaveBeenCalled();
+      expect(getPackageCompatibilityBlockMock).not.toHaveBeenCalled();
+    });
   });
 
   it('does not allow a manual override to bypass strict automatic QA', async () => {

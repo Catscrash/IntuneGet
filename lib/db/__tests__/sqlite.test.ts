@@ -7,8 +7,13 @@ import type {
   UploadHistoryRecord,
 } from '../types';
 
-// Create an in-memory SQLite adapter for testing
-function createTestAdapter(): DatabaseAdapter & { close: () => void } {
+// An in-memory mirror of the production adapter's SQL, for the repositories it
+// re-implements below. updatePolicies is deliberately not mirrored here:
+// update-policies.test.ts exercises the real lib/db/sqlite.ts against a temp
+// database file instead, which is what this fixture cannot do.
+type TestAdapter = Omit<DatabaseAdapter, 'updatePolicies'> & { close: () => void };
+
+function createTestAdapter(): TestAdapter {
   const db = new Database(':memory:');
 
   // Enable WAL mode (won't actually do anything for in-memory but matches production)
@@ -142,7 +147,7 @@ function createTestAdapter(): DatabaseAdapter & { close: () => void } {
     } as PackagingJob;
   }
 
-  const adapter: DatabaseAdapter & { close: () => void } = {
+  const adapter: TestAdapter = {
     close: () => db.close(),
     jobs: {
       async getByStatus(status: string, limit: number = 10, ascending: boolean = true): Promise<PackagingJob[]> {

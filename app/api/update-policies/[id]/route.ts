@@ -6,12 +6,12 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
+import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import type { AppUpdatePolicy, UpdatePolicyType } from '@/types/update-policies';
-import type { Database } from '@/types/database';
+import type { DatabaseAdapter } from '@/lib/db/types';
 
-type AppUpdatePolicyUpdate = Database['public']['Tables']['app_update_policies']['Update'];
+type UpdatePolicyPatch = Parameters<DatabaseAdapter['updatePolicies']['update']>[2];
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -23,10 +23,6 @@ interface RouteParams {
  */
 export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json({ policy: null });
-    }
-
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -36,36 +32,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    // Auto-update policies are a Supabase-only feature: app_update_policies has
-    // no SQLite equivalent, and the schedulers that would act on a policy
-    // (vercel.json crons) do not exist in a self-hosted container. Report that
-    // plainly instead of crashing on createServerClient().
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            'Auto-update policies require Supabase and are not available on this self-hosted deployment',
-        },
-        { status: 503 }
-      );
-    }
 
-    const supabase = createServerClient();
-
-    // Get policy by ID, ensuring it belongs to the user
-    const { data: policy, error } = await supabase
-      .from('app_update_policies')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', user.userId)
-      .single();
-
-    if (error && error.code !== 'PGRST116') {
-      return NextResponse.json(
-        { error: 'Failed to fetch policy' },
-        { status: 500 }
-      );
-    }
+    // Scoped to the owning user in the query: the id is the only thing the
+    // client sends, so one tenant admin must not be able to read another's
+    // policy by guessing it.
+    const policy = await getDatabase().updatePolicies.getById(id, user.userId);
 
     if (!policy) {
       return NextResponse.json(
@@ -75,7 +46,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
 
     return NextResponse.json({
-      policy: policy as AppUpdatePolicy,
+      policy: policy as unknown as AppUpdatePolicy,
     });
   } catch {
     return NextResponse.json(
@@ -91,13 +62,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
  */
 export async function PATCH(request: NextRequest, { params }: RouteParams) {
   try {
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        { error: 'Auto-update policies require hosted services' },
-        { status: 503 }
-      );
-    }
-
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -108,37 +72,12 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
 
     const { id } = await params;
     const body = await request.json();
+    const db = getDatabase();
 
-    // Auto-update policies are a Supabase-only feature: app_update_policies has
-    // no SQLite equivalent, and the schedulers that would act on a policy
-    // (vercel.json crons) do not exist in a self-hosted container. Report that
-    // plainly instead of crashing on createServerClient().
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            'Auto-update policies require Supabase and are not available on this self-hosted deployment',
-        },
-        { status: 503 }
-      );
-    }
-
-    const supabase = createServerClient();
-
-    // Verify policy exists and belongs to user
-    const { data: existingPolicy, error: fetchError } = await supabase
-      .from('app_update_policies')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', user.userId)
-      .single();
-
-    if (fetchError && fetchError.code !== 'PGRST116') {
-      return NextResponse.json(
-        { error: 'Failed to fetch policy' },
-        { status: 500 }
-      );
-    }
+    // Read it first so the validation below can fall back to what is already
+    // stored: a PATCH that only flips policy_type must not have to resend the
+    // pinned version or the deployment config.
+    const existingPolicy = await db.updatePolicies.getById(id, user.userId);
 
     if (!existingPolicy) {
       return NextResponse.json(
@@ -173,40 +112,35 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       }
     }
 
-    // Build update data
-    const updateData: AppUpdatePolicyUpdate = {
-      updated_at: new Date().toISOString(),
-    };
+    // Only the fields the client actually sent; the adapter leaves the rest of
+    // the row alone and stamps updated_at itself.
+    const updateData: UpdatePolicyPatch = {};
 
-    // Only include fields that are provided
     if (body.policy_type !== undefined) updateData.policy_type = body.policy_type;
     if (body.pinned_version !== undefined) updateData.pinned_version = body.pinned_version;
     if (body.deployment_config !== undefined) updateData.deployment_config = body.deployment_config;
     if (body.is_enabled !== undefined) updateData.is_enabled = body.is_enabled;
-    if (body.original_upload_history_id !== undefined) updateData.original_upload_history_id = body.original_upload_history_id;
+    if (body.original_upload_history_id !== undefined) {
+      updateData.original_upload_history_id = body.original_upload_history_id;
+    }
 
-    // Reset consecutive failures if explicitly enabled
+    // Re-enabling is the operator saying the app is fine again, so the circuit
+    // breaker starts over rather than tripping on the old failure count.
     if (body.is_enabled === true) {
       updateData.consecutive_failures = 0;
     }
 
-    // Update the policy
-    const { data: policy, error } = await supabase
-      .from('app_update_policies')
-      .update(updateData)
-      .eq('id', id)
-      .select()
-      .single();
+    const policy = await db.updatePolicies.update(id, user.userId, updateData);
 
-    if (error) {
+    if (!policy) {
       return NextResponse.json(
-        { error: 'Failed to update policy' },
-        { status: 500 }
+        { error: 'Policy not found' },
+        { status: 404 }
       );
     }
 
     return NextResponse.json({
-      policy: policy as AppUpdatePolicy,
+      policy: policy as unknown as AppUpdatePolicy,
     });
   } catch {
     return NextResponse.json(
@@ -222,13 +156,6 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
  */
 export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        { error: 'Auto-update policies require hosted services' },
-        { status: 503 }
-      );
-    }
-
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -238,37 +165,12 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     }
 
     const { id } = await params;
-    // Auto-update policies are a Supabase-only feature: app_update_policies has
-    // no SQLite equivalent, and the schedulers that would act on a policy
-    // (vercel.json crons) do not exist in a self-hosted container. Report that
-    // plainly instead of crashing on createServerClient().
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            'Auto-update policies require Supabase and are not available on this self-hosted deployment',
-        },
-        { status: 503 }
-      );
-    }
 
-    const supabase = createServerClient();
+    // Scoped to the owning user, so a policy of someone else's reads as
+    // "not found" rather than being removed.
+    const deleted = await getDatabase().updatePolicies.deleteById(id, user.userId);
 
-    // Delete the policy (only if it belongs to the user)
-    const { error, count } = await supabase
-      .from('app_update_policies')
-      .delete({ count: 'exact' })
-      .eq('id', id)
-      .eq('user_id', user.userId);
-
-    if (error) {
-      return NextResponse.json(
-        { error: 'Failed to delete policy' },
-        { status: 500 }
-      );
-    }
-
-    if (count === 0) {
+    if (!deleted) {
       return NextResponse.json(
         { error: 'Policy not found' },
         { status: 404 }

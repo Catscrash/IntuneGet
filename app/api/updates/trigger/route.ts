@@ -25,6 +25,7 @@ import { extractSilentSwitches } from '@/lib/msp/silent-switches';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
 import type { WorkflowInputs } from '@/lib/github-actions';
+import { shouldSkipUpdate } from '@/types/update-policies';
 import type {
   TriggerUpdateRequest,
   TriggerUpdateResponse,
@@ -498,11 +499,11 @@ export async function POST(request: NextRequest) {
  *
  * The Supabase path routes through AutoUpdateTrigger, which needs a policy
  * row to carry the deployment config and writes auto_update_history,
- * user_settings and user_profiles alongside. None of that exists here, and a
- * manual trigger does not need it: the user already decided, so there is no
- * policy to consult, no rate limit to respect and no automation history to
- * record. What remains is what a normal deployment does - resolve the config
- * and the installer, then queue a packaging job for the local packager.
+ * user_settings and user_profiles alongside. Most of that does not exist here,
+ * and a manual trigger does not need it: the user already decided, so there is
+ * no rate limit to respect and no automation history to record. What remains
+ * is what a normal deployment does - honour the app's policy, resolve the
+ * config and the installer, then queue a packaging job for the local packager.
  */
 async function triggerWithoutSupabase(
   user: { userId: string; userEmail?: string | null; tenantId: string },
@@ -563,6 +564,23 @@ async function triggerWithoutSupabase(
 
       if (!updateResult) {
         fail('Update not found');
+        continue;
+      }
+
+      // Ignore and pin are enforced here, not only in the list the UI offers:
+      // a stale page or a direct API call must not be able to deploy a version
+      // the operator deliberately held the app back from.
+      const [policy] = await db.updatePolicies.getForWingetIds(
+        user.userId,
+        [req.winget_id],
+        req.tenant_id
+      );
+      if (shouldSkipUpdate(policy as unknown as AppUpdatePolicy, updateResult.latest_version)) {
+        fail(
+          policy.policy_type === 'ignore'
+            ? `Updates for ${req.winget_id} are set to ignore.`
+            : `${req.winget_id} is pinned to ${policy.pinned_version}.`
+        );
         continue;
       }
 

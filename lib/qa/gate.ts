@@ -1,11 +1,11 @@
 import { getCatalogSource } from '@/lib/catalog';
 import { classifyQaFailure } from '@/lib/qa/classify';
-import { createServerClient } from '@/lib/supabase';
+import { getServerClientOrNull } from '@/lib/supabase';
 import {
   getPackageCompatibilityBlock,
   type PackageCompatibilityBlockCode,
 } from '@/lib/package-eligibility';
-import type { QaClassification } from '@/types/qa';
+import type { QaClassification, QaResultRow } from '@/types/qa';
 
 export class QaGateError extends Error {
   readonly code = 'QA_FAILED_CURRENT_VERSION' as const;
@@ -140,10 +140,18 @@ export async function enforceQaGate(input: {
   const installerSha256 = input.installerSha256?.trim().toUpperCase() || '';
   const packageProfileSha256 = input.packageProfileSha256?.trim().toUpperCase() || '';
 
+  // Without Supabase the operational QA tables are out of reach, but the
+  // published catalog snapshot carries qa_results - so the verdict checks below
+  // still run, off the catalog, and a self-hosted install honours the same
+  // pass/fail and security decisions the hosted one does.
+  const supabase = getServerClientOrNull();
+
   // Reviewed exact-payload compatibility blocks cannot be bypassed. These are
   // upstream or platform safety boundaries, not ordinary QA failures.
-  if (installerSha256) {
-    const compatibilityBlock = await getPackageCompatibilityBlock(createServerClient(), {
+  // qa_package_blocks is not part of the snapshot, so this check is Supabase's
+  // alone; the catalog verdict below still blocks a failed or malicious build.
+  if (installerSha256 && supabase) {
+    const compatibilityBlock = await getPackageCompatibilityBlock(supabase, {
       wingetId: input.wingetId,
       version: input.version,
       architecture,
@@ -162,8 +170,8 @@ export async function enforceQaGate(input: {
 
   // Security gate: a malicious VirusTotal verdict for this exact installer
   // blocks packaging even when the installability gate is overridden.
-  if (installerSha256) {
-    const { data: securityRow, error: securityError } = await createServerClient()
+  if (installerSha256 && supabase) {
+    const { data: securityRow, error: securityError } = await supabase
       .from('qa_package_results')
       .select('virustotal_malicious, virustotal_total_engines')
       .eq('winget_id', input.wingetId)
@@ -189,10 +197,22 @@ export async function enforceQaGate(input: {
     }
   }
 
+  // The catalog verdict is the only security signal a self-hosted install has,
+  // so it must be read before the override below rather than after it. A
+  // malicious verdict is not something an operator override may wave through -
+  // that is the same boundary the Supabase check above enforces when it runs.
+  const catalogRow = supabase ? null : await getCatalogSource().getQaResult(input.wingetId);
+  // input.architecture, not the 'x64'-defaulted local: matching on the default
+  // would let a malicious verdict for another architecture slip past a caller
+  // that did not name one, while the verdict check below would still see it.
+  if (catalogRow && matchesRequestedPackage(catalogRow, input.wingetId, input.version, input.architecture)) {
+    throwIfCatalogVerdictBlocks(catalogRow, { securityOnly: true });
+  }
+
   if (!input.requirePassed && input.qaOverride) return;
 
-  const { data: passedRow, error: passedError } = installerSha256
-    ? await createServerClient()
+  const { data: passedRow, error: passedError } = installerSha256 && supabase
+    ? await supabase
         .from('qa_package_results')
         .select('winget_id, tested_version, architecture, installer_sha256, outcome')
         .eq('winget_id', input.wingetId)
@@ -218,17 +238,47 @@ export async function enforceQaGate(input: {
     });
   }
 
-  const row = await getCatalogSource().getQaResult(input.wingetId);
+  const row = catalogRow ?? (await getCatalogSource().getQaResult(input.wingetId));
 
-  if (
-    !row ||
-    row.tested_version !== input.version ||
-    (input.architecture && row.architecture.toLowerCase() !== input.architecture.toLowerCase()) ||
-    row.test_level !== 'psadt-package'
-  ) {
+  if (!row || !matchesRequestedPackage(row, input.wingetId, input.version, input.architecture)) {
     return;
   }
 
+  throwIfCatalogVerdictBlocks(row);
+}
+
+/**
+ * Whether a catalog QA row describes the package about to be deployed.
+ *
+ * A verdict for another version or architecture says nothing about this build,
+ * and an installer-preflight run is not a verdict on the packaged app, so
+ * neither may block or clear it.
+ */
+function matchesRequestedPackage(
+  row: QaResultRow,
+  wingetId: string,
+  version: string,
+  architecture?: string
+): boolean {
+  return (
+    row.winget_id === wingetId &&
+    row.tested_version === version &&
+    (!architecture || row.architecture.toLowerCase() === architecture.toLowerCase()) &&
+    row.test_level === 'psadt-package'
+  );
+}
+
+/**
+ * Apply a catalog QA verdict.
+ *
+ * securityOnly runs just the malicious check, for the pass before an operator
+ * override is honoured: an override may accept a failed installation test, but
+ * never a build antivirus engines flagged.
+ */
+function throwIfCatalogVerdictBlocks(
+  row: QaResultRow,
+  options?: { securityOnly?: boolean }
+): void {
   if ((row.virustotal_malicious ?? 0) >= 1) {
     throw new QaSecurityGateError({
       wingetId: row.winget_id,
@@ -239,6 +289,7 @@ export async function enforceQaGate(input: {
     });
   }
 
+  if (options?.securityOnly) return;
   if (row.outcome !== 'Failed') return;
 
   throw new QaGateError({

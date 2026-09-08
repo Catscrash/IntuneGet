@@ -109,6 +109,36 @@ Available assignments now carry `autoUpdateSettings.autoUpdateSupersededAppsStat
 
 </details>
 
+<details>
+<summary><b>App update policies work without Supabase (auto-update, pin, ignore)</b></summary>
+
+<br>
+
+Update *detection* and the Update button already worked in a SQLite install, but the policy layer did not: `app_update_policies` had no SQLite equivalent, so all four policy routes answered 503, `/api/updates/available` reported every app as having no policy, and the sidebar hid `/dashboard/updates` outright. Pin and ignore were unreachable, and an app set to ignore was indistinguishable from any other.
+
+Policies now go through the db abstraction like every other table, with the same one-row-per-user-tenant-app rule the Supabase schema enforces. The Updates page is visible again in a self-hosted install, and pin, ignore, notify and auto-update all persist.
+
+Ignore and pin are enforced at the trigger, not only in the list the page offers, so a stale page or a direct API call cannot deploy a version the operator deliberately held back.
+
+Not covered: nothing *schedules* an auto-update in a self-hosted install. `AutoUpdateTrigger` is built around Supabase (`user_profiles`, `auto_update_history`, and the Vercel crons that drive it), so an `auto_update` policy records the intent and the rollout happens from the Updates page. `/api/updates/history` stays empty for the same reason — those rows are only written by the hosted trigger.
+
+</details>
+
+<details>
+<summary><b>QA verdicts are honoured by the local packager</b></summary>
+
+<br>
+
+`enforceQaGate` was only reached from the GitHub Actions dispatch and the MSP batch orchestrator. A self-hosted install packages locally through neither, so it applied no QA gate at all — including for a build VirusTotal had flagged as malicious.
+
+The published catalog snapshot already ships `qa_results` (verdicts, and the VirusTotal columns with them), so those decisions are available without Supabase. The gate now reads them through the catalog when there is no Supabase client, and the local packager path applies it before creating the job, so a blocked app leaves no failed job to clear.
+
+An untested app still deploys: nothing marks a package "passed" without a QA pipeline, so treating "no verdict" as a failure would block the entire catalog. A *malicious* verdict is not overridable — that check had to move ahead of the operator override, which previously short-circuited before the catalog verdict was ever read.
+
+Not covered: *running* QA. That needs the operational tables (`qa_candidates` and eight others), a private workflows repo with `intune-qa.yml`, Windows runner VMs and four crons — upstream infrastructure rather than a portable feature. Pending QA state is invisible for the same reason: `qa_candidates` is deliberately excluded from the snapshot.
+
+</details>
+
 > [!NOTE]
 > `fork-main` is kept merged with upstream, so it carries fixes the pull requests above do not yet have — including guards for two newer Supabase-only features on the deploy path (the catalog retirement blocklist and QA gating), which fail the same way in a SQLite install.
 

@@ -111,9 +111,10 @@ export function Sidebar({ user, onSignOut }: SidebarProps) {
   const managementItems = sccmEnabled
     ? managementNav
     : managementNav.filter((item) => item.href !== '/dashboard/sccm');
-  const visibleManagementItems = hostedServices
-    ? managementItems
-    : managementItems.filter((item) => item.href !== '/dashboard/updates');
+  // App Updates no longer depends on hosted services: detection, policies
+  // (pin / ignore / notify / auto-update) and the manual trigger all run
+  // through the db abstraction, so the page works in a self-hosted install.
+  const visibleManagementItems = managementItems;
 
   const navGroups: NavGroup[] = [
     { items: coreNav },

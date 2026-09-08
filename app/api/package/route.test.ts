@@ -19,6 +19,7 @@ const {
   enforceInstallerPreflightMock,
   getLiveInstallersMock,
   ensureQaDemandMock,
+  enforceQaGateMock,
   getPackageEligibilityBlocksMock,
   isSupabaseServerConfiguredMock,
 } = vi.hoisted(() => ({
@@ -38,6 +39,7 @@ const {
   enforceInstallerPreflightMock: vi.fn(),
   getLiveInstallersMock: vi.fn(),
   ensureQaDemandMock: vi.fn(),
+  enforceQaGateMock: vi.fn(),
   getPackageEligibilityBlocksMock: vi.fn(),
   isSupabaseServerConfiguredMock: vi.fn(),
 }));
@@ -84,6 +86,12 @@ vi.mock('@/lib/installer-preflight', async (importOriginal) => {
 });
 
 vi.mock('@/lib/qa/demand', () => ({ ensureQaDemand: ensureQaDemandMock }));
+// The local packager path applies the QA gate itself; the gate's own catalog
+// and Supabase fallbacks are covered in lib/qa/gate.test.ts.
+vi.mock('@/lib/qa/gate', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@/lib/qa/gate')>();
+  return { ...original, enforceQaGate: enforceQaGateMock };
+});
 
 vi.mock('@/lib/package-eligibility', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/package-eligibility')>();
@@ -115,6 +123,7 @@ vi.mock('@/lib/store-app-deploy', () => ({
 }));
 
 import { GET, POST } from '@/app/api/package/route';
+import { QaGateError } from '@/lib/qa/gate';
 import { InstallerPreflightError } from '@/lib/installer-preflight';
 import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
@@ -400,6 +409,7 @@ describe('POST /api/package (workflow dispatch)', () => {
       },
     });
     getPackageEligibilityBlocksMock.mockResolvedValue([]);
+    enforceQaGateMock.mockResolvedValue(undefined);
     isSupabaseServerConfiguredMock.mockReturnValue(true);
   });
 
@@ -432,6 +442,72 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(ensureQaDemandMock).not.toHaveBeenCalled();
     expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('applies the QA gate before queueing a local-packager job', async () => {
+    // Neither the QA demand pipeline nor the GitHub dispatch runs here, so
+    // this is the only place a self-hosted install can honour the published
+    // verdict - without it a build QA marked failed would deploy anyway.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    enforceQaGateMock.mockRejectedValue(
+      new QaGateError({
+        wingetId: 'Test.App',
+        testedVersion: '1.0.0',
+        testedAtUtc: '2026-08-07T12:00:00Z',
+        architecture: 'x64',
+        classification: 'install_failed',
+      })
+    );
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const body = await (await POST(request)).json();
+
+    expect(enforceQaGateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ wingetId: 'Test.App', version: '1.0.0' })
+    );
+    // No job record either: a blocked app must not leave a failed job behind.
+    expect(createMock).not.toHaveBeenCalled();
+    expect(body.jobs).toHaveLength(0);
+    expect(body.errors).toHaveLength(1);
+    expect(body.errors[0].wingetId).toBe('Test.App');
+  });
+
+  it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
+    // With Supabase, ensureQaDemand already decides the job's QA state; gating
+    // again here would double-report the same verdict.
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    ensureQaDemandMock.mockResolvedValue({
+      state: 'passed',
+      candidateId: 'candidate-1',
+      identity: {
+        executionProfileSha256: 'A'.repeat(64),
+        packageProfileSha256: 'A'.repeat(64),
+        presentationProfileSha256: 'B'.repeat(64),
+      },
+    });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    await POST(request);
+
+    expect(ensureQaDemandMock).toHaveBeenCalled();
+    expect(enforceQaGateMock).not.toHaveBeenCalled();
   });
 
   it('blocks a retired catalog app before QA or customer packaging begins', async () => {

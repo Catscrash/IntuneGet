@@ -13,6 +13,7 @@ const {
   isSupabaseConfiguredMock,
   getDatabaseMock,
   getDetectedUpdatesMock,
+  getPoliciesMock,
   getHistoryMock,
   createJobMock,
   buildDeploymentConfigForAppMock,
@@ -30,6 +31,7 @@ const {
   isSupabaseConfiguredMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getDetectedUpdatesMock: vi.fn(),
+  getPoliciesMock: vi.fn(),
   getHistoryMock: vi.fn(),
   createJobMock: vi.fn(),
   buildDeploymentConfigForAppMock: vi.fn(),
@@ -205,7 +207,9 @@ describe('POST /api/updates/trigger', () => {
       uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
       jobs: { create: createJobMock },
       userSettings: { get: getUserSettingsMock },
+      updatePolicies: { getForWingetIds: getPoliciesMock },
     });
+    getPoliciesMock.mockResolvedValue([]);
     getUserSettingsMock.mockResolvedValue(null);
     getDetectedUpdatesMock.mockResolvedValue([]);
     getHistoryMock.mockResolvedValue([]);
@@ -763,6 +767,85 @@ describe('POST /api/updates/trigger', () => {
       await POST(triggerRequest());
 
       expect(createJobMock.mock.calls[0][0].package_config.allowAvailableUninstall).toBe(false);
+    });
+
+    it('refuses to deploy an app the operator set to ignore', async () => {
+      // The Updates page already leaves ignored apps out of "Update All", but
+      // the policy has to hold at the trigger too: a stale page or a direct
+      // API call must not be able to push a version past it.
+      getPoliciesMock.mockResolvedValue([
+        {
+          id: 'pol-1',
+          winget_id: 'Mozilla.Firefox',
+          tenant_id: 'tenant-1',
+          policy_type: 'ignore',
+          is_enabled: true,
+          pinned_version: null,
+        },
+      ]);
+
+      const body = await (await POST(triggerRequest())).json();
+
+      expect(body.triggered).toBe(0);
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/ignore/i);
+      expect(createJobMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses to deploy a version the app is pinned away from', async () => {
+      getPoliciesMock.mockResolvedValue([
+        {
+          id: 'pol-1',
+          winget_id: 'Mozilla.Firefox',
+          tenant_id: 'tenant-1',
+          policy_type: 'pin_version',
+          is_enabled: true,
+          pinned_version: '152.0.1',
+        },
+      ]);
+
+      const body = await (await POST(triggerRequest())).json();
+
+      expect(body.triggered).toBe(0);
+      expect(body.results[0].error).toContain('152.0.1');
+      expect(createJobMock).not.toHaveBeenCalled();
+    });
+
+    it('deploys when the pin names the version being offered', async () => {
+      // Pinning to the version that is actually rolling out is not a block:
+      // shouldSkipUpdate only holds back versions other than the pinned one.
+      getPoliciesMock.mockResolvedValue([
+        {
+          id: 'pol-1',
+          winget_id: 'Mozilla.Firefox',
+          tenant_id: 'tenant-1',
+          policy_type: 'pin_version',
+          is_enabled: true,
+          pinned_version: '152.0.5',
+        },
+      ]);
+
+      const body = await (await POST(triggerRequest())).json();
+
+      expect(body.triggered).toBe(1);
+      expect(createJobMock).toHaveBeenCalled();
+    });
+
+    it('deploys normally when a notify policy is set', async () => {
+      getPoliciesMock.mockResolvedValue([
+        {
+          id: 'pol-1',
+          winget_id: 'Mozilla.Firefox',
+          tenant_id: 'tenant-1',
+          policy_type: 'notify',
+          is_enabled: true,
+          pinned_version: null,
+        },
+      ]);
+
+      const body = await (await POST(triggerRequest())).json();
+
+      expect(body.triggered).toBe(1);
     });
 
     it('applies the current carry-over setting when the deployment stored no choice', async () => {

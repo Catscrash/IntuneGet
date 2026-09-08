@@ -10,6 +10,7 @@ import type {
   DatabaseAdapter,
   PackagingJob,
   UpdateCheckResult,
+  UpdatePolicyRecord,
   UploadHistoryRecord,
 } from './types';
 
@@ -195,6 +196,39 @@ function initializeSchema(db: Database.Database): void {
     )
   `);
 
+  // Per-app update policies. Mirrors app_update_policies in
+  // supabase/migrations/012, including its uniqueness rule: one policy per
+  // user, tenant and package. original_upload_history_id is deliberately not a
+  // foreign key here - the Supabase table sets it null when the referenced
+  // upload is deleted, and a plain column reproduces that without needing
+  // SQLite foreign keys enabled.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_update_policies (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      winget_id TEXT NOT NULL,
+      policy_type TEXT NOT NULL DEFAULT 'notify'
+        CHECK (policy_type IN ('auto_update', 'notify', 'ignore', 'pin_version')),
+      pinned_version TEXT,
+      deployment_config TEXT,
+      original_upload_history_id TEXT,
+      last_auto_update_at TEXT,
+      last_auto_update_version TEXT,
+      is_enabled INTEGER NOT NULL DEFAULT 1,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, tenant_id, winget_id)
+    )
+  `);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_app_update_policies_user ON app_update_policies(user_id);
+    CREATE INDEX IF NOT EXISTS idx_app_update_policies_user_tenant ON app_update_policies(user_id, tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_app_update_policies_winget ON app_update_policies(winget_id);
+  `);
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_update_check_results_user ON update_check_results(user_id);
     CREATE INDEX IF NOT EXISTS idx_update_check_results_tenant ON update_check_results(tenant_id);
@@ -212,6 +246,17 @@ function parseUpdateCheckRow(row: Record<string, unknown>): UpdateCheckResult {
     is_critical: Boolean(row.is_critical),
     is_managed: Boolean(row.is_managed),
   } as UpdateCheckResult;
+}
+
+function parsePolicyRow(row: Record<string, unknown>): UpdatePolicyRecord {
+  return {
+    ...row,
+    deployment_config: row.deployment_config
+      ? (JSON.parse(row.deployment_config as string) as Record<string, unknown>)
+      : null,
+    is_enabled: Boolean(row.is_enabled),
+    consecutive_failures: Number(row.consecutive_failures ?? 0),
+  } as UpdatePolicyRecord;
 }
 
 /**
@@ -786,6 +831,189 @@ export const sqliteDb: DatabaseAdapter = {
         .prepare('SELECT * FROM update_check_results WHERE id = ?')
         .get(id) as Record<string, unknown> | undefined;
       return row ? parseUpdateCheckRow(row) : null;
+    },
+  },
+
+  updatePolicies: {
+    async getByUserId(userId: string, tenantId?: string | null): Promise<UpdatePolicyRecord[]> {
+      const database = getDb();
+      const rows = (
+        tenantId
+          ? database
+              .prepare(
+                `SELECT * FROM app_update_policies
+                 WHERE user_id = ? AND tenant_id = ?
+                 ORDER BY updated_at DESC`
+              )
+              .all(userId, tenantId)
+          : database
+              .prepare(
+                `SELECT * FROM app_update_policies
+                 WHERE user_id = ?
+                 ORDER BY updated_at DESC`
+              )
+              .all(userId)
+      ) as Record<string, unknown>[];
+      return rows.map(parsePolicyRow);
+    },
+
+    async getById(id: string, userId: string): Promise<UpdatePolicyRecord | null> {
+      const row = getDb()
+        .prepare('SELECT * FROM app_update_policies WHERE id = ? AND user_id = ?')
+        .get(id, userId) as Record<string, unknown> | undefined;
+      return row ? parsePolicyRow(row) : null;
+    },
+
+    async getForWingetIds(
+      userId: string,
+      wingetIds: string[],
+      tenantId?: string | null
+    ): Promise<UpdatePolicyRecord[]> {
+      if (wingetIds.length === 0) return [];
+      const database = getDb();
+      const placeholders = wingetIds.map(() => '?').join(', ');
+      const rows = (
+        tenantId
+          ? database
+              .prepare(
+                `SELECT * FROM app_update_policies
+                 WHERE user_id = ? AND tenant_id = ? AND winget_id IN (${placeholders})`
+              )
+              .all(userId, tenantId, ...wingetIds)
+          : database
+              .prepare(
+                `SELECT * FROM app_update_policies
+                 WHERE user_id = ? AND winget_id IN (${placeholders})`
+              )
+              .all(userId, ...wingetIds)
+      ) as Record<string, unknown>[];
+      return rows.map(parsePolicyRow);
+    },
+
+    async upsert(
+      policy: Parameters<DatabaseAdapter['updatePolicies']['upsert']>[0]
+    ): Promise<{ policy: UpdatePolicyRecord; created: boolean }> {
+      const database = getDb();
+      const now = new Date().toISOString();
+
+      // Look up and write in one transaction: two concurrent saves for the
+      // same app would otherwise both see no row and race on the insert, and
+      // the `created` flag the caller reports back would be wrong for one.
+      const save = database.transaction(() => {
+        const existing = database
+          .prepare(
+            `SELECT id, created_at FROM app_update_policies
+             WHERE user_id = ? AND tenant_id = ? AND winget_id = ?`
+          )
+          .get(policy.user_id, policy.tenant_id, policy.winget_id) as
+          | { id: string; created_at: string }
+          | undefined;
+
+        const id = existing?.id || crypto.randomUUID();
+        database
+          .prepare(
+            `INSERT INTO app_update_policies (
+               id, user_id, tenant_id, winget_id, policy_type, pinned_version,
+               deployment_config, original_upload_history_id, last_auto_update_at,
+               last_auto_update_version, is_enabled, consecutive_failures,
+               created_at, updated_at
+             ) VALUES (
+               @id, @user_id, @tenant_id, @winget_id, @policy_type, @pinned_version,
+               @deployment_config, @original_upload_history_id, @last_auto_update_at,
+               @last_auto_update_version, @is_enabled, @consecutive_failures,
+               @created_at, @updated_at
+             )
+             ON CONFLICT(user_id, tenant_id, winget_id) DO UPDATE SET
+               policy_type = excluded.policy_type,
+               pinned_version = excluded.pinned_version,
+               deployment_config = excluded.deployment_config,
+               original_upload_history_id = excluded.original_upload_history_id,
+               is_enabled = excluded.is_enabled,
+               updated_at = excluded.updated_at`
+          )
+          .run({
+            id,
+            user_id: policy.user_id,
+            tenant_id: policy.tenant_id,
+            winget_id: policy.winget_id,
+            policy_type: policy.policy_type,
+            pinned_version: policy.pinned_version ?? null,
+            deployment_config: policy.deployment_config
+              ? JSON.stringify(policy.deployment_config)
+              : null,
+            original_upload_history_id: policy.original_upload_history_id ?? null,
+            // Only ever the insert's values: the ON CONFLICT branch above
+            // leaves these three alone so an existing row keeps its history.
+            last_auto_update_at: null,
+            last_auto_update_version: null,
+            consecutive_failures: 0,
+            is_enabled: policy.is_enabled === false ? 0 : 1,
+            created_at: existing?.created_at || now,
+            updated_at: now,
+          });
+
+        const row = database
+          .prepare('SELECT * FROM app_update_policies WHERE id = ?')
+          .get(id) as Record<string, unknown>;
+        return { policy: parsePolicyRow(row), created: !existing };
+      });
+
+      return save();
+    },
+
+    async update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<UpdatePolicyRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<UpdatePolicyRecord | null> {
+      const database = getDb();
+      const assignments: string[] = [];
+      const values: unknown[] = [];
+
+      const columns: Array<[keyof typeof data, (value: unknown) => unknown]> = [
+        ['tenant_id', (v) => v],
+        ['winget_id', (v) => v],
+        ['policy_type', (v) => v],
+        ['pinned_version', (v) => v ?? null],
+        ['deployment_config', (v) => (v ? JSON.stringify(v) : null)],
+        ['original_upload_history_id', (v) => v ?? null],
+        ['last_auto_update_at', (v) => v ?? null],
+        ['last_auto_update_version', (v) => v ?? null],
+        ['is_enabled', (v) => (v === false ? 0 : 1)],
+        ['consecutive_failures', (v) => Number(v ?? 0)],
+      ];
+
+      for (const [column, encode] of columns) {
+        // `in` alone would treat an explicit `undefined` as a value and, for
+        // is_enabled, coerce it to true - silently re-enabling a policy.
+        if (data[column] !== undefined) {
+          assignments.push(`${column} = ?`);
+          values.push(encode(data[column]));
+        }
+      }
+
+      if (assignments.length === 0) {
+        return this.getById(id, userId);
+      }
+
+      assignments.push('updated_at = ?');
+      values.push(new Date().toISOString());
+
+      const result = database
+        .prepare(
+          `UPDATE app_update_policies SET ${assignments.join(', ')}
+           WHERE id = ? AND user_id = ?`
+        )
+        .run(...values, id, userId);
+
+      return result.changes === 0 ? null : this.getById(id, userId);
+    },
+
+    async deleteById(id: string, userId: string): Promise<boolean> {
+      const result = getDb()
+        .prepare('DELETE FROM app_update_policies WHERE id = ? AND user_id = ?')
+        .run(id, userId);
+      return result.changes > 0;
     },
   },
 };

@@ -5,7 +5,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
+import { getDatabase } from '@/lib/db';
 import { getCatalogSource } from '@/lib/catalog';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
@@ -18,10 +18,6 @@ import type { Json } from '@/types/database';
  */
 export async function GET(request: NextRequest) {
   try {
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json({ policies: [], count: 0 });
-    }
-
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -33,46 +29,18 @@ export async function GET(request: NextRequest) {
     const searchParams = request.nextUrl.searchParams;
     const tenantId = searchParams.get('tenant_id');
 
-    // Auto-update policies are a Supabase-only feature: app_update_policies has
-    // no SQLite equivalent, and the schedulers that would act on a policy
-    // (vercel.json crons) do not exist in a self-hosted container. Report that
-    // plainly instead of crashing on createServerClient().
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            'Auto-update policies require Supabase and are not available on this self-hosted deployment',
-        },
-        { status: 503 }
-      );
-    }
-
-    const supabase = createServerClient();
-
-    // Build query - conditionally add tenant filter
-    const { data: policies, error } = tenantId
-      ? await supabase
-          .from('app_update_policies')
-          .select('*')
-          .eq('user_id', user.userId)
-          .eq('tenant_id', tenantId)
-          .order('updated_at', { ascending: false })
-      : await supabase
-          .from('app_update_policies')
-          .select('*')
-          .eq('user_id', user.userId)
-          .order('updated_at', { ascending: false });
-
-    if (error) {
-      return NextResponse.json(
-        { error: 'Failed to fetch policies' },
-        { status: 500 }
-      );
-    }
+    // Policies go through the db abstraction, so pin, ignore, notify and
+    // auto-update work in Supabase-less SQLite installs too. They used to
+    // answer 503 here, which left the Updates page with no way to silence or
+    // hold back an app.
+    const policies = await getDatabase().updatePolicies.getByUserId(
+      user.userId,
+      tenantId
+    );
 
     return NextResponse.json({
-      policies: policies as AppUpdatePolicy[],
-      count: policies?.length || 0,
+      policies: policies as unknown as AppUpdatePolicy[],
+      count: policies.length,
     });
   } catch {
     return NextResponse.json(
@@ -88,13 +56,6 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        { error: 'Auto-update policies require hosted services' },
-        { status: 503 }
-      );
-    }
-
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
       return NextResponse.json(
@@ -122,21 +83,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Auto-update policies are a Supabase-only feature: app_update_policies has
-    // no SQLite equivalent, and the schedulers that would act on a policy
-    // (vercel.json crons) do not exist in a self-hosted container. Report that
-    // plainly instead of crashing on createServerClient().
-    if (!isSupabaseServerConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            'Auto-update policies require Supabase and are not available on this self-hosted deployment',
-        },
-        { status: 503 }
-      );
-    }
-
-    const supabase = createServerClient();
+    const db = getDatabase();
 
     // Fields the client may omit for pin_version / auto_update. We derive them
     // server-side below so the bell-icon dropdown can set these policies with
@@ -148,28 +95,22 @@ export async function POST(request: NextRequest) {
     // Pin version requires a version. If the client didn't send one, derive the
     // currently deployed version for this app.
     if (body.policy_type === 'pin_version' && !derivedPinnedVersion) {
-      const { data: updateRow } = await supabase
-        .from('update_check_results')
-        .select('current_version')
-        .eq('user_id', user.userId)
-        .eq('tenant_id', body.tenant_id)
-        .eq('winget_id', body.winget_id)
-        .maybeSingle();
-
-      derivedPinnedVersion = updateRow?.current_version || null;
+      const detected = await db.updateCheckResults.getByUserId(
+        user.userId,
+        body.tenant_id
+      );
+      derivedPinnedVersion =
+        detected.find((row) => row.winget_id === body.winget_id)?.current_version || null;
 
       if (!derivedPinnedVersion) {
-        const { data: latestUpload } = await supabase
-          .from('upload_history')
-          .select('version')
-          .eq('user_id', user.userId)
-          .eq('intune_tenant_id', body.tenant_id)
-          .eq('winget_id', body.winget_id)
-          .order('deployed_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        derivedPinnedVersion = latestUpload?.version || null;
+        // No detected update for this app - pin to whatever this tenant last
+        // deployed. getByUserIdAndTenantId returns newest first.
+        const history = await db.uploadHistory.getByUserIdAndTenantId(
+          user.userId,
+          body.tenant_id
+        );
+        derivedPinnedVersion =
+          history.find((row) => row.winget_id === body.winget_id)?.version || null;
       }
 
       if (!derivedPinnedVersion) {
@@ -185,21 +126,20 @@ export async function POST(request: NextRequest) {
     if (body.policy_type === 'auto_update' && !derivedDeploymentConfig) {
       // Resolve the app's latest version: prefer the update check row, fall
       // back to the catalog's latest_version.
-      const { data: updateRow } = await supabase
-        .from('update_check_results')
-        .select('latest_version')
-        .eq('user_id', user.userId)
-        .eq('tenant_id', body.tenant_id)
-        .eq('winget_id', body.winget_id)
-        .maybeSingle();
-
-      let latestVersion = updateRow?.latest_version || '';
+      const detected = await db.updateCheckResults.getByUserId(
+        user.userId,
+        body.tenant_id
+      );
+      let latestVersion =
+        detected.find((row) => row.winget_id === body.winget_id)?.latest_version || '';
       if (!latestVersion) {
         const catalogApp = await getCatalogSource().getAppForInstaller(body.winget_id);
         latestVersion = catalogApp?.latest_version || '';
       }
 
-      const built = await buildDeploymentConfigForApp(supabase, {
+      // The builder reads upload_history and packaging_jobs through the db
+      // abstraction and resolves its own catalog, so it needs no client.
+      const built = await buildDeploymentConfigForApp(null, {
         userId: user.userId,
         tenantId: body.tenant_id,
         wingetId: body.winget_id,
@@ -222,64 +162,22 @@ export async function POST(request: NextRequest) {
       derivedOriginalUploadHistoryId = built.originalUploadHistoryId;
     }
 
-    // Check if policy already exists for this user/tenant/app
-    const { data: existingPolicy } = await supabase
-      .from('app_update_policies')
-      .select('id')
-      .eq('user_id', user.userId)
-      .eq('tenant_id', body.tenant_id)
-      .eq('winget_id', body.winget_id)
-      .maybeSingle();
-
-    // Build policy data - cast deployment_config to Json for database compatibility
-    const policyData = {
+    // One policy per user, tenant and app: the adapter upserts on that triple
+    // so the bell-icon dropdown can set a policy without first looking one up.
+    const { policy, created } = await db.updatePolicies.upsert({
       user_id: user.userId,
       tenant_id: body.tenant_id,
       winget_id: body.winget_id,
       policy_type: body.policy_type,
       pinned_version: body.policy_type === 'pin_version' ? derivedPinnedVersion : null,
-      deployment_config: (derivedDeploymentConfig || null) as Json,
+      deployment_config: (derivedDeploymentConfig || null) as Record<string, unknown> | null,
       original_upload_history_id: derivedOriginalUploadHistoryId,
       is_enabled: body.is_enabled ?? true,
-      updated_at: new Date().toISOString(),
-    };
-
-    let policy;
-    let error;
-
-    if (existingPolicy) {
-      // Update existing policy
-      const result = await supabase
-        .from('app_update_policies')
-        .update(policyData)
-        .eq('id', existingPolicy.id)
-        .select()
-        .single();
-
-      policy = result.data;
-      error = result.error;
-    } else {
-      // Create new policy
-      const result = await supabase
-        .from('app_update_policies')
-        .insert(policyData)
-        .select()
-        .single();
-
-      policy = result.data;
-      error = result.error;
-    }
-
-    if (error) {
-      return NextResponse.json(
-        { error: 'Failed to save policy' },
-        { status: 500 }
-      );
-    }
+    });
 
     return NextResponse.json({
-      policy: policy as AppUpdatePolicy,
-      created: !existingPolicy,
+      policy: policy as unknown as AppUpdatePolicy,
+      created,
     });
   } catch {
     return NextResponse.json(

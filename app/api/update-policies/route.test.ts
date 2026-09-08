@@ -2,20 +2,22 @@ import { NextRequest } from 'next/server';
 
 const {
   parseAccessTokenMock,
-  createServerClientMock,
-  isSupabaseServerConfiguredMock,
   getDatabaseMock,
   getHistoryMock,
   getJobByIdMock,
+  getDetectedUpdatesMock,
+  upsertPolicyMock,
+  getPoliciesByUserMock,
   getCatalogSourceMock,
   getAppForInstallerMock,
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
-  createServerClientMock: vi.fn(),
-  isSupabaseServerConfiguredMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getHistoryMock: vi.fn(),
   getJobByIdMock: vi.fn(),
+  getDetectedUpdatesMock: vi.fn(),
+  upsertPolicyMock: vi.fn(),
+  getPoliciesByUserMock: vi.fn(),
   getCatalogSourceMock: vi.fn(),
   getAppForInstallerMock: vi.fn(),
 }));
@@ -24,126 +26,35 @@ vi.mock('@/lib/auth-utils', () => ({
   parseAccessToken: parseAccessTokenMock,
 }));
 
-vi.mock('@/lib/supabase', () => ({
-  createServerClient: createServerClientMock,
-  isSupabaseServerConfigured: isSupabaseServerConfiguredMock,
-}));
-
 vi.mock('@/lib/catalog', () => ({
   getCatalogSource: getCatalogSourceMock,
 }));
 
-// upload_history and packaging_jobs exist in both backends, so the deployment
-// config builder reads them through the db abstraction rather than Supabase.
+// Everything this route reads and writes - detected updates, upload history,
+// packaging jobs and the policies themselves - exists in both backends and is
+// reached through the db abstraction, so there is no Supabase client to mock.
 vi.mock('@/lib/db', () => ({
   getDatabase: getDatabaseMock,
 }));
 
-import { POST } from '@/app/api/update-policies/route';
+import { GET, POST } from '@/app/api/update-policies/route';
 
-interface TableData {
-  update_check_results?: Record<string, unknown> | null;
+interface Fixture {
+  detected?: Array<Record<string, unknown>>;
   upload_history?: Record<string, unknown> | null;
-  packaging_jobs?: Record<string, unknown> | null;
-  user_settings?: Record<string, unknown> | null;
-  existing_policy?: { id: string } | null;
+  packaging_job?: Record<string, unknown> | null;
 }
 
-/**
- * Builds a supabase mock whose query chain is fully thenable/awaitable at every
- * terminal (single / maybeSingle). The chain ignores filter arguments and just
- * resolves to the data registered for the table being queried.
- */
-function createSupabaseMock(data: TableData) {
-  const insertPayloads: Array<Record<string, unknown>> = [];
-  const updatePayloads: Array<Record<string, unknown>> = [];
+function seed(fixture: Fixture) {
+  getDetectedUpdatesMock.mockResolvedValue(fixture.detected ?? []);
+  getHistoryMock.mockResolvedValue(fixture.upload_history ? [fixture.upload_history] : []);
+  getJobByIdMock.mockResolvedValue(fixture.packaging_job ?? null);
+}
 
-  // The deployment config builder reads these two through the db abstraction,
-  // so the same fixture object feeds both mocks.
-  getHistoryMock.mockResolvedValue(data.upload_history ? [data.upload_history] : []);
-  getJobByIdMock.mockResolvedValue(data.packaging_jobs ?? null);
-
-  const resultFor = (table: string): { data: unknown; error: null } => {
-    switch (table) {
-      case 'update_check_results':
-        return { data: data.update_check_results ?? null, error: null };
-      case 'upload_history':
-        return { data: data.upload_history ?? null, error: null };
-      case 'packaging_jobs':
-        return { data: data.packaging_jobs ?? null, error: null };
-      case 'user_settings':
-        return { data: data.user_settings ?? null, error: null };
-      default:
-        return { data: null, error: null };
-    }
-  };
-
-  const makeChain = (table: string) => {
-    const result = resultFor(table);
-    const chain: Record<string, unknown> = {};
-    const passthrough = () => chain;
-    for (const method of ['select', 'eq', 'order', 'limit']) {
-      chain[method] = vi.fn(passthrough);
-    }
-    chain.single = vi.fn(async () => result);
-    chain.maybeSingle = vi.fn(async () => result);
-    return chain;
-  };
-
-  const supabase = {
-    from: (table: string) => {
-      if (table === 'app_update_policies') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(function thisEq() {
-              return {
-                eq: vi.fn(() => ({
-                  eq: vi.fn(() => ({
-                    single: vi.fn(async () => ({
-                      data: data.existing_policy ?? null,
-                      error: null,
-                    })),
-                    maybeSingle: vi.fn(async () => ({
-                      data: data.existing_policy ?? null,
-                      error: null,
-                    })),
-                  })),
-                })),
-              };
-            }),
-          })),
-          insert: vi.fn((payload: Record<string, unknown>) => {
-            insertPayloads.push(payload);
-            return {
-              select: vi.fn(() => ({
-                single: vi.fn(async () => ({
-                  data: { id: 'policy-new', ...payload },
-                  error: null,
-                })),
-              })),
-            };
-          }),
-          update: vi.fn((payload: Record<string, unknown>) => {
-            updatePayloads.push(payload);
-            return {
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  single: vi.fn(async () => ({
-                    data: { id: data.existing_policy?.id, ...payload },
-                    error: null,
-                  })),
-                })),
-              })),
-            };
-          }),
-        };
-      }
-
-      return makeChain(table);
-    },
-  };
-
-  return { supabase, insertPayloads, updatePayloads };
+/** The policy the upsert was asked to store. */
+function savedPolicy(): Record<string, unknown> {
+  expect(upsertPolicyMock).toHaveBeenCalledTimes(1);
+  return upsertPolicyMock.mock.calls[0][0];
 }
 
 function makeRequest(body: Record<string, unknown>) {
@@ -157,34 +68,72 @@ function makeRequest(body: Record<string, unknown>) {
   });
 }
 
-describe('POST /api/update-policies', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    isSupabaseServerConfiguredMock.mockReturnValue(true);
-    getDatabaseMock.mockReturnValue({
-      uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
-      jobs: { getById: getJobByIdMock },
-    });
-    getHistoryMock.mockResolvedValue([]);
-    getJobByIdMock.mockResolvedValue(null);
-    parseAccessTokenMock.mockResolvedValue({
-      userId: 'user-1',
-      userEmail: 'user@example.com',
-      tenantId: 'home-tenant',
-      userName: 'User',
-    });
-    getAppForInstallerMock.mockResolvedValue(null);
-    getCatalogSourceMock.mockReturnValue({
-      getAppForInstaller: getAppForInstallerMock,
-    });
+beforeEach(() => {
+  vi.clearAllMocks();
+  getDatabaseMock.mockReturnValue({
+    uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
+    jobs: { getById: getJobByIdMock },
+    updateCheckResults: { getByUserId: getDetectedUpdatesMock },
+    updatePolicies: {
+      upsert: upsertPolicyMock,
+      getByUserId: getPoliciesByUserMock,
+    },
+  });
+  seed({});
+  getPoliciesByUserMock.mockResolvedValue([]);
+  upsertPolicyMock.mockImplementation(async (policy: Record<string, unknown>) => ({
+    policy: { id: 'policy-new', ...policy },
+    created: true,
+  }));
+  parseAccessTokenMock.mockResolvedValue({
+    userId: 'user-1',
+    userEmail: 'user@example.com',
+    tenantId: 'home-tenant',
+    userName: 'User',
+  });
+  getAppForInstallerMock.mockResolvedValue(null);
+  getCatalogSourceMock.mockReturnValue({
+    getAppForInstaller: getAppForInstallerMock,
+  });
+});
+
+describe('GET /api/update-policies', () => {
+  it('lists the stored policies without Supabase', async () => {
+    // Regression: this answered 503 in a self-hosted install, which left the
+    // Updates page with no way to see or set pin and ignore at all.
+    getPoliciesByUserMock.mockResolvedValue([
+      { id: 'policy-1', winget_id: 'Microsoft.Edge', policy_type: 'ignore' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/update-policies?tenant_id=tenant-1');
+    request.headers.set('Authorization', 'Bearer test-token');
+    const response = await GET(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.count).toBe(1);
+    expect(body.policies[0].policy_type).toBe('ignore');
+    expect(getPoliciesByUserMock).toHaveBeenCalledWith('user-1', 'tenant-1');
   });
 
+  it('returns 401 without valid auth', async () => {
+    parseAccessTokenMock.mockResolvedValue(null);
+
+    const request = new NextRequest('http://localhost:3000/api/update-policies');
+    const response = await GET(request);
+
+    expect(response.status).toBe(401);
+    expect(getPoliciesByUserMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/update-policies', () => {
   it('derives the current version for pin_version when client omits it', async () => {
-    const { supabase, insertPayloads } = createSupabaseMock({
-      update_check_results: { current_version: '1.2.3', latest_version: '1.3.0' },
-      existing_policy: null,
+    seed({
+      detected: [
+        { winget_id: 'Microsoft.Edge', current_version: '1.2.3', latest_version: '1.3.0' },
+      ],
     });
-    createServerClientMock.mockReturnValue(supabase);
 
     const response = await POST(
       makeRequest({
@@ -196,19 +145,33 @@ describe('POST /api/update-policies', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(insertPayloads).toHaveLength(1);
-    expect(insertPayloads[0].pinned_version).toBe('1.2.3');
-    expect(insertPayloads[0].policy_type).toBe('pin_version');
+    expect(savedPolicy().pinned_version).toBe('1.2.3');
+    expect(savedPolicy().policy_type).toBe('pin_version');
     expect(body.created).toBe(true);
   });
 
-  it('returns 400 for pin_version when no current version can be derived', async () => {
-    const { supabase } = createSupabaseMock({
-      update_check_results: null,
-      upload_history: null,
-      existing_policy: null,
+  it('falls back to the last deployed version when nothing was detected', async () => {
+    // Pinning an app that has no pending update is the normal case: the
+    // operator holds it at what is deployed right now.
+    seed({
+      detected: [],
+      upload_history: { id: 'upload-1', winget_id: 'Microsoft.Edge', version: '1.1.0' },
     });
-    createServerClientMock.mockReturnValue(supabase);
+
+    const response = await POST(
+      makeRequest({
+        winget_id: 'Microsoft.Edge',
+        tenant_id: 'tenant-1',
+        policy_type: 'pin_version',
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(savedPolicy().pinned_version).toBe('1.1.0');
+  });
+
+  it('returns 400 for pin_version when no current version can be derived', async () => {
+    seed({ detected: [], upload_history: null });
 
     const response = await POST(
       makeRequest({
@@ -221,17 +184,20 @@ describe('POST /api/update-policies', () => {
 
     expect(response.status).toBe(400);
     expect(body.error).toContain('pinned_version');
+    expect(upsertPolicyMock).not.toHaveBeenCalled();
   });
 
   it('derives a deployment_config from a prior deployment for auto_update', async () => {
-    const { supabase, insertPayloads } = createSupabaseMock({
-      update_check_results: { current_version: '1.0.0', latest_version: '2.0.0' },
+    seed({
+      detected: [
+        { winget_id: 'Microsoft.Edge', current_version: '1.0.0', latest_version: '2.0.0' },
+      ],
       upload_history: {
         id: 'upload-1',
         packaging_job_id: 'job-1',
         winget_id: 'Microsoft.Edge',
       },
-      packaging_jobs: {
+      packaging_job: {
         id: 'job-1',
         display_name: 'Microsoft Edge',
         publisher: 'Microsoft',
@@ -243,10 +209,7 @@ describe('POST /api/update-policies', () => {
         detection_rules: [],
         package_config: { assignments: [], categories: [] },
       },
-      user_settings: { carryOverAssignments: true },
-      existing_policy: null,
     });
-    createServerClientMock.mockReturnValue(supabase);
 
     const response = await POST(
       makeRequest({
@@ -258,11 +221,9 @@ describe('POST /api/update-policies', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(insertPayloads).toHaveLength(1);
-    expect(insertPayloads[0].policy_type).toBe('auto_update');
-    expect(insertPayloads[0].original_upload_history_id).toBe('upload-1');
-    const config = insertPayloads[0].deployment_config as Record<string, unknown>;
-    expect(config).toBeTruthy();
+    expect(savedPolicy().policy_type).toBe('auto_update');
+    expect(savedPolicy().original_upload_history_id).toBe('upload-1');
+    const config = savedPolicy().deployment_config as Record<string, unknown>;
     expect(config.displayName).toBe('Microsoft Edge');
     expect(config.forceCreateNewApp).toBe(true);
     expect(body.created).toBe(true);
@@ -272,14 +233,16 @@ describe('POST /api/update-policies', () => {
     // The stored rules name the version the previous deployment installed. If
     // they are carried over unchanged, the new app object detects its
     // predecessor and never reports as installed on any device.
-    const { supabase, insertPayloads } = createSupabaseMock({
-      update_check_results: { current_version: '1.0.0', latest_version: '2.0.0' },
+    seed({
+      detected: [
+        { winget_id: 'Microsoft.Edge', current_version: '1.0.0', latest_version: '2.0.0' },
+      ],
       upload_history: {
         id: 'upload-1',
         packaging_job_id: 'job-1',
         winget_id: 'Microsoft.Edge',
       },
-      packaging_jobs: {
+      packaging_job: {
         id: 'job-1',
         display_name: 'Microsoft Edge',
         publisher: 'Microsoft',
@@ -301,9 +264,7 @@ describe('POST /api/update-policies', () => {
         ],
         package_config: { assignments: [], categories: [] },
       },
-      existing_policy: null,
     });
-    createServerClientMock.mockReturnValue(supabase);
 
     const response = await POST(
       makeRequest({
@@ -314,19 +275,18 @@ describe('POST /api/update-policies', () => {
     );
 
     expect(response.status).toBe(200);
-    const config = insertPayloads[0].deployment_config as Record<string, unknown>;
+    const config = savedPolicy().deployment_config as Record<string, unknown>;
     const rules = config.detectionRules as Array<Record<string, unknown>>;
     expect(rules[0].detectionValue).toBe('2.0.0');
   });
 
   it('returns 400 for auto_update with no prior deployment and not in catalog', async () => {
-    const { supabase } = createSupabaseMock({
-      update_check_results: { current_version: '1.0.0', latest_version: '2.0.0' },
+    seed({
+      detected: [
+        { winget_id: 'Not.InCatalog', current_version: '1.0.0', latest_version: '2.0.0' },
+      ],
       upload_history: null,
-      user_settings: null,
-      existing_policy: null,
     });
-    createServerClientMock.mockReturnValue(supabase);
     // Catalog returns no app -> buildDefaultDeploymentConfig returns null
     getCatalogSourceMock.mockReturnValue({
       getAppForInstaller: getAppForInstallerMock,
@@ -345,14 +305,10 @@ describe('POST /api/update-policies', () => {
 
     expect(response.status).toBe(400);
     expect(body.error).toContain('Auto-update requires');
+    expect(upsertPolicyMock).not.toHaveBeenCalled();
   });
 
   it('creates an ignore policy with just the policy type', async () => {
-    const { supabase, insertPayloads } = createSupabaseMock({
-      existing_policy: null,
-    });
-    createServerClientMock.mockReturnValue(supabase);
-
     const response = await POST(
       makeRequest({
         winget_id: 'Microsoft.Edge',
@@ -363,19 +319,13 @@ describe('POST /api/update-policies', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(insertPayloads).toHaveLength(1);
-    expect(insertPayloads[0].policy_type).toBe('ignore');
-    expect(insertPayloads[0].pinned_version).toBeNull();
-    expect(insertPayloads[0].deployment_config).toBeNull();
+    expect(savedPolicy().policy_type).toBe('ignore');
+    expect(savedPolicy().pinned_version).toBeNull();
+    expect(savedPolicy().deployment_config).toBeNull();
     expect(body.created).toBe(true);
   });
 
   it('creates a notify policy with just the policy type', async () => {
-    const { supabase, insertPayloads } = createSupabaseMock({
-      existing_policy: null,
-    });
-    createServerClientMock.mockReturnValue(supabase);
-
     const response = await POST(
       makeRequest({
         winget_id: 'Microsoft.Edge',
@@ -386,27 +336,42 @@ describe('POST /api/update-policies', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(insertPayloads[0].policy_type).toBe('notify');
+    expect(savedPolicy().policy_type).toBe('notify');
     expect(body.created).toBe(true);
   });
 
-  it('reports policies unavailable instead of crashing when Supabase is absent', async () => {
-    // Regression: the route called createServerClient() unconditionally, which
-    // throws without Supabase config, so a self-hosted SQLite install got a
-    // 500 here. Policies genuinely need Supabase - say so with a 503.
-    isSupabaseServerConfiguredMock.mockReturnValue(false);
+  it('reports an existing policy as replaced rather than created', async () => {
+    // One policy per user, tenant and app: setting a second one from the
+    // dropdown must land on the same row.
+    upsertPolicyMock.mockResolvedValue({
+      policy: { id: 'policy-1', policy_type: 'ignore' },
+      created: false,
+    });
 
+    const body = await (
+      await POST(
+        makeRequest({
+          winget_id: 'Microsoft.Edge',
+          tenant_id: 'tenant-1',
+          policy_type: 'ignore',
+        })
+      )
+    ).json();
+
+    expect(body.created).toBe(false);
+    expect(body.policy.id).toBe('policy-1');
+  });
+
+  it('rejects an unknown policy type', async () => {
     const response = await POST(
       makeRequest({
         winget_id: 'Microsoft.Edge',
         tenant_id: 'tenant-1',
-        policy_type: 'notify',
+        policy_type: 'uninstall_everything',
       })
     );
-    const body = await response.json();
 
-    expect(response.status).toBe(503);
-    expect(body.error).toMatch(/require hosted services/);
-    expect(createServerClientMock).not.toHaveBeenCalled();
+    expect(response.status).toBe(400);
+    expect(upsertPolicyMock).not.toHaveBeenCalled();
   });
 });

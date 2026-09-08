@@ -40,6 +40,7 @@ import {
 } from '@/lib/installer-preflight';
 import { applyInstallerUrlOverride } from '@/lib/installer-url-overrides';
 import { ensureQaDemand } from '@/lib/qa/demand';
+import { describeQaGateError, enforceQaGate, isQaGateError } from '@/lib/qa/gate';
 import { isDeferredCustomerQaEnabled } from '@/lib/qa/continuity';
 import {
   applyApplicationPackagingAdapter,
@@ -615,6 +616,36 @@ export async function POST(request: NextRequest) {
                   demandSource: 'customer',
                 });
             const qaDeferred = qaDemand?.state === 'waiting' && isDeferredCustomerQaEnabled();
+
+            // Two paths already apply the QA gate: the demand pipeline above,
+            // and the GitHub Actions dispatch below. A local packager without
+            // Supabase has neither, so the verdict is checked here, off the
+            // published catalog snapshot - otherwise a self-hosted install
+            // would happily deploy a build QA marked failed, or malicious.
+            // enforceQaGate exempts custom-source items itself, and an
+            // operator override still cannot get past a malicious verdict.
+            if (!qaDemand && isLocalPackagerMode) {
+              try {
+                await enforceQaGate({
+                  wingetId: item.wingetId,
+                  version: item.version,
+                  architecture: item.architecture,
+                  installerSha256,
+                  qaOverride: isQaMaintenanceMode() || item.qaOverride,
+                  sourceType: item.sourceType,
+                });
+              } catch (error) {
+                if (!isQaGateError(error)) throw error;
+                // Reported before the job record exists, so a blocked app
+                // leaves no failed job behind for the operator to clear.
+                errors.push({
+                  wingetId: item.wingetId,
+                  error: describeQaGateError(error),
+                });
+                continue;
+              }
+            }
+
             // Self-hosted installs have no QA pipeline, so local jobs must remain pollable.
             const initialStatus = isLocalPackagerMode && !supabaseServerConfigured
               ? 'queued'

@@ -8,6 +8,7 @@ import type {
   DatabaseAdapter,
   PackagingJob,
   UpdateCheckResult,
+  UpdatePolicyRecord,
   UploadHistoryRecord,
   JobStats,
 } from './types';
@@ -772,6 +773,165 @@ export const supabaseDb: DatabaseAdapter = {
       }
 
       return (data as unknown as UpdateCheckResult) || null;
+    },
+  },
+
+  updatePolicies: {
+    async getByUserId(userId: string, tenantId?: string | null): Promise<UpdatePolicyRecord[]> {
+      const supabase = createServerClient();
+
+      let query = supabase
+        .from('app_update_policies')
+        .select('*')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false });
+
+      if (tenantId) {
+        query = query.eq('tenant_id', tenantId);
+      }
+
+      const { data, error } = await query;
+
+      if (isError(error)) {
+        console.error('Error fetching update policies:', error);
+        throw error;
+      }
+
+      return (data as unknown as UpdatePolicyRecord[]) || [];
+    },
+
+    async getById(id: string, userId: string): Promise<UpdatePolicyRecord | null> {
+      const { data, error } = await createServerClient()
+        .from('app_update_policies')
+        .select('*')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error fetching update policy:', error);
+        throw error;
+      }
+
+      return (data as unknown as UpdatePolicyRecord) || null;
+    },
+
+    async getForWingetIds(
+      userId: string,
+      wingetIds: string[],
+      tenantId?: string | null
+    ): Promise<UpdatePolicyRecord[]> {
+      if (wingetIds.length === 0) return [];
+      const supabase = createServerClient();
+
+      let query = supabase
+        .from('app_update_policies')
+        .select('*')
+        .eq('user_id', userId)
+        .in('winget_id', wingetIds);
+
+      if (tenantId) {
+        query = query.eq('tenant_id', tenantId);
+      }
+
+      const { data, error } = await query;
+
+      if (isError(error)) {
+        console.error('Error fetching update policies:', error);
+        throw error;
+      }
+
+      return (data as unknown as UpdatePolicyRecord[]) || [];
+    },
+
+    async upsert(
+      policy: Parameters<DatabaseAdapter['updatePolicies']['upsert']>[0]
+    ): Promise<{ policy: UpdatePolicyRecord; created: boolean }> {
+      const supabase = createServerClient();
+
+      const { data: existing, error: lookupError } = await supabase
+        .from('app_update_policies')
+        .select('id')
+        .eq('user_id', policy.user_id)
+        .eq('tenant_id', policy.tenant_id)
+        .eq('winget_id', policy.winget_id)
+        .maybeSingle();
+
+      if (isError(lookupError)) {
+        console.error('Error looking up update policy:', lookupError);
+        throw lookupError;
+      }
+
+      const payload = {
+        user_id: policy.user_id,
+        tenant_id: policy.tenant_id,
+        winget_id: policy.winget_id,
+        policy_type: policy.policy_type,
+        pinned_version: policy.pinned_version ?? null,
+        deployment_config: policy.deployment_config ?? null,
+        original_upload_history_id: policy.original_upload_history_id ?? null,
+        is_enabled: policy.is_enabled !== false,
+        updated_at: new Date().toISOString(),
+      };
+
+      const existingId = (existing as { id: string } | null)?.id;
+      const { data, error } = existingId
+        ? await supabase
+            .from('app_update_policies')
+            .update(payload as never)
+            .eq('id', existingId)
+            .select()
+            .single()
+        : await supabase
+            .from('app_update_policies')
+            .insert(payload as never)
+            .select()
+            .single();
+
+      if (isError(error)) {
+        console.error('Error saving update policy:', error);
+        throw error;
+      }
+
+      return { policy: data as unknown as UpdatePolicyRecord, created: !existingId };
+    },
+
+    async update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<UpdatePolicyRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<UpdatePolicyRecord | null> {
+      const { data: row, error } = await createServerClient()
+        .from('app_update_policies')
+        .update({ ...data, updated_at: new Date().toISOString() } as never)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select()
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error updating update policy:', error);
+        throw error;
+      }
+
+      return (row as unknown as UpdatePolicyRecord) || null;
+    },
+
+    async deleteById(id: string, userId: string): Promise<boolean> {
+      const { data, error } = await createServerClient()
+        .from('app_update_policies')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select('id')
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error deleting update policy:', error);
+        throw error;
+      }
+
+      return Boolean(data);
     },
   },
 };
