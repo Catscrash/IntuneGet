@@ -513,6 +513,36 @@ describe('POST /api/package (workflow dispatch)', () => {
     consoleError.mockRestore();
   });
 
+  it('names the reason in the summary when nothing could be queued', async () => {
+    // The cart falls back to this string when no job was created. A bare
+    // count ("1 failed") leaves the operator with nothing to act on.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    enforceQaGateMock.mockRejectedValue(
+      new QaGateError({
+        wingetId: 'Test.App',
+        testedVersion: '1.0.0',
+        testedAtUtc: '2026-08-07T12:00:00Z',
+        architecture: 'x64',
+        classification: 'install_failed',
+      })
+    );
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const body = await (await POST(request)).json();
+
+    expect(body.message).toContain('Test.App:');
+    expect(body.message).toContain(body.errors[0].error);
+  });
+
   it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
     // With Supabase, ensureQaDemand already decides the job's QA state; gating
     // again here would double-report the same verdict.
