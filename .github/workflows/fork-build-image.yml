@@ -8,18 +8,17 @@ name: Fork - build and publish image
 
 on:
   push:
-    branches: [fork-main]
-    # Documentation and the packager have no bearing on the web image.
-    paths-ignore:
-      - '**/*.md'
-      - 'packager/**'
-      - 'docs/**'
+    # Deliberately not every commit: an image is only wanted when something is
+    # actually going to be deployed, and a build takes ~7 minutes. Tag the
+    # commit to ask for one:
+    #
+    #   git tag deploy-$(date +%Y%m%d-%H%M) && git push fork --tags
+    tags:
+      - 'deploy-*'
   workflow_dispatch:
 
 concurrency:
-  # A newer commit makes an in-flight build pointless; only the tip gets
-  # deployed.
-  group: fork-image-${{ github.ref }}
+  group: fork-image
   cancel-in-progress: true
 
 jobs:
@@ -36,7 +35,15 @@ jobs:
         id: image
         # Docker repository names must be lowercase, and the owner is not:
         # "ghcr.io/Catscrash/..." is rejected outright by buildx.
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/intuneget" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/intuneget" >> "$GITHUB_OUTPUT"
+          # A manual run has no tag to name the image after; fall back to the
+          # run number so every build still gets a unique, stable tag.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "ref_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref_tag=manual-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Free runner disk space
         # The repo carries ~750 MB of icons and the build adds node_modules and
@@ -61,8 +68,12 @@ jobs:
           push: true
           # Two tags on purpose: the branch tag is what the deployment pulls,
           # the commit tag is what a rollback names.
+          # Three tags: the channel the deployment tracks, the tag that
+          # asked for this build, and the commit - the last two are what a
+          # rollback names.
           tags: |
             ${{ steps.image.outputs.name }}:fork-main
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.ref_tag }}
             ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
           # Layer cache in the Actions cache, so an ordinary code change
           # rebuilds only the app layer rather than reinstalling npm packages.
@@ -81,6 +92,7 @@ jobs:
             echo
             echo '```'
             echo "${{ steps.image.outputs.name }}:fork-main"
+            echo "${{ steps.image.outputs.name }}:${{ steps.image.outputs.ref_tag }}"
             echo "${{ steps.image.outputs.name }}:sha-${{ github.sha }}"
             echo '```'
             echo
