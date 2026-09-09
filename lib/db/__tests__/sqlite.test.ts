@@ -8,10 +8,11 @@ import type {
 } from '../types';
 
 // An in-memory mirror of the production adapter's SQL, for the repositories it
-// re-implements below. updatePolicies is deliberately not mirrored here:
-// update-policies.test.ts exercises the real lib/db/sqlite.ts against a temp
-// database file instead, which is what this fixture cannot do.
-type TestAdapter = Omit<DatabaseAdapter, 'updatePolicies'> & { close: () => void };
+// re-implements below. updatePolicies and webhooks are deliberately not
+// mirrored: their tests exercise the real lib/db/sqlite.ts against a temp
+// database file instead, which is what this fixture cannot do - a mirrored
+// statement stays correct even when the production one is broken.
+type TestAdapter = Omit<DatabaseAdapter, 'updatePolicies' | 'webhooks'> & { close: () => void };
 
 function createTestAdapter(): TestAdapter {
   const db = new Database(':memory:');
@@ -503,6 +504,16 @@ function createTestAdapter(): TestAdapter {
     },
 
     updateCheckResults: {
+      async setNotifiedAt(ids: string[], userId: string, notifiedAt: string): Promise<number> {
+        if (ids.length === 0) return 0;
+        const stmt = db.prepare(
+          'UPDATE update_check_results SET notified_at = ? WHERE id = ? AND user_id = ?'
+        );
+        let changed = 0;
+        for (const id of ids) changed += stmt.run(notifiedAt, id, userId).changes;
+        return changed;
+      },
+
       async getByUserId(userId: string, tenantId?: string | null): Promise<UpdateCheckResult[]> {
         const stmt = tenantId
           ? db.prepare(`
@@ -610,7 +621,7 @@ function createTestJob(overrides: Partial<PackagingJob> = {}): Partial<Packaging
 }
 
 describe('SQLite Database Adapter', () => {
-  let adapter: DatabaseAdapter & { close: () => void };
+  let adapter: TestAdapter;
 
   beforeEach(() => {
     adapter = createTestAdapter();

@@ -111,6 +111,34 @@ export interface UpdateCheckResult {
 }
 
 /**
+ * A user's outbound webhook.
+ *
+ * Mirrors webhook_configurations (supabase/migrations/011). Only the storage
+ * lived in Supabase - formatting, HMAC signing and delivery in
+ * lib/webhooks/service.ts are plain logic, so a self-hosted install can use
+ * webhooks once the configurations have somewhere to live.
+ *
+ * headers is stored as JSON in both backends and returned parsed.
+ */
+export interface WebhookConfigurationRecord {
+  id: string;
+  user_id: string;
+  name: string;
+  url: string;
+  webhook_type: 'slack' | 'teams' | 'discord' | 'custom';
+  /** HMAC secret; null when the operator did not set one. */
+  secret: string | null;
+  headers: Record<string, string>;
+  is_enabled: boolean;
+  /** Circuit-breaker state, owned by the delivery path. */
+  failure_count: number;
+  last_failure_at: string | null;
+  last_success_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
  * Per-app update policy.
  *
  * Mirrors the app_update_policies table (supabase/migrations/012). One row per
@@ -325,6 +353,13 @@ export interface DatabaseAdapter {
       userId: string,
       dismissedAt: string | null
     ): Promise<UpdateCheckResult | null>;
+
+    /**
+     * Stamp notified_at on a set of detected updates, so the next run does not
+     * notify about them again. Scoped to the owning user like the dismissal
+     * above. Returns how many rows were stamped.
+     */
+    setNotifiedAt(ids: string[], userId: string, notifiedAt: string): Promise<number>;
   };
 
   updatePolicies: {
@@ -391,6 +426,43 @@ export interface DatabaseAdapter {
      * Remove a policy, scoped to its owner. Returns false when there was
      * nothing of theirs to remove.
      */
+    deleteById(id: string, userId: string): Promise<boolean>;
+  };
+
+  webhooks: {
+    /** A user's webhooks, newest first. */
+    getByUserId(userId: string): Promise<WebhookConfigurationRecord[]>;
+
+    /**
+     * Only the ones that should receive a delivery. Filtered in the query
+     * rather than in the caller: a disabled webhook must never be delivered
+     * to, and that is not a decision to leave to each call site.
+     */
+    getEnabledByUserId(userId: string): Promise<WebhookConfigurationRecord[]>;
+
+    /** One webhook, scoped to its owner. */
+    getById(id: string, userId: string): Promise<WebhookConfigurationRecord | null>;
+
+    /** How many a user already has, for the per-user limit. */
+    countByUserId(userId: string): Promise<number>;
+
+    create(
+      webhook: Pick<
+        WebhookConfigurationRecord,
+        'user_id' | 'name' | 'url' | 'webhook_type' | 'secret' | 'headers' | 'is_enabled'
+      >
+    ): Promise<WebhookConfigurationRecord>;
+
+    /**
+     * Patch a webhook, scoped to its owner. Returns null when no row of
+     * theirs has this id.
+     */
+    update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<WebhookConfigurationRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<WebhookConfigurationRecord | null>;
+
     deleteById(id: string, userId: string): Promise<boolean>;
   };
 }

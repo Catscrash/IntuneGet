@@ -12,6 +12,7 @@ import type {
   UpdateCheckResult,
   UpdatePolicyRecord,
   UploadHistoryRecord,
+  WebhookConfigurationRecord,
 } from './types';
 
 // Singleton database instance
@@ -196,6 +197,33 @@ function initializeSchema(db: Database.Database): void {
     )
   `);
 
+  // Outbound webhooks. Mirrors webhook_configurations in
+  // supabase/migrations/011. Delivery itself needs no database, so storing
+  // these is all that stood between a self-hosted install and working
+  // webhooks.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS webhook_configurations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      webhook_type TEXT NOT NULL
+        CHECK (webhook_type IN ('slack', 'teams', 'discord', 'custom')),
+      secret TEXT,
+      headers TEXT NOT NULL DEFAULT '{}',
+      is_enabled INTEGER NOT NULL DEFAULT 1,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      last_failure_at TEXT,
+      last_success_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_webhook_configurations_user ON webhook_configurations(user_id);
+  `);
+
   // Per-app update policies. Mirrors app_update_policies in
   // supabase/migrations/012, including its uniqueness rule: one policy per
   // user, tenant and package. original_upload_history_id is deliberately not a
@@ -246,6 +274,25 @@ function parseUpdateCheckRow(row: Record<string, unknown>): UpdateCheckResult {
     is_critical: Boolean(row.is_critical),
     is_managed: Boolean(row.is_managed),
   } as UpdateCheckResult;
+}
+
+function parseWebhookRow(row: Record<string, unknown>): WebhookConfigurationRecord {
+  let headers: Record<string, string> = {};
+  if (row.headers) {
+    try {
+      headers = JSON.parse(row.headers as string) as Record<string, string>;
+    } catch {
+      // A malformed blob must not take down the whole webhook list; an empty
+      // header set still delivers.
+      headers = {};
+    }
+  }
+  return {
+    ...row,
+    headers,
+    is_enabled: Boolean(row.is_enabled),
+    failure_count: Number(row.failure_count ?? 0),
+  } as WebhookConfigurationRecord;
 }
 
 function parsePolicyRow(row: Record<string, unknown>): UpdatePolicyRecord {
@@ -832,6 +879,28 @@ export const sqliteDb: DatabaseAdapter = {
         .get(id) as Record<string, unknown> | undefined;
       return row ? parseUpdateCheckRow(row) : null;
     },
+
+    async setNotifiedAt(
+      ids: string[],
+      userId: string,
+      notifiedAt: string
+    ): Promise<number> {
+      if (ids.length === 0) return 0;
+      const database = getDb();
+      const stmt = database.prepare(
+        'UPDATE update_check_results SET notified_at = ?, updated_at = ? WHERE id = ? AND user_id = ?'
+      );
+      const now = new Date().toISOString();
+      // One transaction: a partial stamp would notify about the rest twice.
+      const stampAll = database.transaction((rows: string[]) => {
+        let changed = 0;
+        for (const id of rows) {
+          changed += stmt.run(notifiedAt, now, id, userId).changes;
+        }
+        return changed;
+      });
+      return stampAll(ids);
+    },
   },
 
   updatePolicies: {
@@ -1012,6 +1081,134 @@ export const sqliteDb: DatabaseAdapter = {
     async deleteById(id: string, userId: string): Promise<boolean> {
       const result = getDb()
         .prepare('DELETE FROM app_update_policies WHERE id = ? AND user_id = ?')
+        .run(id, userId);
+      return result.changes > 0;
+    },
+  },
+
+  webhooks: {
+    async getByUserId(userId: string): Promise<WebhookConfigurationRecord[]> {
+      const rows = getDb()
+        .prepare(
+          `SELECT * FROM webhook_configurations
+           WHERE user_id = ?
+           ORDER BY created_at DESC`
+        )
+        .all(userId) as Record<string, unknown>[];
+      return rows.map(parseWebhookRow);
+    },
+
+    async getEnabledByUserId(userId: string): Promise<WebhookConfigurationRecord[]> {
+      const rows = getDb()
+        .prepare(
+          `SELECT * FROM webhook_configurations
+           WHERE user_id = ? AND is_enabled = 1
+           ORDER BY created_at DESC`
+        )
+        .all(userId) as Record<string, unknown>[];
+      return rows.map(parseWebhookRow);
+    },
+
+    async getById(id: string, userId: string): Promise<WebhookConfigurationRecord | null> {
+      const row = getDb()
+        .prepare('SELECT * FROM webhook_configurations WHERE id = ? AND user_id = ?')
+        .get(id, userId) as Record<string, unknown> | undefined;
+      return row ? parseWebhookRow(row) : null;
+    },
+
+    async countByUserId(userId: string): Promise<number> {
+      const row = getDb()
+        .prepare('SELECT COUNT(*) AS count FROM webhook_configurations WHERE user_id = ?')
+        .get(userId) as { count: number };
+      return Number(row?.count ?? 0);
+    },
+
+    async create(
+      webhook: Parameters<DatabaseAdapter['webhooks']['create']>[0]
+    ): Promise<WebhookConfigurationRecord> {
+      const database = getDb();
+      const id = crypto.randomUUID();
+      const now = new Date().toISOString();
+
+      database
+        .prepare(
+          `INSERT INTO webhook_configurations (
+             id, user_id, name, url, webhook_type, secret, headers,
+             is_enabled, failure_count, last_failure_at, last_success_at,
+             created_at, updated_at
+           ) VALUES (
+             @id, @user_id, @name, @url, @webhook_type, @secret, @headers,
+             @is_enabled, 0, NULL, NULL, @created_at, @updated_at
+           )`
+        )
+        .run({
+          id,
+          user_id: webhook.user_id,
+          name: webhook.name,
+          url: webhook.url,
+          webhook_type: webhook.webhook_type,
+          secret: webhook.secret ?? null,
+          headers: JSON.stringify(webhook.headers ?? {}),
+          is_enabled: webhook.is_enabled === false ? 0 : 1,
+          created_at: now,
+          updated_at: now,
+        });
+
+      const row = database
+        .prepare('SELECT * FROM webhook_configurations WHERE id = ?')
+        .get(id) as Record<string, unknown>;
+      return parseWebhookRow(row);
+    },
+
+    async update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<WebhookConfigurationRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<WebhookConfigurationRecord | null> {
+      const database = getDb();
+      const assignments: string[] = [];
+      const values: unknown[] = [];
+
+      const columns: Array<[keyof typeof data, (value: unknown) => unknown]> = [
+        ['name', (v) => v],
+        ['url', (v) => v],
+        ['webhook_type', (v) => v],
+        ['secret', (v) => v ?? null],
+        ['headers', (v) => JSON.stringify(v ?? {})],
+        ['is_enabled', (v) => (v === false ? 0 : 1)],
+        ['failure_count', (v) => Number(v ?? 0)],
+        ['last_failure_at', (v) => v ?? null],
+        ['last_success_at', (v) => v ?? null],
+      ];
+
+      for (const [column, encode] of columns) {
+        // An explicit undefined means "not given", not "clear it".
+        if (data[column] !== undefined) {
+          assignments.push(`${column} = ?`);
+          values.push(encode(data[column]));
+        }
+      }
+
+      if (assignments.length === 0) {
+        return this.getById(id, userId);
+      }
+
+      assignments.push('updated_at = ?');
+      values.push(new Date().toISOString());
+
+      const result = database
+        .prepare(
+          `UPDATE webhook_configurations SET ${assignments.join(', ')}
+           WHERE id = ? AND user_id = ?`
+        )
+        .run(...values, id, userId);
+
+      return result.changes === 0 ? null : this.getById(id, userId);
+    },
+
+    async deleteById(id: string, userId: string): Promise<boolean> {
+      const result = getDb()
+        .prepare('DELETE FROM webhook_configurations WHERE id = ? AND user_id = ?')
         .run(id, userId);
       return result.changes > 0;
     },

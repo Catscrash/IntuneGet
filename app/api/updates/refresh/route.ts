@@ -163,9 +163,10 @@ export async function POST(request: NextRequest) {
     // here must not fail the refresh; the daily cron remains the backstop.
     const hasPendingNotifications = rows.some((row) => row.notified_at === null);
     let notified: { emailsSent: number; webhooksSent: number } | undefined;
-    // Notification channels (email, webhooks) are Supabase-only; without it
-    // the refresh still refreshes, it just has nowhere to notify.
-    if (supabase && hasPendingNotifications) {
+    // Webhooks reach the user without Supabase - only their storage ever
+    // needed it - so this no longer waits for a Supabase client. Email and the
+    // notification centre stay Supabase-only and are skipped inside.
+    if (hasPendingNotifications) {
       try {
         const res = await notifyUserOfPendingUpdates(supabase, user.userId, {
           respectFrequency: false,

@@ -11,6 +11,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { sendUpdateNotificationEmail, isEmailConfigured } from '@/lib/email/service';
 import { deliverWebhook } from '@/lib/webhooks/service';
+import { getDatabase } from '@/lib/db';
 import type {
   NotificationPreferences,
   WebhookConfiguration,
@@ -57,7 +58,13 @@ export function shouldSendBasedOnFrequency(frequency: string): boolean {
  *   the user just asked for a check).
  */
 export async function notifyUserOfPendingUpdates(
-  supabase: SupabaseClient,
+  /**
+   * null in a self-hosted install. Webhooks work without it - only their
+   * storage ever needed Supabase, and delivery is plain logic - so the
+   * Supabase-only channels (email, the notification centre and its history)
+   * are skipped rather than the whole run being refused.
+   */
+  supabase: SupabaseClient | null,
   userId: string,
   options: {
     pendingUpdates?: UpdateCheckResult[];
@@ -73,36 +80,53 @@ export async function notifyUserOfPendingUpdates(
     errors: [],
   };
 
-  // Load pending updates for the user if not supplied
+  const db = getDatabase();
+
+  // Load pending updates for the user if not supplied. update_check_results
+  // exists in both backends, so this goes through the db abstraction.
   let updates = options.pendingUpdates;
   if (!updates) {
-    const { data, error } = await supabase
-      .from('update_check_results')
-      .select('*')
-      .eq('user_id', userId)
-      .is('notified_at', null)
-      .is('dismissed_at', null)
-      .order('detected_at', { ascending: false });
-    if (error) {
-      result.errors.push(`Error fetching pending updates: ${error.message}`);
+    try {
+      updates = (await db.updateCheckResults.getByUserId(userId)).filter(
+        (row) => row.notified_at === null && row.dismissed_at === null
+      );
+    } catch (error) {
+      result.errors.push(
+        `Error fetching pending updates: ${error instanceof Error ? error.message : 'unknown'}`
+      );
       return result;
     }
-    updates = (data as UpdateCheckResult[]) || [];
   }
 
   if (updates.length === 0) {
     return result;
   }
 
-  const [{ data: prefsRow }, { data: webhookRows }, { data: profileRow }] =
-    await Promise.all([
-      supabase.from('notification_preferences').select('*').eq('user_id', userId).maybeSingle(),
-      supabase.from('webhook_configurations').select('*').eq('user_id', userId).eq('is_enabled', true),
-      supabase.from('user_profiles').select('id, email, name, tenant_name').eq('id', userId).maybeSingle(),
-    ]);
+  // notification_preferences and user_profiles have no SQLite equivalent, so
+  // without Supabase there are no preferences to honour and no address to mail
+  // to - the webhook channel carries the run on its own.
+  const [prefsRow, profileRow] = supabase
+    ? await Promise.all([
+        supabase
+          .from('notification_preferences')
+          .select('*')
+          .eq('user_id', userId)
+          .maybeSingle()
+          .then((r) => r.data),
+        supabase
+          .from('user_profiles')
+          .select('id, email, name, tenant_name')
+          .eq('id', userId)
+          .maybeSingle()
+          .then((r) => r.data),
+      ])
+    : [null, null];
+
+  const userWebhooks = (await db.webhooks.getEnabledByUserId(
+    userId
+  )) as unknown as WebhookConfiguration[];
 
   const prefs = (prefsRow as NotificationPreferences | null) || undefined;
-  const userWebhooks = (webhookRows as WebhookConfiguration[] | null) || [];
   const profile = (profileRow as UserProfile | null) || undefined;
 
   // Filter updates based on preferences
@@ -115,7 +139,7 @@ export async function notifyUserOfPendingUpdates(
     // Nothing matches the user's filter; mark all as notified so they are not
     // reconsidered every run.
     result.notifiedUpdateIds.push(...updates.map((u) => u.id));
-    await markNotified(supabase, result.notifiedUpdateIds);
+    await markNotified(userId, result.notifiedUpdateIds);
     return result;
   }
 
@@ -163,7 +187,9 @@ export async function notifyUserOfPendingUpdates(
             profile?.name || undefined
           );
 
-          await supabase.from('notification_history').insert({
+          // Only reachable with Supabase - prefs come from there, so the email
+          // branch cannot run without it - but stated rather than implied.
+          await supabase?.from('notification_history').insert({
             user_id: userId,
             channel: 'email',
             payload,
@@ -202,18 +228,24 @@ export async function notifyUserOfPendingUpdates(
         statusUpdate.failure_count = (webhook.failure_count || 0) + 1;
       }
 
-      await supabase.from('webhook_configurations').update(statusUpdate).eq('id', webhook.id);
+      // Circuit-breaker state lives with the webhook, so it goes through the
+      // db abstraction and survives without Supabase.
+      await db.webhooks.update(webhook.id, userId, statusUpdate);
 
-      await supabase.from('notification_history').insert({
-        user_id: userId,
-        channel: 'webhook',
-        webhook_id: webhook.id,
-        payload,
-        status: webhookResult.success ? 'sent' : 'failed',
-        error_message: webhookResult.error || null,
-        apps_notified: appUpdates.length,
-        sent_at: webhookResult.success ? new Date().toISOString() : null,
-      });
+      // notification_history is Supabase-only; without it the delivery still
+      // happened, it is just not recorded in the notification centre.
+      if (supabase) {
+        await supabase.from('notification_history').insert({
+          user_id: userId,
+          channel: 'webhook',
+          webhook_id: webhook.id,
+          payload,
+          status: webhookResult.success ? 'sent' : 'failed',
+          error_message: webhookResult.error || null,
+          apps_notified: appUpdates.length,
+          sent_at: webhookResult.success ? new Date().toISOString() : null,
+        });
+      }
 
       if (webhookResult.success) {
         delivered = true;
@@ -231,18 +263,17 @@ export async function notifyUserOfPendingUpdates(
     }
   }
 
-  await markNotified(supabase, result.notifiedUpdateIds);
+  await markNotified(userId, result.notifiedUpdateIds);
   return result;
 }
 
-async function markNotified(supabase: SupabaseClient, ids: string[]): Promise<void> {
+async function markNotified(userId: string, ids: string[]): Promise<void> {
   if (ids.length === 0) return;
-  const chunkSize = 100;
-  for (let i = 0; i < ids.length; i += chunkSize) {
-    const chunk = ids.slice(i, i + chunkSize);
-    await supabase
-      .from('update_check_results')
-      .update({ notified_at: new Date().toISOString() })
-      .in('id', chunk);
-  }
+  // update_check_results exists in both backends; the adapter scopes the
+  // stamp to the owning user and chunks where the backend needs it.
+  await getDatabase().updateCheckResults.setNotifiedAt(
+    ids,
+    userId,
+    new Date().toISOString()
+  );
 }

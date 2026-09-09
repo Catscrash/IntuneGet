@@ -6,17 +6,16 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient } from '@/lib/supabase';
+import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { validateWebhookUrl } from '@/lib/webhooks/service';
 import type {
   WebhookConfiguration,
   WebhookConfigurationUpdate,
 } from '@/types/notifications';
-import type { Database } from '@/types/database';
+import type { DatabaseAdapter } from '@/lib/db/types';
 
-type WebhookConfigurationDatabaseUpdate =
-  Database['public']['Tables']['webhook_configurations']['Update'];
+type WebhookPatch = Parameters<DatabaseAdapter['webhooks']['update']>[2];
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -38,26 +37,15 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     const { id } = await params;
 
-    const supabase = createServerClient();
+    // Scoped to the owning user in the query: the id is the only thing the
+    // client sends, so one user must not be able to read another's webhook -
+    // secret included - by guessing it.
+    const webhook = await getDatabase().webhooks.getById(id, user.userId);
 
-    // Get webhook configuration
-    const { data: webhook, error } = await supabase
-      .from('webhook_configurations')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', user.userId)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return NextResponse.json(
-          { error: 'Webhook not found' },
-          { status: 404 }
-        );
-      }
+    if (!webhook) {
       return NextResponse.json(
-        { error: 'Failed to fetch webhook' },
-        { status: 500 }
+        { error: 'Webhook not found' },
+        { status: 404 }
       );
     }
 
@@ -115,27 +103,11 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       );
     }
 
-    const supabase = createServerClient();
+    const db = getDatabase();
 
-    // Verify ownership
-    const { data: existing, error: fetchError } = await supabase
-      .from('webhook_configurations')
-      .select('id')
-      .eq('id', id)
-      .eq('user_id', user.userId)
-      .single();
-
-    if (fetchError || !existing) {
-      return NextResponse.json(
-        { error: 'Webhook not found' },
-        { status: 404 }
-      );
-    }
-
-    // Build update data
-    const updateData: WebhookConfigurationDatabaseUpdate = {
-      updated_at: new Date().toISOString(),
-    };
+    // Only the fields the client actually sent; the adapter leaves the rest of
+    // the row alone and stamps updated_at itself.
+    const updateData: WebhookPatch = {};
 
     if (body.name !== undefined) updateData.name = body.name.trim();
     if (body.url !== undefined) updateData.url = body.url;
@@ -148,18 +120,14 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       updateData.secret = body.secret;
     }
 
-    // Update webhook
-    const { data: webhook, error } = await supabase
-      .from('webhook_configurations')
-      .update(updateData)
-      .eq('id', id)
-      .select()
-      .single();
+    // The update is itself scoped to the owner, so a webhook belonging to
+    // someone else reads as "not found" rather than being written to.
+    const webhook = await db.webhooks.update(id, user.userId, updateData);
 
-    if (error) {
+    if (!webhook) {
       return NextResponse.json(
-        { error: 'Failed to update webhook' },
-        { status: 500 }
+        { error: 'Webhook not found' },
+        { status: 404 }
       );
     }
 
@@ -194,19 +162,14 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     const { id } = await params;
 
-    const supabase = createServerClient();
+    // Scoped to the owning user, so someone else's webhook reads as
+    // "not found" rather than being removed.
+    const deleted = await getDatabase().webhooks.deleteById(id, user.userId);
 
-    // Delete webhook (will automatically fail if not owned by user due to WHERE clause)
-    const { error } = await supabase
-      .from('webhook_configurations')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', user.userId);
-
-    if (error) {
+    if (!deleted) {
       return NextResponse.json(
-        { error: 'Failed to delete webhook' },
-        { status: 500 }
+        { error: 'Webhook not found' },
+        { status: 404 }
       );
     }
 

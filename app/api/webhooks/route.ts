@@ -5,7 +5,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient } from '@/lib/supabase';
+import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { validateWebhookUrl, detectWebhookType } from '@/lib/webhooks/service';
 import type {
@@ -27,24 +27,15 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const supabase = createServerClient();
-
-    // Get user's webhook configurations
-    const { data: webhooks, error } = await supabase
-      .from('webhook_configurations')
-      .select('*')
-      .eq('user_id', user.userId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      return NextResponse.json(
-        { error: 'Failed to fetch webhooks' },
-        { status: 500 }
-      );
-    }
+    // Webhooks go through the db abstraction: only storing them ever needed
+    // Supabase, and delivery in lib/webhooks/service.ts is plain logic - so
+    // this works in a self-hosted SQLite install too. It previously called
+    // createServerClient() unconditionally, which throws without Supabase and
+    // surfaced as a bare "Internal server error" in the UI.
+    const webhooks = await getDatabase().webhooks.getByUserId(user.userId);
 
     // Mask secrets in response
-    const sanitizedWebhooks = (webhooks || []).map((webhook: WebhookConfiguration) => ({
+    const sanitizedWebhooks = webhooks.map((webhook: WebhookConfiguration) => ({
       ...webhook,
       secret: webhook.secret ? '********' : null,
     }));
@@ -113,50 +104,25 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const supabase = createServerClient();
+    const db = getDatabase();
 
     // Check webhook limit (max 10 per user)
-    const { count, error: countError } = await supabase
-      .from('webhook_configurations')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', user.userId);
-
-    if (countError) {
-      return NextResponse.json(
-        { error: 'Failed to create webhook' },
-        { status: 500 }
-      );
-    }
-
-    if (count !== null && count >= 10) {
+    if ((await db.webhooks.countByUserId(user.userId)) >= 10) {
       return NextResponse.json(
         { error: 'Maximum of 10 webhooks allowed per user' },
         { status: 400 }
       );
     }
 
-    // Create webhook
-    const { data: webhook, error } = await supabase
-      .from('webhook_configurations')
-      .insert({
-        user_id: user.userId,
-        name: body.name.trim(),
-        url: body.url,
-        webhook_type: webhookType,
-        secret: body.secret || null,
-        headers: body.headers || {},
-        is_enabled: body.is_enabled ?? true,
-        failure_count: 0,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return NextResponse.json(
-        { error: 'Failed to create webhook' },
-        { status: 500 }
-      );
-    }
+    const webhook = await db.webhooks.create({
+      user_id: user.userId,
+      name: body.name.trim(),
+      url: body.url,
+      webhook_type: webhookType,
+      secret: body.secret || null,
+      headers: body.headers || {},
+      is_enabled: body.is_enabled ?? true,
+    });
 
     // Mask secret in response
     const sanitizedWebhook = {

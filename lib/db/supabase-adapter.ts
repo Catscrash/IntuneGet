@@ -10,6 +10,7 @@ import type {
   UpdateCheckResult,
   UpdatePolicyRecord,
   UploadHistoryRecord,
+  WebhookConfigurationRecord,
   JobStats,
 } from './types';
 import type { PostgrestError } from '@supabase/supabase-js';
@@ -774,6 +775,37 @@ export const supabaseDb: DatabaseAdapter = {
 
       return (data as unknown as UpdateCheckResult) || null;
     },
+
+    async setNotifiedAt(
+      ids: string[],
+      userId: string,
+      notifiedAt: string
+    ): Promise<number> {
+      if (ids.length === 0) return 0;
+      const supabase = createServerClient();
+      let stamped = 0;
+
+      // Chunked: the id list is as long as the user has pending updates, and
+      // a single .in() with thousands of values is rejected.
+      const chunkSize = 100;
+      for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize);
+        const { data, error } = await supabase
+          .from('update_check_results')
+          .update({ notified_at: notifiedAt } as never)
+          .in('id', chunk)
+          .eq('user_id', userId)
+          .select('id');
+
+        if (isError(error)) {
+          console.error('Error marking updates notified:', error);
+          throw error;
+        }
+        stamped += (data as unknown as unknown[] | null)?.length ?? 0;
+      }
+
+      return stamped;
+    },
   },
 
   updatePolicies: {
@@ -928,6 +960,133 @@ export const supabaseDb: DatabaseAdapter = {
 
       if (isError(error)) {
         console.error('Error deleting update policy:', error);
+        throw error;
+      }
+
+      return Boolean(data);
+    },
+  },
+
+  webhooks: {
+    async getByUserId(userId: string): Promise<WebhookConfigurationRecord[]> {
+      const { data, error } = await createServerClient()
+        .from('webhook_configurations')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (isError(error)) {
+        console.error('Error fetching webhooks:', error);
+        throw error;
+      }
+
+      return (data as unknown as WebhookConfigurationRecord[]) || [];
+    },
+
+    async getEnabledByUserId(userId: string): Promise<WebhookConfigurationRecord[]> {
+      const { data, error } = await createServerClient()
+        .from('webhook_configurations')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('is_enabled', true)
+        .order('created_at', { ascending: false });
+
+      if (isError(error)) {
+        console.error('Error fetching enabled webhooks:', error);
+        throw error;
+      }
+
+      return (data as unknown as WebhookConfigurationRecord[]) || [];
+    },
+
+    async getById(id: string, userId: string): Promise<WebhookConfigurationRecord | null> {
+      const { data, error } = await createServerClient()
+        .from('webhook_configurations')
+        .select('*')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error fetching webhook:', error);
+        throw error;
+      }
+
+      return (data as unknown as WebhookConfigurationRecord) || null;
+    },
+
+    async countByUserId(userId: string): Promise<number> {
+      const { count, error } = await createServerClient()
+        .from('webhook_configurations')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', userId);
+
+      if (isError(error)) {
+        console.error('Error counting webhooks:', error);
+        throw error;
+      }
+
+      return count ?? 0;
+    },
+
+    async create(
+      webhook: Parameters<DatabaseAdapter['webhooks']['create']>[0]
+    ): Promise<WebhookConfigurationRecord> {
+      const { data, error } = await createServerClient()
+        .from('webhook_configurations')
+        .insert({
+          user_id: webhook.user_id,
+          name: webhook.name,
+          url: webhook.url,
+          webhook_type: webhook.webhook_type,
+          secret: webhook.secret ?? null,
+          headers: webhook.headers ?? {},
+          is_enabled: webhook.is_enabled !== false,
+          failure_count: 0,
+        } as never)
+        .select()
+        .single();
+
+      if (isError(error)) {
+        console.error('Error creating webhook:', error);
+        throw error;
+      }
+
+      return data as unknown as WebhookConfigurationRecord;
+    },
+
+    async update(
+      id: string,
+      userId: string,
+      data: Partial<Omit<WebhookConfigurationRecord, 'id' | 'user_id' | 'created_at'>>
+    ): Promise<WebhookConfigurationRecord | null> {
+      const { data: row, error } = await createServerClient()
+        .from('webhook_configurations')
+        .update({ ...data, updated_at: new Date().toISOString() } as never)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select()
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error updating webhook:', error);
+        throw error;
+      }
+
+      return (row as unknown as WebhookConfigurationRecord) || null;
+    },
+
+    async deleteById(id: string, userId: string): Promise<boolean> {
+      const { data, error } = await createServerClient()
+        .from('webhook_configurations')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select('id')
+        .maybeSingle();
+
+      if (isError(error)) {
+        console.error('Error deleting webhook:', error);
         throw error;
       }
 
