@@ -161,6 +161,12 @@ interface CartItemBase {
 
   // Explicit acknowledgement of a failed QA result for this exact version.
   qaOverride?: boolean;
+  /**
+   * Waive a VirusTotal finding for this package. Separate from qaOverride so
+   * accepting a failed installation test never silently accepts an antivirus
+   * finding as well.
+   */
+  securityOverride?: boolean;
 
   // Update policy chosen during deployment configuration. Absent = "Notify"
   // (default): no policy row is written on deploy, preserving any policy set

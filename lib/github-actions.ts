@@ -54,6 +54,8 @@ export interface WorkflowInputs {
   installScope?: 'machine' | 'user'; // Install scope for per-user vs per-machine
   forceCreate?: boolean; // Skip duplicate check and force create new app
   qaOverride?: boolean; // Server-side QA acknowledgement; never forwarded to GitHub
+  securityOverride?: boolean; // Server-side only, like qaOverride
+  maliciousThreshold?: number; // Operator setting; server-side only
   sourceIntuneAppId?: string; // Previous app ID for assignment carry-over
   carryOverAssignments?: boolean; // Copy assignments from previous app
   removeAssignmentsFromPreviousApp?: boolean; // Remove assignments from previous app after carry-over
@@ -276,6 +278,8 @@ export async function triggerPackagingWorkflow(
     packageProfileSha256,
     requirePassed: options?.requireQaPass,
     qaOverride: inputs.qaOverride,
+    securityOverride: inputs.securityOverride,
+    maliciousThreshold: inputs.maliciousThreshold,
     sourceType: inputs.sourceType,
   });
 

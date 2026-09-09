@@ -1,4 +1,5 @@
 import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
+import { resolveVirusTotalMaliciousThreshold } from '@/types/user-settings';
 /**
  * Package API Route
  * Queues packaging jobs by triggering GitHub Actions workflows
@@ -185,8 +186,13 @@ export async function POST(request: NextRequest) {
     // per-cart choice, so it is stamped onto every item once here. The whole
     // item becomes the job's package_config further down, so each of the job
     // creation paths below inherits it without repeating the lookup.
-    const allowAvailableUninstall = Boolean(
-      (await db.userSettings.get(userId))?.allowAvailableUninstall
+    const operatorSettings = await db.userSettings.get(userId);
+    const allowAvailableUninstall = Boolean(operatorSettings?.allowAvailableUninstall);
+    // How many VirusTotal engines must flag an installer before packaging is
+    // refused. An operator house rule like the settings above, not a per-app
+    // choice - a package waived case by case uses securityOverride instead.
+    const maliciousThreshold = resolveVirusTotalMaliciousThreshold(
+      operatorSettings?.virusTotalMaliciousThreshold
     );
     for (const item of items) {
       (item as { allowAvailableUninstall?: boolean }).allowAvailableUninstall =
@@ -632,6 +638,8 @@ export async function POST(request: NextRequest) {
                   architecture: item.architecture,
                   installerSha256,
                   qaOverride: isQaMaintenanceMode() || item.qaOverride,
+                  securityOverride: item.securityOverride,
+                  maliciousThreshold,
                   sourceType: item.sourceType,
                 });
               } catch (error) {
@@ -814,6 +822,8 @@ export async function POST(request: NextRequest) {
               installScope: item.installScope,
               forceCreate: item.forceCreate || forceCreate,
               qaOverride: isQaMaintenanceMode() || item.qaOverride,
+              securityOverride: item.securityOverride,
+              maliciousThreshold,
               sourceType: item.sourceType,
             };
 

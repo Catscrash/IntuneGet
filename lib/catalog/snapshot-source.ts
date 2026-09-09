@@ -626,7 +626,8 @@ export class SnapshotCatalogSource implements CatalogSource {
         return db
           .prepare(
             `SELECT winget_id, outcome, tested_version, architecture, tested_at_utc,
-                    test_level, package_profile_sha256
+                    test_level, package_profile_sha256,
+                    virustotal_malicious, virustotal_total_engines
              FROM qa_results
              WHERE test_level = 'psadt-package' AND winget_id IN (${placeholders})`
           )

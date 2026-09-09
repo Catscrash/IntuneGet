@@ -29,6 +29,8 @@ export function toQaStatus(row: {
   tested_at_utc: string;
   test_level: QaStatus['testLevel'];
   package_profile_sha256: string | null;
+  virustotal_malicious?: number | null;
+  virustotal_total_engines?: number | null;
 }): QaStatus {
   return {
     outcome: row.outcome,
@@ -37,6 +39,8 @@ export function toQaStatus(row: {
     testedAtUtc: row.tested_at_utc,
     testLevel: row.test_level,
     packageProfileSha256: row.package_profile_sha256 || undefined,
+    maliciousEngines: row.virustotal_malicious ?? undefined,
+    totalEngines: row.virustotal_total_engines ?? undefined,
   };
 }
 

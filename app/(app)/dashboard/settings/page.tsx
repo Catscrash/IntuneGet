@@ -20,6 +20,7 @@ import {
   Check,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { MAX_VIRUSTOTAL_MALICIOUS_THRESHOLD } from '@/types/user-settings';
 import { useMicrosoftAuth } from '@/hooks/useMicrosoftAuth';
 import { PageHeader } from '@/components/dashboard';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -30,7 +31,7 @@ import { useCartStore } from '@/stores/cart-store';
 import { clearConsentPending, isConsentPending } from '@/components/AdminConsentBanner';
 
 type SettingsTab = 'general' | 'permissions' | 'notifications' | 'exports' | 'data';
-type PreferenceKey = 'cart' | 'assignments' | 'supersedence' | 'availableUninstall';
+type PreferenceKey = 'cart' | 'assignments' | 'supersedence' | 'availableUninstall' | 'malicious';
 
 type PermissionErrorType =
   | 'missing_credentials'
@@ -77,7 +78,7 @@ export default function SettingsPage() {
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [activePreferenceSave, setActivePreferenceSave] = useState<PreferenceKey | null>(null);
   const [lastUpdatedPreference, setLastUpdatedPreference] = useState<PreferenceKey | null>(null);
-  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp, setAllowAvailableUninstall } = useUserSettings();
+  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp, setAllowAvailableUninstall, setVirusTotalMaliciousThreshold } = useUserSettings();
   const autoOpenOnAdd = userSettings.cartAutoOpenOnAdd;
   const setAutoOpenOnAddStore = useCartStore((state) => state.setAutoOpenOnAdd);
   const handleCartToggle = useCallback(
@@ -118,6 +119,19 @@ export default function SettingsPage() {
       }
     },
     [setSupersedePreviousApp]
+  );
+
+  const handleMaliciousThresholdChange = useCallback(
+    async (value: number) => {
+      setActivePreferenceSave('malicious');
+      setLastUpdatedPreference('malicious');
+      try {
+        await setVirusTotalMaliciousThreshold(value);
+      } finally {
+        setActivePreferenceSave(null);
+      }
+    },
+    [setVirusTotalMaliciousThreshold]
   );
 
   const handleAvailableUninstallToggle = useCallback(
@@ -542,6 +556,42 @@ export default function SettingsPage() {
                           <span className="text-xs text-text-muted"><T>Saving...</T></span>
                         )}
                         {!isSaving && syncError && lastUpdatedPreference === 'availableUninstall' && (
+                          <span className="text-xs text-status-warning"><T>Saved locally</T></span>
+                        )}
+                      </div>
+                    </div>
+                  </motion.section>
+
+                  {/* Antivirus threshold card */}
+                  <motion.section
+                    variants={itemVariants}
+                    className="glass-light rounded-xl p-6 border border-overlay/5 hover:border-accent-cyan/20 transition-colors"
+                  >
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-text-primary font-medium"><T>Block on antivirus findings</T></p>
+                        <p className="text-sm text-text-muted">
+                          <T>How many VirusTotal engines must flag an installer before packaging is refused. A single engine is often a false positive on legitimate software. Set to 0 to never block on this.</T>
+                        </p>
+                      </div>
+                      <div className="flex min-w-28 flex-col items-end gap-1">
+                        <input
+                          type="number"
+                          min={0}
+                          max={MAX_VIRUSTOTAL_MALICIOUS_THRESHOLD}
+                          step={1}
+                          value={userSettings.virusTotalMaliciousThreshold}
+                          onChange={(event) =>
+                            void handleMaliciousThresholdChange(Number(event.target.value))
+                          }
+                          disabled={isSaving && activePreferenceSave !== 'malicious'}
+                          aria-label="Antivirus engine threshold"
+                          className="w-20 rounded-lg border border-overlay/10 bg-transparent px-3 py-2 text-right text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan disabled:opacity-50"
+                        />
+                        {isSaving && activePreferenceSave === 'malicious' && (
+                          <span className="text-xs text-text-muted"><T>Saving...</T></span>
+                        )}
+                        {!isSaving && syncError && lastUpdatedPreference === 'malicious' && (
                           <span className="text-xs text-status-warning"><T>Saved locally</T></span>
                         )}
                       </div>

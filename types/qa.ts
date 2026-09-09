@@ -203,6 +203,12 @@ export interface QaStatusRow {
   tested_at_utc: string;
   test_level: QaTestLevel;
   package_profile_sha256: string | null;
+  /**
+   * Engines that flagged this installer, and how many ran. Optional: a
+   * snapshot built before these columns existed simply has neither.
+   */
+  virustotal_malicious?: number | null;
+  virustotal_total_engines?: number | null;
 }
 
 export interface QaCandidateStatusRow {
@@ -256,6 +262,13 @@ export interface QaStatus {
   installerSha256?: string;
   testLevel: QaTestLevel;
   packageProfileSha256?: string;
+  /**
+   * Antivirus finding for this exact installer. Carried to the client so the
+   * cart can warn - and offer a deliberate waiver - before a deployment is
+   * attempted, rather than only after the gate refuses it.
+   */
+  maliciousEngines?: number;
+  totalEngines?: number;
 }
 
 export type QaBadgeState =

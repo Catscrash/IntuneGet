@@ -40,6 +40,8 @@ import {
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
 import { useQaStatuses } from '@/hooks/use-qa';
+import { useUserSettings } from '@/components/providers/UserSettingsProvider';
+import { resolveVirusTotalMaliciousThreshold } from '@/types/user-settings';
 const QaDetailsDialog = dynamic(() => import('@/components/qa/QaDetailsDialog').then(m => m.QaDetailsDialog));
 import type { QaStatus } from '@/types/qa';
 
@@ -99,6 +101,30 @@ interface PackageApiErrorResponse {
   };
 }
 
+/**
+ * The antivirus finding for this exact package, if the operator's threshold
+ * would refuse it.
+ *
+ * Mirrors the server-side gate: same version and architecture, and a count at
+ * or above the threshold. A threshold of 0 turns the check off entirely.
+ */
+function securityFindingForItem(
+  item: CartItem,
+  status: QaStatus | null | undefined,
+  threshold: number
+): { malicious: number; total?: number } | null {
+  if (threshold <= 0 || !status || !isWin32CartItem(item)) return null;
+  const malicious = status.maliciousEngines ?? 0;
+  if (
+    malicious < threshold ||
+    status.testedVersion !== item.version ||
+    status.architecture.toLowerCase() !== item.architecture.toLowerCase()
+  ) {
+    return null;
+  }
+  return { malicious, total: status.totalEngines };
+}
+
 function hasFailedQaForItem(item: CartItem, status: QaStatus | null | undefined): boolean {
   return Boolean(
     status &&
@@ -111,6 +137,12 @@ function hasFailedQaForItem(item: CartItem, status: QaStatus | null | undefined)
 
 export function UploadCart() {
   const router = useRouter();
+  const { settings: userSettings } = useUserSettings();
+  // The same operator setting the server gate uses, so the cart warns about
+  // exactly the packages the deployment would refuse - no more, no less.
+  const maliciousThreshold = resolveVirusTotalMaliciousThreshold(
+    userSettings?.virusTotalMaliciousThreshold
+  );
   const items = useCartStore((state) => state.items);
   const isOpen = useCartStore((state) => state.isOpen);
   const toggleCart = useCartStore((state) => state.toggleCart);
@@ -454,7 +486,58 @@ export function UploadCart() {
                             Test override
                           </span>
                         )}
+                        {item.securityOverride && (
+                          <span className="inline-flex items-center gap-1 rounded border border-status-error/20 bg-status-error/10 px-2 py-1 text-xs font-medium text-status-error">
+                            <ShieldAlert className="h-3 w-3" />
+                            Security override
+                          </span>
+                        )}
                       </div>
+
+                      {(() => {
+                        const finding = securityFindingForItem(
+                          item,
+                          qaStatusesData?.statuses[item.wingetId],
+                          maliciousThreshold
+                        );
+                        if (!finding || item.securityOverride) return null;
+                        return (
+                          <div className="mt-3 flex items-start gap-2 rounded-lg border border-status-error/20 bg-status-error/10 p-2.5">
+                            <ShieldAlert className="mt-0.5 h-4 w-4 flex-shrink-0 text-status-error" />
+                            <div className="flex-1 text-xs">
+                              <p className="font-medium text-status-error">
+                                Antivirus engines flagged this installer
+                              </p>
+                              <p className="mt-0.5 text-text-secondary">
+                                {finding.malicious}
+                                {finding.total ? ` of ${finding.total}` : ''} engine
+                                {finding.malicious === 1 ? '' : 's'} flagged version {item.version}.
+                                A small count is often a false positive, but confirm the source
+                                before deploying.
+                              </p>
+                              <div className="mt-2 flex flex-wrap gap-3">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setQaDetailsTarget({ wingetId: item.wingetId, version: item.version })
+                                  }
+                                  className="font-medium text-status-error underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-error"
+                                >
+                                  View test details
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateItem(item.id, { securityOverride: true })}
+                                  disabled={isDeploying}
+                                  className="font-medium text-status-error underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-error disabled:opacity-50"
+                                >
+                                  Accept the finding and deploy
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       {hasFailedQaForItem(item, qaStatusesData?.statuses[item.wingetId]) && !item.qaOverride && (
                         <div className="mt-3 flex items-start gap-2 rounded-lg border border-status-error/20 bg-status-error/10 p-2.5">

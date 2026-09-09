@@ -15,6 +15,7 @@ import { useSidebarStore } from "@/stores/sidebar-store";
 import { getUserSettings, patchUserSettings } from "@/lib/user-settings";
 import {
   DEFAULT_USER_SETTINGS,
+  resolveVirusTotalMaliciousThreshold,
   type ThemeMode,
   type ViewMode,
   type UserSettings,
@@ -37,6 +38,7 @@ type UserSettingsContextValue = {
   setCarryOverAssignments: (enabled: boolean) => Promise<void>;
   setSupersedePreviousApp: (enabled: boolean) => Promise<void>;
   setAllowAvailableUninstall: (enabled: boolean) => Promise<void>;
+  setVirusTotalMaliciousThreshold: (threshold: number) => Promise<void>;
 };
 
 const UserSettingsContext = createContext<UserSettingsContextValue | null>(null);
@@ -471,6 +473,17 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
     [updateSettings]
   );
 
+  const setVirusTotalMaliciousThreshold = useCallback(
+    async (threshold: number) => {
+      // Normalise here as well as on the server: the value comes from a number
+      // input, so it can arrive empty or fractional.
+      await updateSettings({
+        virusTotalMaliciousThreshold: resolveVirusTotalMaliciousThreshold(threshold),
+      });
+    },
+    [updateSettings]
+  );
+
   const value = useMemo<UserSettingsContextValue>(
     () => ({
       settings,
@@ -488,6 +501,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setCarryOverAssignments,
       setSupersedePreviousApp,
       setAllowAvailableUninstall,
+      setVirusTotalMaliciousThreshold,
     }),
     [
       hasStoredSettings,
@@ -504,6 +518,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setCarryOverAssignments,
       setSupersedePreviousApp,
       setAllowAvailableUninstall,
+      setVirusTotalMaliciousThreshold,
       syncError,
     ]
   );

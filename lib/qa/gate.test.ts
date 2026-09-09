@@ -247,6 +247,73 @@ describe('enforceQaGate', () => {
     ).resolves.toBeUndefined();
   });
 
+  describe('operator threshold and security override', () => {
+    beforeEach(() => {
+      serverClientMock.mockReturnValue(null);
+      getQaResultMock.mockResolvedValue({
+        ...failedRow,
+        outcome: 'Passed',
+        virustotal_status: 'flagged',
+        virustotal_malicious: 2,
+        virustotal_total_engines: 75,
+      });
+    });
+
+    const flagged = {
+      wingetId: 'OpenJS.NodeJS',
+      version: '26.7.0',
+      architecture: 'x64',
+      installerSha256,
+    };
+
+    it('blocks at the default threshold of one engine', async () => {
+      await expect(enforceQaGate(flagged)).rejects.toBeInstanceOf(QaSecurityGateError);
+    });
+
+    it('lets a count below the operator threshold through', async () => {
+      // 2 of 75 engines is where antivirus false positives live; an operator
+      // who raised the bar to 3 has decided that is noise.
+      await expect(
+        enforceQaGate({ ...flagged, maliciousThreshold: 3 })
+      ).resolves.toBeUndefined();
+    });
+
+    it('still blocks once the count reaches the operator threshold', async () => {
+      await expect(
+        enforceQaGate({ ...flagged, maliciousThreshold: 2 })
+      ).rejects.toBeInstanceOf(QaSecurityGateError);
+    });
+
+    it('checks nothing at a threshold of zero', async () => {
+      await expect(
+        enforceQaGate({ ...flagged, maliciousThreshold: 0 })
+      ).resolves.toBeUndefined();
+    });
+
+    it('honours an explicit security override', async () => {
+      await expect(
+        enforceQaGate({ ...flagged, securityOverride: true })
+      ).resolves.toBeUndefined();
+    });
+
+    it('does not let the QA override waive a security finding', async () => {
+      // The two are separate decisions: accepting a failed installation test
+      // must not silently accept an antivirus finding as well.
+      await expect(
+        enforceQaGate({ ...flagged, qaOverride: true })
+      ).rejects.toBeInstanceOf(QaSecurityGateError);
+    });
+
+    it('does not let the security override waive a failed installation test', async () => {
+      // ... and the reverse, so neither override widens beyond its own scope.
+      getQaResultMock.mockResolvedValue({ ...failedRow, virustotal_malicious: null });
+
+      await expect(
+        enforceQaGate({ ...flagged, securityOverride: true })
+      ).rejects.toBeInstanceOf(QaGateError);
+    });
+  });
+
   describe('without Supabase (self-hosted, catalog snapshot only)', () => {
     // qa_results ships in the published catalog snapshot, so a self-hosted
     // install can honour the same verdicts the hosted one does. The

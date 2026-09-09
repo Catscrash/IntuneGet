@@ -21,6 +21,11 @@ vi.mock('@/hooks/useMspOptional', () => ({ useMspOptional: () => ({ isMspUser: f
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }));
 vi.mock('next/dynamic', () => ({ default: () => () => null }));
 vi.mock('@/components/AdminConsentBanner', () => ({ clearConsentPending: vi.fn(), isConsentPending: () => false }));
+// The cart reads the operator's antivirus threshold; this test is about
+// permission refetching, so stub the settings rather than mount the provider.
+vi.mock('@/components/providers/UserSettingsProvider', () => ({
+  useUserSettings: () => ({ settings: { virusTotalMaliciousThreshold: 1 } }),
+}));
 import { UploadCart } from './UploadCart';
 import { useCartStore } from '@/stores/cart-store';
 

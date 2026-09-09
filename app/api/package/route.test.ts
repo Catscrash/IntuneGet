@@ -543,6 +543,51 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(body.message).toContain(body.errors[0].error);
   });
 
+  it('passes the operator threshold and the per-app security override to the gate', async () => {
+    // The threshold is a house rule from settings; the override is the
+    // operator accepting one specific finding. Both have to reach the gate,
+    // or the setting is decorative and the waiver never takes effect.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    getUserSettingsMock.mockResolvedValue({ virusTotalMaliciousThreshold: 4 });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item({ securityOverride: true })] }),
+    });
+
+    await POST(request);
+
+    expect(enforceQaGateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ maliciousThreshold: 4, securityOverride: true })
+    );
+  });
+
+  it('falls back to the default threshold when the operator saved none', async () => {
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    getUserSettingsMock.mockResolvedValue(null);
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    await POST(request);
+
+    expect(enforceQaGateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ maliciousThreshold: 1, securityOverride: undefined })
+    );
+  });
+
   it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
     // With Supabase, ensureQaDemand already decides the job's QA state; gating
     // again here would double-report the same verdict.

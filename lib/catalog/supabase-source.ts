@@ -442,7 +442,7 @@ export class SupabaseCatalogSource implements CatalogSource {
     const { data, error } = await supabase
       .from('qa_results')
       .select(
-        'winget_id, outcome, tested_version, architecture, tested_at_utc, test_level, package_profile_sha256'
+        'winget_id, outcome, tested_version, architecture, tested_at_utc, test_level, package_profile_sha256, virustotal_malicious, virustotal_total_engines'
       )
       .in('winget_id', ids)
       .eq('test_level', 'psadt-package');

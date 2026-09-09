@@ -132,10 +132,26 @@ export async function enforceQaGate(input: {
   packageProfileSha256?: string;
   requirePassed?: boolean;
   qaOverride?: boolean;
+  /**
+   * Waive a VirusTotal verdict for this package. Deliberately separate from
+   * qaOverride: accepting a failed installation test is a different decision
+   * from accepting an antivirus finding, and one must not silently carry the
+   * other.
+   */
+  securityOverride?: boolean;
+  /**
+   * How many engines must flag the installer before packaging is refused.
+   * 0 disables the check. Defaults to 1 when the caller has no operator
+   * setting to hand, which is the behaviour this gate has always had.
+   */
+  maliciousThreshold?: number;
   sourceType?: 'winget' | 'custom';
 }): Promise<void> {
   if (input.sourceType === 'custom') return;
 
+  // 0 means "do not check", so it has to survive the ?? below rather than be
+  // treated as absent.
+  const maliciousThreshold = input.maliciousThreshold ?? 1;
   const architecture = (input.architecture || 'x64').toLowerCase();
   const installerSha256 = input.installerSha256?.trim().toUpperCase() || '';
   const packageProfileSha256 = input.packageProfileSha256?.trim().toUpperCase() || '';
@@ -170,7 +186,7 @@ export async function enforceQaGate(input: {
 
   // Security gate: a malicious VirusTotal verdict for this exact installer
   // blocks packaging even when the installability gate is overridden.
-  if (installerSha256 && supabase) {
+  if (installerSha256 && supabase && maliciousThreshold > 0 && !input.securityOverride) {
     const { data: securityRow, error: securityError } = await supabase
       .from('qa_package_results')
       .select('virustotal_malicious, virustotal_total_engines')
@@ -178,7 +194,7 @@ export async function enforceQaGate(input: {
       .eq('tested_version', input.version)
       .eq('architecture', architecture)
       .eq('installer_sha256', installerSha256)
-      .gte('virustotal_malicious', 1)
+      .gte('virustotal_malicious', maliciousThreshold)
       .order('tested_at_utc', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -186,7 +202,7 @@ export async function enforceQaGate(input: {
       throw new Error(`Could not read the installer security verdict: ${securityError.message}`);
     }
     const malicious = (securityRow?.virustotal_malicious as number | null) ?? 0;
-    if (malicious >= 1) {
+    if (malicious >= maliciousThreshold) {
       throw new QaSecurityGateError({
         wingetId: input.wingetId,
         version: input.version,
@@ -206,7 +222,11 @@ export async function enforceQaGate(input: {
   // would let a malicious verdict for another architecture slip past a caller
   // that did not name one, while the verdict check below would still see it.
   if (catalogRow && matchesRequestedPackage(catalogRow, input.wingetId, input.version, input.architecture)) {
-    throwIfCatalogVerdictBlocks(catalogRow, { securityOnly: true });
+    throwIfCatalogVerdictBlocks(catalogRow, {
+      securityOnly: true,
+      maliciousThreshold,
+      securityOverride: input.securityOverride,
+    });
   }
 
   if (!input.requirePassed && input.qaOverride) return;
@@ -244,7 +264,10 @@ export async function enforceQaGate(input: {
     return;
   }
 
-  throwIfCatalogVerdictBlocks(row);
+  throwIfCatalogVerdictBlocks(row, {
+    maliciousThreshold,
+    securityOverride: input.securityOverride,
+  });
 }
 
 /**
@@ -277,9 +300,19 @@ function matchesRequestedPackage(
  */
 function throwIfCatalogVerdictBlocks(
   row: QaResultRow,
-  options?: { securityOnly?: boolean }
+  options?: {
+    securityOnly?: boolean;
+    maliciousThreshold?: number;
+    securityOverride?: boolean;
+  }
 ): void {
-  if ((row.virustotal_malicious ?? 0) >= 1) {
+  const maliciousThreshold = options?.maliciousThreshold ?? 1;
+  const blocksOnSecurity =
+    maliciousThreshold > 0 &&
+    !options?.securityOverride &&
+    (row.virustotal_malicious ?? 0) >= maliciousThreshold;
+
+  if (blocksOnSecurity) {
     throw new QaSecurityGateError({
       wingetId: row.winget_id,
       version: row.tested_version,
