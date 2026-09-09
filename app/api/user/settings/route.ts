@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
-import { DEFAULT_USER_SETTINGS } from '@/types/user-settings';
+import { DEFAULT_USER_SETTINGS, resolveVirusTotalMaliciousThreshold } from '@/types/user-settings';
 import type { UserSettings, UserSettingsUpdate } from '@/types/user-settings';
 
 function isBoolean(value: unknown): value is boolean {
@@ -65,6 +65,15 @@ function sanitizeSettings(payload: Record<string, unknown>): UserSettingsUpdate 
 
   if (isBoolean(payload.allowAvailableUninstall)) {
     updates.allowAvailableUninstall = payload.allowAvailableUninstall;
+  }
+
+  // Not a boolean like the rest, and it is read back through the same
+  // sanitizer - so a key missing here is dropped on save *and* on load, and
+  // the setting silently has no effect.
+  if (payload.virusTotalMaliciousThreshold !== undefined) {
+    updates.virusTotalMaliciousThreshold = resolveVirusTotalMaliciousThreshold(
+      payload.virusTotalMaliciousThreshold
+    );
   }
 
   return updates;
