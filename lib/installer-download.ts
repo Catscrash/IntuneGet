@@ -305,6 +305,13 @@ async function readRangeMetadata(
       method: 'HEAD',
       headers,
       signal,
+      // Behind a proxy this doubles as the CONNECT budget: Node reads the
+      // tunnel timeout from the request options, not from setTimeout() below,
+      // and defaults it to 5s. A cold tunnel through a corporate proxy can
+      // take longer than that, which surfaced as "Connection to establish
+      // proxy tunnel timed out after 5000ms" no matter how generous the
+      // timeout passed here was.
+      timeout: timeoutMs,
     };
     const request = url.protocol === 'https:'
       ? https.request({ ...commonOptions, servername: url.hostname }, onResponse)
@@ -389,6 +396,13 @@ async function downloadInstallerRange(
       method: 'GET',
       headers,
       signal,
+      // Behind a proxy this doubles as the CONNECT budget: Node reads the
+      // tunnel timeout from the request options, not from setTimeout() below,
+      // and defaults it to 5s. A cold tunnel through a corporate proxy can
+      // take longer than that, which surfaced as "Connection to establish
+      // proxy tunnel timed out after 5000ms" no matter how generous the
+      // timeout passed here was.
+      timeout: timeoutMs,
     };
     const request = url.protocol === 'https:'
       ? https.request({ ...commonOptions, servername: url.hostname }, onResponse)
@@ -507,6 +521,9 @@ async function readPublisherChecksum(
       headers,
       servername: url.hostname,
       signal,
+      // Same reason as above: without this the proxy tunnel gets Node's 5s
+      // default rather than the budget this request was given.
+      timeout: PUBLISHER_CHECKSUM_TIMEOUT_MS,
     }, onResponse);
     request.setTimeout(PUBLISHER_CHECKSUM_TIMEOUT_MS, () => {
       request.destroy(new Error(
@@ -731,6 +748,13 @@ async function hashUrl(
       method: 'GET',
       headers,
       signal,
+      // Behind a proxy this doubles as the CONNECT budget: Node reads the
+      // tunnel timeout from the request options, not from setTimeout() below,
+      // and defaults it to 5s. A cold tunnel through a corporate proxy can
+      // take longer than that, which surfaced as "Connection to establish
+      // proxy tunnel timed out after 5000ms" no matter how generous the
+      // timeout passed here was.
+      timeout: timeoutMs,
     };
 
     const request = url.protocol === 'https:'
