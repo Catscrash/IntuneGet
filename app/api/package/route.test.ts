@@ -481,6 +481,38 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(body.errors[0].wingetId).toBe('Test.App');
   });
 
+  it('deploys anyway when the QA verdict cannot be read, and says so', async () => {
+    // A snapshot that is missing, still downloading or unreadable says nothing
+    // about this package. Blocking on it would take down every deployment over
+    // an unrelated fault, and the operator would only see "0 jobs processed,
+    // 1 failed" with no cause anywhere.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    enforceQaGateMock.mockRejectedValue(new Error('database disk image is malformed'));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const body = await (await POST(request)).json();
+
+    expect(body.errors).toBeUndefined();
+    expect(body.jobs).toHaveLength(1);
+    expect(createMock).toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('Could not read the QA verdict'),
+      expect.any(Error)
+    );
+
+    consoleError.mockRestore();
+  });
+
   it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
     // With Supabase, ensureQaDemand already decides the job's QA state; gating
     // again here would double-report the same verdict.

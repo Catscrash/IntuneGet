@@ -635,14 +635,28 @@ export async function POST(request: NextRequest) {
                   sourceType: item.sourceType,
                 });
               } catch (error) {
-                if (!isQaGateError(error)) throw error;
-                // Reported before the job record exists, so a blocked app
-                // leaves no failed job behind for the operator to clear.
-                errors.push({
-                  wingetId: item.wingetId,
-                  error: describeQaGateError(error),
-                });
-                continue;
+                if (isQaGateError(error)) {
+                  // A real verdict. Reported before the job record exists, so
+                  // a blocked app leaves no failed job behind to clear.
+                  errors.push({
+                    wingetId: item.wingetId,
+                    error: describeQaGateError(error),
+                  });
+                  continue;
+                }
+                // Not a verdict but a failure to read one - the catalog
+                // snapshot is missing, still downloading, or unreadable. That
+                // says nothing about this package, and blocking on it would
+                // take down every deployment over an unrelated fault, with an
+                // opaque message. Self-hosted installs applied no gate at all
+                // before this check existed, so proceeding is the prior
+                // behaviour rather than a new weakening - but it must be
+                // visible, because it means the gate is not protecting
+                // anything until the snapshot is healthy again.
+                console.error(
+                  `[QA gate] Could not read the QA verdict for ${item.wingetId} ${item.version}; deploying without it.`,
+                  error
+                );
               }
             }
 
@@ -737,6 +751,10 @@ export async function POST(request: NextRequest) {
               createdAt: jobRecord?.created_at || new Date().toISOString(),
             });
           } catch (error) {
+            console.error(
+              `[package] Job creation failed for ${item.wingetId} ${item.version}:`,
+              error
+            );
             errors.push({
               wingetId: item.wingetId,
               error: error instanceof Error ? error.message : 'Unknown error',
