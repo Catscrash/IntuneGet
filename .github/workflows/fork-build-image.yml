@@ -22,9 +22,6 @@ concurrency:
   group: fork-image-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/intuneget
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,6 +31,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Resolve image name
+        id: image
+        # Docker repository names must be lowercase, and the owner is not:
+        # "ghcr.io/Catscrash/..." is rejected outright by buildx.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/intuneget" >> "$GITHUB_OUTPUT"
 
       - name: Free runner disk space
         # The repo carries ~750 MB of icons and the build adds node_modules and
@@ -59,8 +62,8 @@ jobs:
           # Two tags on purpose: the branch tag is what the deployment pulls,
           # the commit tag is what a rollback names.
           tags: |
-            ${{ env.IMAGE }}:fork-main
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:fork-main
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
           # Layer cache in the Actions cache, so an ordinary code change
           # rebuilds only the app layer rather than reinstalling npm packages.
           cache-from: type=gha
@@ -77,8 +80,8 @@ jobs:
             echo "### Image published"
             echo
             echo '```'
-            echo "${{ env.IMAGE }}:fork-main"
-            echo "${{ env.IMAGE }}:sha-${{ github.sha }}"
+            echo "${{ steps.image.outputs.name }}:fork-main"
+            echo "${{ steps.image.outputs.name }}:sha-${{ github.sha }}"
             echo '```'
             echo
             echo "Deploy on the target host:"
