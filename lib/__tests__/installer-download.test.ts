@@ -135,3 +135,59 @@ describe('installer download safety helpers', () => {
     expect(parseByteContentRange('bytes 0-100/100')).toBeNull();
   });
 });
+
+describe('proxy tunnel budget', () => {
+  // Node reads the CONNECT timeout from the request options and defaults it to
+  // 5s. Setting it only via request.setTimeout() leaves every installer request
+  // with a 5s connect budget behind a proxy, however generous the timeout the
+  // caller asked for - which showed up as "Connection to establish proxy tunnel
+  // timed out after 5000ms" on a cold tunnel.
+  it('passes the caller timeout as a request option, not only via setTimeout', async () => {
+    vi.resetModules();
+    const requestOptions: Array<Record<string, unknown>> = [];
+
+    vi.doMock('node:dns/promises', () => ({
+      lookup: vi.fn(async () => [{ address: '93.184.216.34', family: 4 }]),
+    }));
+
+    // Records the options, then fails the request immediately so the call
+    // settles instead of waiting on a response that never comes.
+    const fakeRequest = (options: Record<string, unknown>) => {
+      requestOptions.push(options);
+      const handlers: Record<string, (arg: unknown) => void> = {};
+      return {
+        setTimeout: vi.fn(),
+        on: vi.fn((event: string, handler: (arg: unknown) => void) => {
+          handlers[event] = handler;
+        }),
+        end: vi.fn(() => {
+          setImmediate(() => handlers.error?.(new Error('no network in tests')));
+        }),
+        destroy: vi.fn(),
+      };
+    };
+
+    vi.doMock('node:https', () => ({ request: vi.fn(fakeRequest) }));
+    vi.doMock('node:http', () => ({ request: vi.fn(fakeRequest) }));
+
+    const { hashRemoteInstaller } = await import('@/lib/installer-download');
+
+    // The request never completes - the mock resolves nothing - so cut it off
+    // once the options have been captured.
+    const pending = hashRemoteInstaller('https://example.com/setup.exe', {
+      timeoutMs: 1234,
+      totalTimeoutMs: 5_000,
+    }).catch(() => undefined);
+    await pending;
+
+    expect(requestOptions.length).toBeGreaterThan(0);
+    for (const options of requestOptions) {
+      expect(options.timeout).toBe(1234);
+    }
+
+    vi.doUnmock('node:https');
+    vi.doUnmock('node:http');
+    vi.doUnmock('node:dns/promises');
+    vi.resetModules();
+  });
+});
