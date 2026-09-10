@@ -4,14 +4,13 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createServerClient } from '@/lib/supabase';
+import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { sendTestWebhook } from '@/lib/webhooks/service';
 import type { WebhookConfiguration } from '@/types/notifications';
-import type { Database } from '@/types/database';
+import type { DatabaseAdapter } from '@/lib/db/types';
 
-type WebhookConfigurationUpdate =
-  Database['public']['Tables']['webhook_configurations']['Update'];
+type WebhookPatch = Parameters<DatabaseAdapter['webhooks']['update']>[2];
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -33,17 +32,14 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     const { id } = await params;
 
-    const supabase = createServerClient();
+    // Through the db abstraction like the rest of the webhook routes: only
+    // storing these ever needed Supabase, and sendTestWebhook() below does not
+    // touch a database at all. Scoped to the owning user, since the id is the
+    // only thing the client sends and the row holds an HMAC secret.
+    const db = getDatabase();
+    const webhook = await db.webhooks.getById(id, user.userId);
 
-    // Get webhook configuration
-    const { data: webhook, error: fetchError } = await supabase
-      .from('webhook_configurations')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', user.userId)
-      .single();
-
-    if (fetchError || !webhook) {
+    if (!webhook) {
       return NextResponse.json(
         { error: 'Webhook not found' },
         { status: 404 }
@@ -54,9 +50,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const result = await sendTestWebhook(webhook as WebhookConfiguration);
 
     // Update webhook status based on result
-    const statusUpdate: WebhookConfigurationUpdate = {
-      updated_at: new Date().toISOString(),
-    };
+    const statusUpdate: WebhookPatch = {};
 
     if (result.success) {
       statusUpdate.last_success_at = new Date().toISOString();
@@ -66,10 +60,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       statusUpdate.failure_count = (webhook.failure_count || 0) + 1;
     }
 
-    await supabase
-      .from('webhook_configurations')
-      .update(statusUpdate)
-      .eq('id', id);
+    await db.webhooks.update(id, user.userId, statusUpdate);
 
     return NextResponse.json({
       success: result.success,
