@@ -57,6 +57,7 @@ interface PackagingJobsSelectQuery {
 
 interface PackagingJobsUpdateQuery {
   eq(column: string, value: string): PackagingJobsUpdateQuery;
+  lt(column: string, value: string): PackagingJobsUpdateQuery;
   is(column: string, value: null): PackagingJobsUpdateQuery;
   select(): {
     single(): Promise<QueryResult<PackagingJob>>;
@@ -408,18 +409,26 @@ export const supabaseDb: DatabaseAdapter = {
     },
 
     /**
-     * Force release a stale job back to queued state (no packager_id check)
+     * Force release a stale job back to queued state after confirming it is still stale
      */
-    async forceRelease(jobId: string): Promise<PackagingJob | null> {
+    async forceRelease(jobId: string, staleThreshold?: Date): Promise<PackagingJob | null> {
       const supabase = createServerClient();
       const query = getPackagingJobsQuery(supabase);
 
-      const { data, error } = await query
+      let updateQuery = query
         .update({
           status: 'queued',
           packaging_started_at: null,
         })
-        .eq('id', jobId)
+        .eq('id', jobId);
+
+      if (staleThreshold) {
+        updateQuery = updateQuery
+          .eq('status', 'packaging')
+          .lt('packaging_started_at', staleThreshold.toISOString());
+      }
+
+      const { data, error } = await updateQuery
         .select()
         .single();
 

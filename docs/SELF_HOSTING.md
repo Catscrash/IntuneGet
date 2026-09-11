@@ -308,7 +308,8 @@ intuneget-packager --verbose
 Check the packager health endpoint:
 
 ```bash
-curl https://your-intuneget-instance.com/api/packager/health
+curl -H "Authorization: Bearer $PACKAGER_API_KEY" \
+  https://your-intuneget-instance.com/api/packager/health
 ```
 
 Expected response:

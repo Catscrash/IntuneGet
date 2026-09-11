@@ -33,7 +33,7 @@ Community endpoints use in-memory rate limiting:
 | `POST` | `/api/packager/jobs` | Packager key | Claim a queued job |
 | `PATCH` | `/api/packager/jobs` | Packager key | Heartbeat/progress/status update |
 | `DELETE` | `/api/packager/jobs` | Packager key | Release claimed job |
-| `GET` | `/api/packager/health` | none | Local packager health and stale-job recovery |
+| `GET` | `/api/packager/health` | Packager key | Local packager health and stale-job recovery |
 
 Notes:
 - `POST /api/package` limits batches to 10 items.

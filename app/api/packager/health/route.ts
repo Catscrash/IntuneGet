@@ -4,8 +4,8 @@
  * Also handles stale job recovery in SQLite mode
  */
 
-import { NextResponse } from 'next/server';
-import { getDatabase, getDatabaseMode } from '@/lib/db';
+import { NextRequest, NextResponse } from 'next/server';
+import { getDatabase, getDatabaseMode, verifyPackagerApiKey } from '@/lib/db';
 import { getFeatureFlags } from '@/lib/features';
 
 interface PackagerStats {
@@ -20,7 +20,18 @@ interface PackagerStats {
 // Stale job timeout: 5 minutes (should match packager config)
 const STALE_JOB_TIMEOUT_MS = 5 * 60 * 1000;
 
-export async function GET() {
+function verifyPackagerAuth(request: NextRequest): boolean {
+  const authHeader = request.headers.get('Authorization');
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return false;
+  }
+
+  const providedKey = authHeader.slice(7);
+  return verifyPackagerApiKey(providedKey);
+}
+
+export async function GET(request: NextRequest) {
   try {
     const features = getFeatureFlags();
 
@@ -29,6 +40,13 @@ export async function GET() {
         status: 'disabled',
         message: 'Local packager mode is not enabled. Set PACKAGER_MODE=local to enable.',
       });
+    }
+
+    if (!verifyPackagerAuth(request)) {
+      return NextResponse.json(
+        { error: 'Unauthorized - invalid packager credentials' },
+        { status: 401 }
+      );
     }
 
     const db = getDatabase();
@@ -40,7 +58,7 @@ export async function GET() {
     let staleJobsRecovered = 0;
     const staleJobs = await db.jobs.getStaleJobs(staleThreshold);
     for (const job of staleJobs) {
-      const released = await db.jobs.forceRelease(job.id);
+      const released = await db.jobs.forceRelease(job.id, staleThreshold);
       if (released) {
         staleJobsRecovered++;
       }

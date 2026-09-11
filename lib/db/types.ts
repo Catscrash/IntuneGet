@@ -261,9 +261,9 @@ export interface DatabaseAdapter {
     release(jobId: string, packagerId: string): Promise<PackagingJob | null>;
 
     /**
-     * Force release a stale job back to queued state (no packager_id check)
+     * Force release a stale job back to queued state after confirming it is still stale
      */
-    forceRelease(jobId: string): Promise<PackagingJob | null>;
+    forceRelease(jobId: string, staleThreshold?: Date): Promise<PackagingJob | null>;
 
     /**
      * Get stale jobs (packaging status with old heartbeat)

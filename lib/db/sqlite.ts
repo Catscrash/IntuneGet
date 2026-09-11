@@ -557,10 +557,13 @@ export const sqliteDb: DatabaseAdapter = {
     },
 
     /**
-     * Force release a stale job back to queued state (no packager_id check)
+     * Force release a stale job back to queued state after confirming it is still stale
      */
-    async forceRelease(jobId: string): Promise<PackagingJob | null> {
+    async forceRelease(jobId: string, staleThreshold?: Date): Promise<PackagingJob | null> {
       const database = getDb();
+      const whereClause = staleThreshold
+        ? 'WHERE id = ? AND status = ? AND packager_heartbeat_at < ?'
+        : 'WHERE id = ?';
       const stmt = database.prepare(`
         UPDATE packaging_jobs
         SET status = 'queued',
@@ -569,10 +572,13 @@ export const sqliteDb: DatabaseAdapter = {
             claimed_at = NULL,
             packaging_started_at = NULL,
             updated_at = ?
-        WHERE id = ?
+        ${whereClause}
       `);
 
-      const result = stmt.run(new Date().toISOString(), jobId);
+      const values = staleThreshold
+        ? [new Date().toISOString(), jobId, 'packaging', staleThreshold.toISOString()]
+        : [new Date().toISOString(), jobId];
+      const result = stmt.run(...values);
 
       if (result.changes === 0) {
         return null;
