@@ -9,6 +9,7 @@ import { RelatedPosts } from "@/components/blog/RelatedPosts";
 import { blogPosts } from "@/lib/data/blog-data";
 import { ArrowRight } from "lucide-react";
 import { T } from "gt-next";
+import { jsonForScript } from '@/lib/json-script';
 
 const post = getBlogPost("intune-winget-integration-guide")!;
 
@@ -163,7 +164,7 @@ export default function IntuneWingetIntegrationGuidePage() {
         <script
           key={i}
           type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(data) }}
+          dangerouslySetInnerHTML={{ __html: jsonForScript(data) }}
         />
       ))}
 

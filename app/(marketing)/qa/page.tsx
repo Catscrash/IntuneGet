@@ -7,6 +7,7 @@ import { Header } from '@/components/landing/Header';
 import { Footer } from '@/components/landing/sections/Footer';
 import { QaLiveClient } from './QaLiveClient';
 import { isQaLivePublicEnabled } from '@/lib/qa/public-access';
+import { jsonForScript } from '@/lib/json-script';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,7 +34,7 @@ export default async function QaPage() {
   return (
     <div className="flex min-h-screen flex-col bg-bg-deepest">
       <Header />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }} />
       <main id="main-content" className="mx-auto min-h-svh w-full max-w-[1600px] flex-1 px-4 pb-16 pt-24 lg:px-8 lg:pt-28">
         <div className="mb-8 max-w-3xl space-y-3">
           <p className="text-sm font-semibold uppercase tracking-[0.18em] text-accent-cyan"><T>Application quality assurance</T></p>

@@ -5,6 +5,7 @@ import { Footer } from "@/components/landing/sections/Footer";
 import { Heart, Target, Users, Code } from "lucide-react";
 import { Github, Linkedin } from "@/components/icons/brand-icons";
 import { T } from "gt-next";
+import { jsonForScript } from '@/lib/json-script';
 
 export const metadata: Metadata = {
   title: "About IntuneGet | Free Open-Source Intune Deployment Tool",
@@ -85,11 +86,11 @@ export default function AboutPage() {
       <Header />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }}
       />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(aboutJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(aboutJsonLd) }}
       />
 
       <main className="flex-1 mx-auto max-w-4xl px-4 py-12 lg:px-8 lg:py-16 pt-24 lg:pt-28 w-full">

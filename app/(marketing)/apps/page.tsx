@@ -10,6 +10,7 @@ import { getCatalogSource } from "@/lib/catalog";
 import { mergeCategoryCounts } from "@/lib/catalog/seo";
 import { formatAppCountLabel } from "@/lib/stats/public-stats";
 import { CatalogSearch } from "./CatalogSearch";
+import { jsonForScript } from '@/lib/json-script';
 
 // Refresh the catalog sample at most once an hour
 export const revalidate = 3600;
@@ -66,7 +67,7 @@ export default async function AppsPage() {
       <Header />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }}
       />
 
       <main id="main-content" className="flex-1 mx-auto w-full max-w-6xl px-4 py-12 lg:px-8 lg:py-16 pt-24 lg:pt-28">

@@ -1,6 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
+import { jsonForScript } from '@/lib/json-script';
 
 const navItemsMap: Record<string, string> = {
   "/docs": "Documentation",
@@ -58,7 +59,7 @@ export function DocsBreadcrumbJsonLd() {
     <script
       type="application/ld+json"
       dangerouslySetInnerHTML={{
-        __html: JSON.stringify(breadcrumbJsonLd),
+        __html: jsonForScript(breadcrumbJsonLd),
       }}
     />
   );

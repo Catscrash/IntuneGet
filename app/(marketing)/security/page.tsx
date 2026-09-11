@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Header } from "@/components/landing/Header";
 import { Footer } from "@/components/landing/sections/Footer";
 import { T } from "gt-next";
+import { jsonForScript } from '@/lib/json-script';
 
 export const metadata: Metadata = {
   title: "Security & Permissions | IntuneGet",
@@ -100,7 +101,7 @@ export default function SecurityPage() {
       <Header />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }}
       />
 
       {/* Content */}

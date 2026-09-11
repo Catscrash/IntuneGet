@@ -18,6 +18,7 @@ import {
   categorySlug,
   resolveCatalogIconUrl,
 } from '@/lib/catalog/seo';
+import { jsonForScript } from '@/lib/json-script';
 
 export const dynamicParams = true;
 export const revalidate = 86400;
@@ -195,8 +196,8 @@ export default async function AppDetailPage({ params }: PageProps) {
   return (
     <div className="flex min-h-screen flex-col bg-bg-deepest">
       <Header />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }} />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(softwareJsonLd) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: jsonForScript(softwareJsonLd) }} />
       <main id="main-content" className="mx-auto w-full max-w-6xl flex-1 space-y-10 px-4 pb-16 pt-24 lg:px-8 lg:pt-28">
         <nav aria-label="Breadcrumb" className="flex flex-wrap items-center gap-2 text-sm text-text-muted">
           <Link href="/" className="hover:text-accent-cyan"><T>Home</T></Link><span>/</span>

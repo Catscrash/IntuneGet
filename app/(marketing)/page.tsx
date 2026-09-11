@@ -18,6 +18,7 @@ import {
 import { getGitHubRepoStats } from "@/lib/stats/github-stats";
 import { LandingStatsProvider } from "@/components/providers/LandingStatsProvider";
 import packageJson from "../../package.json";
+import { jsonForScript } from '@/lib/json-script';
 
 // Re-render the page (and refresh the SSR'd counters) at most every 5 minutes
 export const revalidate = 300;
@@ -136,19 +137,19 @@ export default async function LandingPage() {
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{
-          __html: JSON.stringify(softwareApplicationJsonLd),
+          __html: jsonForScript(softwareApplicationJsonLd),
         }}
       />
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{
-          __html: JSON.stringify(faqPageJsonLd),
+          __html: jsonForScript(faqPageJsonLd),
         }}
       />
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{
-          __html: JSON.stringify(howToJsonLd),
+          __html: jsonForScript(howToJsonLd),
         }}
       />
       <LandingStatsProvider

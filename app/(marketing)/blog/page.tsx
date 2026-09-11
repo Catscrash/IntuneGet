@@ -3,6 +3,7 @@ import Link from "next/link";
 import { blogPosts } from "@/lib/data/blog-data";
 import { ArrowRight, Calendar, Clock, Tag } from "lucide-react";
 import { T } from "gt-next";
+import { jsonForScript } from '@/lib/json-script';
 
 export const metadata: Metadata = {
   title: "Blog | IntuneGet - Winget to Intune Guides & Tutorials",
@@ -68,11 +69,11 @@ export default function BlogPage() {
     <>
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(breadcrumbJsonLd) }}
       />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(collectionPageJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonForScript(collectionPageJsonLd) }}
       />
       <div className="container px-4 md:px-6 mx-auto max-w-5xl py-12 md:py-16">
         {/* Page header */}

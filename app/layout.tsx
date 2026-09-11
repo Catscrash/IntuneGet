@@ -6,6 +6,7 @@ import { CookieConsentBanner } from '@/components/consent/CookieConsentBanner';
 import { PlausibleLoader } from '@/components/analytics/PlausibleLoader';
 import { GTProvider, T } from "gt-next";
 import { getLocale } from "gt-next/server";
+import { jsonForScript } from '@/lib/json-script';
 
 // Analytics configuration
 const PLAUSIBLE_DOMAIN = process.env.NEXT_PUBLIC_PLAUSIBLE_DOMAIN;
@@ -209,7 +210,7 @@ export default async function RootLayout({
         <link rel="preconnect" href="https://plausible.io" />
         <script
           dangerouslySetInnerHTML={{
-            __html: `window.__RUNTIME_CONFIG__=${JSON.stringify({
+            __html: `window.__RUNTIME_CONFIG__=${jsonForScript({
               NEXT_PUBLIC_AZURE_AD_CLIENT_ID:
                 process.env.AZURE_CLIENT_ID || process.env.NEXT_PUBLIC_AZURE_AD_CLIENT_ID || "",
             })}`,
@@ -239,19 +240,19 @@ export default async function RootLayout({
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
-            __html: JSON.stringify(organizationJsonLd),
+            __html: jsonForScript(organizationJsonLd),
           }}
         />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
-            __html: JSON.stringify(personJsonLd),
+            __html: jsonForScript(personJsonLd),
           }}
         />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
-            __html: JSON.stringify(websiteJsonLd),
+            __html: jsonForScript(websiteJsonLd),
           }}
         />
       </head>
