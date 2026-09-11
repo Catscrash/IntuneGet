@@ -7,6 +7,7 @@ import {
 } from '@/lib/winget-sync-resolution.mjs';
 import { normalizeInstaller, normalizeManifestInstallers } from '@/lib/manifest-api';
 import { selectAppsToSync } from './select-apps';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 10;
 const SYNC_STATUS_ID = 'sync-manifests-hot';
@@ -34,9 +35,8 @@ interface CuratedAppUpdate {
 }
 
 export async function GET(request: Request) {
-  // Verify cron secret (Vercel adds this header for cron jobs)
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  // Verify cron secret
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 

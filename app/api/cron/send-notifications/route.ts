@@ -7,13 +7,13 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { notifyUserOfPendingUpdates } from '@/lib/notifications/notify-user';
 import type { UpdateCheckResult } from '@/types/notifications';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 20;
 
 export async function GET(request: Request) {
   // Verify cron secret
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 

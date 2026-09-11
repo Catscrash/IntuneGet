@@ -14,6 +14,7 @@ import {
 } from '@/lib/auto-update/trigger';
 import { AppUpdatePolicy, shouldSkipUpdate } from '@/types/update-policies';
 import { getCatalogSource } from '@/lib/catalog';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 50;
 
@@ -186,8 +187,7 @@ async function processAutoUpdates(
 
 export async function GET(request: Request) {
   // Verify cron secret
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 

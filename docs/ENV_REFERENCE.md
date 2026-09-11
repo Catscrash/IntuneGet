@@ -77,7 +77,7 @@ repository, so it reads its own compact JSON without a cross-repository token.
 
 | Variable | Notes |
 |---|---|
-| `CRON_SECRET` | Protect cron routes |
+| `CRON_SECRET` | Protect cron routes. Required to run them at all: while it is unset every cron route answers 401, so a scheduled deployment needs it configured on both the app and the scheduler |
 | `MSP_STATE_SECRET` | MSP state/signing support |
 
 ## Packager Service Variables

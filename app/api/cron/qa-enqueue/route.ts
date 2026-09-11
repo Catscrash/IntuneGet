@@ -45,6 +45,7 @@ import {
   resolveWingetManifest,
 } from '@/lib/winget-sync-resolution.mjs';
 import { shouldReactivateSupersededCandidate } from '@/lib/qa/candidate-reactivation';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 3;
 const POLL_STATE_ID = 'microsoft/winget-pkgs';
@@ -481,8 +482,7 @@ async function persistQaCatalogReconciliation(
 }
 
 export async function GET(request: Request) {
-  const cronSecret = process.env.CRON_SECRET;
-  if (!cronSecret || request.headers.get('authorization') !== `Bearer ${cronSecret}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
   let requestedPackageIds: string[];

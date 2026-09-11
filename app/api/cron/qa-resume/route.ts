@@ -12,12 +12,12 @@ import { isDeferredCustomerQaEnabled } from '@/lib/qa/continuity';
 import { reconcileCatalogInstaller } from '@/lib/catalog-installer-reconciliation';
 import type { Win32CartItem } from '@/types/upload';
 import type { Json } from '@/types/database';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const RESUME_BATCH_SIZE = 25;
 
 export async function GET(request: Request) {
-  const cronSecret = process.env.CRON_SECRET;
-  if (!cronSecret || request.headers.get('authorization') !== `Bearer ${cronSecret}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
