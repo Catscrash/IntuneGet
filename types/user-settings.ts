@@ -27,6 +27,35 @@ export interface UserSettings {
    * how to act on it - it never changes what was scanned.
    */
   virusTotalMaliciousThreshold: number;
+  /**
+   * Free text appended to every deployed app's Intune description, for
+   * example a team signature. Empty by default - nothing is added beyond the
+   * machine-readable package-id marker the duplicate guard needs.
+   *
+   * Visible to end users in Company Portal, so it is the operator's own words
+   * rather than the tool's.
+   */
+  appDescriptionSuffix: string;
+}
+
+/** Kept short: it rides along in every app description. */
+export const MAX_APP_DESCRIPTION_SUFFIX_LENGTH = 200;
+
+/**
+ * Coerce a stored settings value into a usable suffix.
+ *
+ * Control characters are dropped rather than rejected - the text goes into a
+ * Graph payload, and a stray character should not fail a deployment. Newlines
+ * survive so a two-line signature stays two lines.
+ */
+export function resolveAppDescriptionSuffix(value: unknown): string {
+  if (typeof value !== 'string') {
+    return DEFAULT_USER_SETTINGS.appDescriptionSuffix;
+  }
+  return value
+    .replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .slice(0, MAX_APP_DESCRIPTION_SUFFIX_LENGTH)
+    .trimEnd();
 }
 
 /** Largest accepted threshold; VirusTotal runs on the order of 70-80 engines. */
@@ -66,6 +95,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   // Unchanged behaviour until an operator decides otherwise: one engine is
   // enough to refuse.
   virusTotalMaliciousThreshold: 1,
+  appDescriptionSuffix: '',
 };
 
 export interface UserSettingsResponse {

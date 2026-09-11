@@ -31,7 +31,9 @@ export async function deployStoreApp(
   const appBody: Record<string, unknown> = {
     '@odata.type': '#microsoft.graph.winGetApp',
     displayName: item.displayName,
-    description: item.description || `Deployed via IntuneGet from Microsoft Store: ${item.packageIdentifier}\nSource: IntuneGet.com`,
+    // Store apps have no winget id; the store identifier is the equivalent
+    // machine-readable marker, and it carries no branding.
+    description: item.description || `Microsoft Store: ${item.packageIdentifier}`,
     publisher: item.publisher,
     packageIdentifier: item.packageIdentifier,
     installExperience: {

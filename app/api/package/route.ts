@@ -1,5 +1,8 @@
 import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
-import { resolveVirusTotalMaliciousThreshold } from '@/types/user-settings';
+import {
+  resolveAppDescriptionSuffix,
+  resolveVirusTotalMaliciousThreshold,
+} from '@/types/user-settings';
 /**
  * Package API Route
  * Queues packaging jobs by triggering GitHub Actions workflows
@@ -193,6 +196,10 @@ export async function POST(request: NextRequest) {
     // choice - a package waived case by case uses securityOverride instead.
     const maliciousThreshold = resolveVirusTotalMaliciousThreshold(
       operatorSettings?.virusTotalMaliciousThreshold
+    );
+    // Operator's own signature for the Intune description; empty unless set.
+    const appDescriptionSuffix = resolveAppDescriptionSuffix(
+      operatorSettings?.appDescriptionSuffix
     );
     for (const item of items) {
       (item as { allowAvailableUninstall?: boolean }).allowAvailableUninstall =
@@ -784,7 +791,9 @@ export async function POST(request: NextRequest) {
               displayName: item.displayName,
               description: buildIntuneAppDescription({
                 description: item.description,
-                fallback: `Deployed via IntuneGet from Winget: ${item.wingetId}`,
+                fallback: item.displayName,
+                wingetId: item.wingetId,
+                sourceText: appDescriptionSuffix,
               }),
               publisher: item.publisher,
               version: item.version,

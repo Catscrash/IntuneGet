@@ -68,15 +68,28 @@ import { useUserSettings } from '@/components/providers/UserSettingsProvider';
 import { useUpdateAppSettings } from '@/hooks/use-update-app-settings';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { generateDetectionRules, generateInstallCommand, generateUninstallCommand } from '@/lib/detection-rules';
-import { INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
+import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
 import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
 
-// Strip the auto-appended "Source: IntuneGet.com" marker so the description
-// editor shows only the human-authored text. The marker is re-appended at
-// deploy time by buildIntuneAppDescription, which is idempotent.
-function stripSourceMarker(value: string): string {
-  const idx = value.toLowerCase().lastIndexOf(INTUNE_APP_SOURCE_MARKER.toLowerCase());
-  return (idx === -1 ? value : value.slice(0, idx)).trimEnd();
+// Strip the auto-appended trailing lines so the description editor shows only
+// the human-authored text: the "Winget: <id>" marker, the legacy product
+// marker that older packages carry, and the operator's own signature line.
+// All three are re-appended at deploy time by buildIntuneAppDescription, which
+// is idempotent.
+function stripSourceMarker(value: string, sourceText?: string): string {
+  let result = value;
+
+  for (const marker of [LEGACY_INTUNE_APP_SOURCE_MARKER, sourceText?.trim()]) {
+    if (!marker) continue;
+    const idx = result.toLowerCase().lastIndexOf(marker.toLowerCase());
+    if (idx !== -1) result = result.slice(0, idx);
+  }
+
+  // The package-id marker is generated, so match its shape rather than a
+  // literal - the editor may hold a description from any package.
+  result = result.replace(/\n?Winget:\s*\S+\s*$/i, '');
+
+  return result.trimEnd();
 }
 import { useLocaleVariants, usePackageManifest } from '@/hooks/use-packages';
 import { countryCodeToFlag, cleanPackageName } from '@/lib/locale-utils';
@@ -190,7 +203,8 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
 
   // Editable Intune app description (#117). Defaults to the package description;
   // left blank, it falls back to the package default at deploy time. The
-  // "Source: IntuneGet.com" marker is appended later by buildIntuneAppDescription.
+  // The package-id marker and the operator signature are appended later by
+  // buildIntuneAppDescription.
   const [description, setDescription] = useState<string>(
     () => stripSourceMarker(deployedConfig?.description ?? pkg.description ?? '')
   );

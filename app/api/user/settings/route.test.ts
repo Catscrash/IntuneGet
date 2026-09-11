@@ -73,6 +73,36 @@ describe('user settings sanitizer', () => {
     );
   });
 
+  it('stores the description signature', async () => {
+    // Same allow-list trap as the threshold: a key missing from sanitizeSettings
+    // is dropped on save and on load, so the field would look saved and never
+    // reach a deployment.
+    await PATCH(patch({ appDescriptionSuffix: 'Packaged with care by IT' }));
+
+    expect(mergeSettingsMock).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ appDescriptionSuffix: 'Packaged with care by IT' })
+    );
+  });
+
+  it('strips control characters from the signature instead of failing', async () => {
+    // It ends up in a Graph payload; a stray character must not fail a deploy.
+    await PATCH(patch({ appDescriptionSuffix: 'by\u0000 IT\u0007' }));
+
+    expect(mergeSettingsMock).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ appDescriptionSuffix: 'by IT' })
+    );
+  });
+
+  it('reads the stored signature back out', async () => {
+    getSettingsMock.mockResolvedValue({ appDescriptionSuffix: 'by IT' });
+
+    const body = await (await GET(get())).json();
+
+    expect(body.settings.appDescriptionSuffix).toBe('by IT');
+  });
+
   it('reads the stored threshold back out', async () => {
     getSettingsMock.mockResolvedValue({ virusTotalMaliciousThreshold: 4 });
 

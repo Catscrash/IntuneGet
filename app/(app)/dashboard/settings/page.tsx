@@ -20,7 +20,7 @@ import {
   Check,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { MAX_VIRUSTOTAL_MALICIOUS_THRESHOLD } from '@/types/user-settings';
+import { MAX_APP_DESCRIPTION_SUFFIX_LENGTH, MAX_VIRUSTOTAL_MALICIOUS_THRESHOLD } from '@/types/user-settings';
 import { useMicrosoftAuth } from '@/hooks/useMicrosoftAuth';
 import { PageHeader } from '@/components/dashboard';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -31,7 +31,7 @@ import { useCartStore } from '@/stores/cart-store';
 import { clearConsentPending, isConsentPending } from '@/components/AdminConsentBanner';
 
 type SettingsTab = 'general' | 'permissions' | 'notifications' | 'exports' | 'data';
-type PreferenceKey = 'cart' | 'assignments' | 'supersedence' | 'availableUninstall' | 'malicious';
+type PreferenceKey = 'cart' | 'assignments' | 'supersedence' | 'availableUninstall' | 'malicious' | 'descriptionSuffix';
 
 type PermissionErrorType =
   | 'missing_credentials'
@@ -78,7 +78,7 @@ export default function SettingsPage() {
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [activePreferenceSave, setActivePreferenceSave] = useState<PreferenceKey | null>(null);
   const [lastUpdatedPreference, setLastUpdatedPreference] = useState<PreferenceKey | null>(null);
-  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp, setAllowAvailableUninstall, setVirusTotalMaliciousThreshold } = useUserSettings();
+  const { settings: userSettings, isSaving, syncError, setCartAutoOpenOnAdd, setCarryOverAssignments, setSupersedePreviousApp, setAllowAvailableUninstall, setVirusTotalMaliciousThreshold, setAppDescriptionSuffix } = useUserSettings();
   const autoOpenOnAdd = userSettings.cartAutoOpenOnAdd;
   const setAutoOpenOnAddStore = useCartStore((state) => state.setAutoOpenOnAdd);
   const handleCartToggle = useCallback(
@@ -119,6 +119,22 @@ export default function SettingsPage() {
       }
     },
     [setSupersedePreviousApp]
+  );
+
+  // Saved on blur rather than on every keystroke: this is free text, and a
+  // request per character would be both wasteful and visibly laggy.
+  const handleDescriptionSuffixCommit = useCallback(
+    async (value: string) => {
+      if (value === userSettings.appDescriptionSuffix) return;
+      setActivePreferenceSave('descriptionSuffix');
+      setLastUpdatedPreference('descriptionSuffix');
+      try {
+        await setAppDescriptionSuffix(value);
+      } finally {
+        setActivePreferenceSave(null);
+      }
+    },
+    [setAppDescriptionSuffix, userSettings.appDescriptionSuffix]
   );
 
   const handleMaliciousThresholdChange = useCallback(
@@ -558,6 +574,41 @@ export default function SettingsPage() {
                         {!isSaving && syncError && lastUpdatedPreference === 'availableUninstall' && (
                           <span className="text-xs text-status-warning"><T>Saved locally</T></span>
                         )}
+                      </div>
+                    </div>
+                  </motion.section>
+
+                  {/* App description signature card */}
+                  <motion.section
+                    variants={itemVariants}
+                    className="glass-light rounded-xl p-6 border border-overlay/5 hover:border-accent-cyan/20 transition-colors"
+                  >
+                    <div>
+                      <p className="text-text-primary font-medium"><T>Description signature</T></p>
+                      <p className="text-sm text-text-muted">
+                        <T>Appended to every deployed app&apos;s description in Intune, where end users see it in Company Portal. Leave empty to add nothing.</T>
+                      </p>
+                      <div className="mt-3 flex flex-col gap-1">
+                        <input
+                          type="text"
+                          maxLength={MAX_APP_DESCRIPTION_SUFFIX_LENGTH}
+                          defaultValue={userSettings.appDescriptionSuffix}
+                          onBlur={(event) =>
+                            void handleDescriptionSuffixCommit(event.target.value)
+                          }
+                          disabled={isSaving && activePreferenceSave !== 'descriptionSuffix'}
+                          placeholder="Packaged with care by IT"
+                          aria-label="App description signature"
+                          className="w-full rounded-lg border border-overlay/10 bg-transparent px-3 py-2 text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan disabled:opacity-50"
+                        />
+                        <div className="flex min-h-4 justify-end">
+                          {isSaving && activePreferenceSave === 'descriptionSuffix' && (
+                            <span className="text-xs text-text-muted"><T>Saving...</T></span>
+                          )}
+                          {!isSaving && syncError && lastUpdatedPreference === 'descriptionSuffix' && (
+                            <span className="text-xs text-status-warning"><T>Saved locally</T></span>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </motion.section>

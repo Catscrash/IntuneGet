@@ -26,6 +26,7 @@ import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
 import type { WorkflowInputs } from '@/lib/github-actions';
 import { shouldSkipUpdate } from '@/types/update-policies';
+import { resolveAppDescriptionSuffix } from '@/types/user-settings';
 import type {
   TriggerUpdateRequest,
   TriggerUpdateResponse,
@@ -124,6 +125,9 @@ export async function POST(request: NextRequest) {
     }
     const userSettings = (userSettingsRow?.settings as Record<string, unknown> | null) || null;
     const globalCarryOver = Boolean(userSettings?.carryOverAssignments);
+    const appDescriptionSuffix = resolveAppDescriptionSuffix(
+      userSettings?.appDescriptionSuffix
+    );
     const supersedePrevious = Boolean(userSettings?.supersedePreviousApp);
     const allowAvailableUninstall = Boolean(userSettings?.allowAvailableUninstall);
 
@@ -336,7 +340,9 @@ export async function POST(request: NextRequest) {
               displayName: deploymentConfig.displayName || installerInfo.displayName,
               description: buildIntuneAppDescription({
                 description: deploymentConfig.description,
-                fallback: `Deployed via IntuneGet from Winget: ${req.winget_id}`,
+                fallback: deploymentConfig.displayName,
+                wingetId: req.winget_id,
+                sourceText: appDescriptionSuffix,
               }),
               publisher: deploymentConfig.publisher || 'Unknown Publisher',
               version: installerInfo.latestVersion,
@@ -518,6 +524,9 @@ async function triggerWithoutSupabase(
   // both versions assigned and nothing superseded.
   const storedSettings = (await db.userSettings.get(user.userId)) ?? {};
   const globalCarryOver = Boolean(storedSettings.carryOverAssignments);
+  const appDescriptionSuffix = resolveAppDescriptionSuffix(
+    storedSettings.appDescriptionSuffix
+  );
   const supersedePrevious = Boolean(storedSettings.supersedePreviousApp);
   const allowAvailableUninstall = Boolean(storedSettings.allowAvailableUninstall);
 
@@ -549,6 +558,11 @@ async function triggerWithoutSupabase(
         fail(
           `${req.winget_id} keeps itself up to date on the device (Click-to-Run); IntuneGet does not deploy updates for it. Refresh the updates list to remove it.`
         );
+        continue;
+      }
+
+      if (req.tenant_id !== user.tenantId) {
+        fail('Update deployment is only available for the signed-in tenant in SQLite mode.');
         continue;
       }
 

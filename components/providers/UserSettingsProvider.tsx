@@ -15,6 +15,7 @@ import { useSidebarStore } from "@/stores/sidebar-store";
 import { getUserSettings, patchUserSettings } from "@/lib/user-settings";
 import {
   DEFAULT_USER_SETTINGS,
+  resolveAppDescriptionSuffix,
   resolveVirusTotalMaliciousThreshold,
   type ThemeMode,
   type ViewMode,
@@ -39,6 +40,7 @@ type UserSettingsContextValue = {
   setSupersedePreviousApp: (enabled: boolean) => Promise<void>;
   setAllowAvailableUninstall: (enabled: boolean) => Promise<void>;
   setVirusTotalMaliciousThreshold: (threshold: number) => Promise<void>;
+  setAppDescriptionSuffix: (suffix: string) => Promise<void>;
 };
 
 const UserSettingsContext = createContext<UserSettingsContextValue | null>(null);
@@ -473,6 +475,13 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
     [updateSettings]
   );
 
+  const setAppDescriptionSuffix = useCallback(
+    async (suffix: string) => {
+      await updateSettings({ appDescriptionSuffix: resolveAppDescriptionSuffix(suffix) });
+    },
+    [updateSettings]
+  );
+
   const setVirusTotalMaliciousThreshold = useCallback(
     async (threshold: number) => {
       // Normalise here as well as on the server: the value comes from a number
@@ -502,6 +511,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setSupersedePreviousApp,
       setAllowAvailableUninstall,
       setVirusTotalMaliciousThreshold,
+      setAppDescriptionSuffix,
     }),
     [
       hasStoredSettings,
@@ -519,6 +529,7 @@ export function UserSettingsProvider({ children }: { children: ReactNode }) {
       setSupersedePreviousApp,
       setAllowAvailableUninstall,
       setVirusTotalMaliciousThreshold,
+      setAppDescriptionSuffix,
       syncError,
     ]
   );

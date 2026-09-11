@@ -51,7 +51,8 @@ export async function deployToIntune(
     onProgress?.(jobId, 'uploading', 10, 'Creating Win32 app in Intune...');
     const description = buildIntuneAppDescription({
       description: stagedPackage.description,
-      fallback: `Deployed via IntuneGet from Winget: ${stagedPackage.wingetId}`,
+      fallback: stagedPackage.displayName,
+      wingetId: stagedPackage.wingetId,
     });
 
     // Non-fatal: fetchIconAsBase64 returns null on any failure

@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
-import { DEFAULT_USER_SETTINGS, resolveVirusTotalMaliciousThreshold } from '@/types/user-settings';
+import {
+  DEFAULT_USER_SETTINGS,
+  resolveAppDescriptionSuffix,
+  resolveVirusTotalMaliciousThreshold,
+} from '@/types/user-settings';
 import type { UserSettings, UserSettingsUpdate } from '@/types/user-settings';
 
 function isBoolean(value: unknown): value is boolean {
@@ -73,6 +77,12 @@ function sanitizeSettings(payload: Record<string, unknown>): UserSettingsUpdate 
   if (payload.virusTotalMaliciousThreshold !== undefined) {
     updates.virusTotalMaliciousThreshold = resolveVirusTotalMaliciousThreshold(
       payload.virusTotalMaliciousThreshold
+    );
+  }
+
+  if (payload.appDescriptionSuffix !== undefined) {
+    updates.appDescriptionSuffix = resolveAppDescriptionSuffix(
+      payload.appDescriptionSuffix
     );
   }
 

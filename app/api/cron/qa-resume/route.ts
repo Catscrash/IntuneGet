@@ -224,7 +224,8 @@ export async function GET(request: Request) {
         displayName: item.displayName || job.display_name,
         description: buildIntuneAppDescription({
           description: item.description,
-          fallback: `Deployed via IntuneGet from Winget: ${job.winget_id}`,
+          fallback: job.display_name,
+          wingetId: job.winget_id,
         }),
         publisher: item.publisher || job.publisher || 'Unknown Publisher',
         version: job.version,

@@ -1,5 +1,18 @@
-/** IntuneGet marker included in managed app descriptions. */
-export const INTUNE_APP_SOURCE_MARKER = 'Source: IntuneGet.com';
+/**
+ * Marker older packages carried in their description. Still recognised so the
+ * duplicate guard keeps matching apps deployed before the switch; nothing
+ * writes it any more.
+ */
+export const LEGACY_INTUNE_APP_SOURCE_MARKER = 'Source: IntuneGet.com';
+
+/**
+ * The marker written today: the package id rather than a product name. It
+ * carries no branding into Company Portal, and it is what the match below
+ * already preferred - an exact id beats "one of ours".
+ */
+export function intuneAppSourceMarker(wingetId: string): string {
+  return `Winget: ${wingetId.trim()}`;
+}
 
 export interface DuplicateAppInfo {
   matchType: 'exact';
@@ -43,7 +56,7 @@ function isIntuneGetFingerprint(description: string | null | undefined, wingetId
   if (wingetMarker) {
     return Boolean(wingetId) && wingetMarker[1].toLowerCase() === wingetId.toLowerCase();
   }
-  return description.includes(INTUNE_APP_SOURCE_MARKER);
+  return description.includes(LEGACY_INTUNE_APP_SOURCE_MARKER);
 }
 
 function graphPathFromNextLink(nextLink: string): string {

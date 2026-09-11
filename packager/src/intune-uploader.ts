@@ -11,11 +11,11 @@ import { createLogger, Logger } from './logger.js';
 import { fetchWithProxy } from './fetch-with-proxy.js';
 import {
   findDuplicateIntuneApp,
-  INTUNE_APP_SOURCE_MARKER,
+  intuneAppSourceMarker,
   type DuplicateAppInfo,
 } from './duplicate-app.js';
 
-export { INTUNE_APP_SOURCE_MARKER } from './duplicate-app.js';
+export { LEGACY_INTUNE_APP_SOURCE_MARKER, intuneAppSourceMarker } from './duplicate-app.js';
 export type { DuplicateAppInfo } from './duplicate-app.js';
 
 export interface IntuneAppResult {
@@ -378,15 +378,15 @@ export class IntuneUploader {
     const commands = this.buildCommandLines(job);
     const baseDescription = extractPackageDescription(
       job.package_config,
-      `${job.display_name} ${job.version} - Deployed via IntuneGet from Winget: ${job.winget_id}`
+      `${job.display_name} ${job.version}`
     );
-    // Append the source marker (same convention as the web app and hosted
-    // workflow) so tenant-wide duplicate detection recognizes this app
-    const description = baseDescription
-      .toLowerCase()
-      .includes(INTUNE_APP_SOURCE_MARKER.toLowerCase())
+    // Append the package-id marker (same convention as the web app) so
+    // tenant-wide duplicate detection recognises this app. The web app has
+    // usually appended it already; this covers the paths that have not.
+    const sourceMarker = intuneAppSourceMarker(job.winget_id);
+    const description = baseDescription.includes(sourceMarker)
       ? baseDescription
-      : `${baseDescription}\n${INTUNE_APP_SOURCE_MARKER}`;
+      : `${baseDescription}\n${sourceMarker}`;
     const largeIcon = await this.fetchLargeIcon(job);
     // Graph rejects the create call with "The Win32LobApp must have at least
     // one detection rule specified" if `rules` is empty at creation time, so
