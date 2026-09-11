@@ -99,7 +99,7 @@ export async function POST(request: NextRequest) {
     const tokenTenantId = user.tenantId;
 
     // Check for MSP tenant override header and enforce tenant access checks
-    // (membership, managed tenant consent, and customer-only access mode)
+    // (membership, MSP role, managed tenant consent, and customer-only access mode)
     const supabaseServerConfigured = isSupabaseServerConfigured();
     const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
     const { tenantId, errorResponse: tenantError } = supabaseServerConfigured
@@ -108,6 +108,7 @@ export async function POST(request: NextRequest) {
           userId,
           tokenTenantId,
           requestedTenantId: mspTenantId,
+          requiredPermission: 'deploy_apps',
         })
       : { tenantId: tokenTenantId, errorResponse: null };
 

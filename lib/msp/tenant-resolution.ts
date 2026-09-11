@@ -1,12 +1,27 @@
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
-import { canAccessPrimaryTenant, type AccessMode } from '@/lib/msp-permissions';
+import {
+  canAccessPrimaryTenant,
+  hasPermission,
+  parseRole,
+  type AccessMode,
+  type Permission,
+} from '@/lib/msp-permissions';
 
 interface ResolveTargetTenantInput {
   supabase: ReturnType<typeof createServerClient>;
   userId: string;
   tokenTenantId: string;
   requestedTenantId: string | null;
+  /**
+   * Permission the caller's MSP role has to carry for this operation. Every
+   * route that writes to a tenant - queueing a deployment, mutating Intune
+   * configuration - passes the permission it needs, so the role matrix is
+   * enforced where the tenant is resolved instead of once per route. Users
+   * with no MSP membership are unaffected, which keeps single-tenant installs
+   * working as before.
+   */
+  requiredPermission?: Permission;
 }
 
 interface ResolveTargetTenantResult {
@@ -16,6 +31,7 @@ interface ResolveTargetTenantResult {
 
 interface MembershipWithOrg {
   access_mode: AccessMode;
+  role: string | null;
   msp_organization_id: string;
   msp_organizations: {
     primary_tenant_id: string;
@@ -24,6 +40,7 @@ interface MembershipWithOrg {
 
 const CUSTOMER_ONLY_ERROR =
   'Your MSP membership is limited to customer tenants. Select a customer tenant to continue.';
+const PERMISSION_ERROR = 'Your MSP role does not allow this operation.';
 
 /**
  * Resolve the effective tenant for MSP users and enforce tenant access checks.
@@ -33,22 +50,39 @@ const CUSTOMER_ONLY_ERROR =
  * tenant is rejected regardless of how it was targeted (explicit header or the
  * token tenant fallback), since every member's token tenant is the primary
  * tenant.
+ *
+ * Callers that write pass requiredPermission, which is checked against the
+ * member's role before any tenant is handed back.
  */
 export async function resolveTargetTenantId({
   supabase,
   userId,
   tokenTenantId,
   requestedTenantId,
+  requiredPermission,
 }: ResolveTargetTenantInput): Promise<ResolveTargetTenantResult> {
   const { data: membershipData } = await supabase
     .from('msp_user_memberships')
-    .select('access_mode, msp_organization_id, msp_organizations!inner(primary_tenant_id)')
+    .select('access_mode, role, msp_organization_id, msp_organizations!inner(primary_tenant_id)')
     .eq('user_id', userId)
     .single();
 
   const membership = membershipData as unknown as MembershipWithOrg | null;
 
   const targetTenantId = requestedTenantId || tokenTenantId;
+
+  // An unreadable role parses as the least privileged one, so a membership row
+  // that predates the role column cannot write anywhere
+  if (
+    membership &&
+    requiredPermission &&
+    !hasPermission(parseRole(membership.role), requiredPermission)
+  ) {
+    return {
+      tenantId: tokenTenantId,
+      errorResponse: NextResponse.json({ error: PERMISSION_ERROR }, { status: 403 }),
+    };
+  }
 
   // Members limited to customer tenants can never target the org's primary tenant
   if (

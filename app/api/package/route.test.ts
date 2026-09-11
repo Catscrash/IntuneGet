@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { STALE_JOB_TIMEOUT_MINUTES, STALE_JOB_ERROR_MESSAGE } from '@/lib/stale-jobs';
 import type { PackagingJob } from '@/lib/db/types';
 
@@ -411,6 +411,40 @@ describe('POST /api/package (workflow dispatch)', () => {
     getPackageEligibilityBlocksMock.mockResolvedValue([]);
     enforceQaGateMock.mockResolvedValue(undefined);
     isSupabaseServerConfiguredMock.mockReturnValue(true);
+  });
+
+  it('asks for deploy_apps and stops when the MSP role does not carry it', async () => {
+    // An MSP viewer reaching this route would otherwise queue a deployment
+    // into any customer tenant its organization manages.
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    vi.mocked(resolveTargetTenantId).mockResolvedValueOnce({
+      tenantId: 'tenant-1',
+      errorResponse: NextResponse.json(
+        { error: 'Your MSP role does not allow this operation.' },
+        { status: 403 }
+      ),
+    });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer viewer-token',
+        'Content-Type': 'application/json',
+        'X-MSP-Tenant-Id': 'customer-tenant',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(403);
+    expect(vi.mocked(resolveTargetTenantId).mock.calls[0][0]).toMatchObject({
+      requestedTenantId: 'customer-tenant',
+      requiredPermission: 'deploy_apps',
+    });
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
   it('creates a queued local-packager job without Supabase or QA', async () => {
