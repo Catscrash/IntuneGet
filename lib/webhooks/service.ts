@@ -10,6 +10,7 @@ import type {
   WebhookTestPayload,
   WebhookType,
 } from '@/types/notifications';
+import { postWebhook, WebhookTargetError } from './egress';
 import {
   formatSlackMessage,
   formatTeamsMessage,
@@ -163,17 +164,12 @@ export async function deliverWebhook(
     }
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), opts.timeout);
-
-      const response = await fetch(webhook.url, {
-        method: 'POST',
+      const response = await postWebhook(webhook.url, {
         headers,
         body: payloadString,
-        signal: controller.signal,
+        timeoutMs: opts.timeout,
       });
 
-      clearTimeout(timeoutId);
       lastStatusCode = response.status;
 
       if (response.ok) {
@@ -183,13 +179,13 @@ export async function deliverWebhook(
         };
       }
 
-      // Non-retryable errors
-      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        const errorText = await response.text().catch(() => 'Unknown error');
+      // Non-retryable errors. Redirects land here too: they are never
+      // followed, so a webhook that answers with one cannot be delivered.
+      if (response.status < 500 && response.status !== 429) {
         return {
           success: false,
           statusCode: response.status,
-          error: `HTTP ${response.status}: ${errorText.slice(0, 200)}`,
+          error: `HTTP ${response.status}: ${response.body.slice(0, 200) || 'Unknown error'}`,
           retryable: false,
         };
       }
@@ -197,12 +193,16 @@ export async function deliverWebhook(
       // Retryable error (5xx or 429)
       lastError = `HTTP ${response.status}`;
     } catch (error) {
+      // A destination that is not allowed stays disallowed on retry
+      if (error instanceof WebhookTargetError) {
+        return {
+          success: false,
+          error: error.message,
+          retryable: false,
+        };
+      }
       if (error instanceof Error) {
-        if (error.name === 'AbortError') {
-          lastError = 'Request timed out';
-        } else {
-          lastError = error.message;
-        }
+        lastError = error.message;
       } else {
         lastError = 'Unknown error';
       }
@@ -237,17 +237,11 @@ export async function sendTestWebhook(
   }
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    const response = await fetch(webhook.url, {
-      method: 'POST',
+    const response = await postWebhook(webhook.url, {
       headers,
       body: payloadString,
-      signal: controller.signal,
+      timeoutMs: 10000,
     });
-
-    clearTimeout(timeoutId);
 
     if (response.ok) {
       return {
@@ -256,20 +250,13 @@ export async function sendTestWebhook(
       };
     }
 
-    const errorText = await response.text().catch(() => 'Unknown error');
     return {
       success: false,
       statusCode: response.status,
-      error: `HTTP ${response.status}: ${errorText.slice(0, 200)}`,
+      error: `HTTP ${response.status}: ${response.body.slice(0, 200) || 'Unknown error'}`,
     };
   } catch (error) {
     if (error instanceof Error) {
-      if (error.name === 'AbortError') {
-        return {
-          success: false,
-          error: 'Request timed out',
-        };
-      }
       return {
         success: false,
         error: error.message,
@@ -279,34 +266,6 @@ export async function sendTestWebhook(
       success: false,
       error: 'Unknown error',
     };
-  }
-}
-
-/**
- * Validate webhook URL
- */
-export function validateWebhookUrl(url: string): { valid: boolean; error?: string } {
-  try {
-    const parsed = new URL(url);
-
-    // Must be HTTPS
-    if (parsed.protocol !== 'https:') {
-      return { valid: false, error: 'URL must use HTTPS' };
-    }
-
-    // Basic validation for known webhook types
-    if (
-      url.includes('hooks.slack.com') ||
-      url.includes('webhook.office.com') ||
-      url.includes('discord.com/api/webhooks')
-    ) {
-      return { valid: true };
-    }
-
-    // Allow any HTTPS URL for custom webhooks
-    return { valid: true };
-  } catch {
-    return { valid: false, error: 'Invalid URL format' };
   }
 }
 

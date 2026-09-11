@@ -11,6 +11,7 @@ import { parseAccessToken } from '@/lib/auth-utils';
 import { hasPermission, type MspRole } from '@/lib/msp-permissions';
 import { createAuditLog } from '@/lib/audit-logger';
 import { generateWebhookSecret } from '@/lib/msp/webhook-signatures';
+import { validateWebhookTarget } from '@/lib/webhooks/egress';
 import type { Database } from '@/types/database';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -200,21 +201,14 @@ export async function PUT(request: NextRequest, context: RouteContext) {
     }
 
     if (body.url !== undefined) {
-      try {
-        const url = new URL(body.url);
-        if (url.protocol !== 'https:') {
-          return NextResponse.json(
-            { error: 'Webhook URL must use HTTPS' },
-            { status: 400 }
-          );
-        }
-        updates.url = body.url;
-      } catch {
+      const urlValidation = await validateWebhookTarget(body.url);
+      if (!urlValidation.valid) {
         return NextResponse.json(
-          { error: 'Invalid webhook URL' },
+          { error: urlValidation.error || 'Invalid webhook URL' },
           { status: 400 }
         );
       }
+      updates.url = body.url;
     }
 
     if (body.event_types !== undefined) {

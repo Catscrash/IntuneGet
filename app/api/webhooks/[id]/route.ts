@@ -8,7 +8,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
-import { validateWebhookUrl } from '@/lib/webhooks/service';
+import { validateWebhookTarget } from '@/lib/webhooks/egress';
 import type {
   WebhookConfiguration,
   WebhookConfigurationUpdate,
@@ -83,7 +83,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     // Validate URL if provided
     if (body.url) {
-      const urlValidation = validateWebhookUrl(body.url);
+      const urlValidation = await validateWebhookTarget(body.url);
       if (!urlValidation.valid) {
         return NextResponse.json(
           { error: urlValidation.error || 'Invalid webhook URL' },

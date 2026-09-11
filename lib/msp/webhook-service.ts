@@ -4,6 +4,7 @@
  */
 
 import { createServerClient } from '@/lib/supabase';
+import { postWebhook } from '@/lib/webhooks/egress';
 import { createWebhookHeaders } from './webhook-signatures';
 
 // Webhook event types
@@ -123,9 +124,6 @@ async function deliverWebhook(
     return;
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
   try {
     const headers = createWebhookHeaders(
       payloadString,
@@ -133,16 +131,13 @@ async function deliverWebhook(
       webhook.headers
     );
 
-    const response = await fetch(webhook.url, {
-      method: 'POST',
+    const response = await postWebhook(webhook.url, {
       headers,
       body: payloadString,
-      signal: controller.signal,
+      timeoutMs: 10000, // 10 second timeout
     });
 
-    clearTimeout(timeoutId);
-
-    const responseBody = await response.text().catch(() => '');
+    const responseBody = response.body;
 
     if (response.ok) {
       // Success - update delivery record
@@ -176,12 +171,8 @@ async function deliverWebhook(
       );
     }
   } catch (error) {
-    clearTimeout(timeoutId);
-
     const errorMessage = error instanceof Error
-      ? error.name === 'AbortError'
-        ? 'Request timeout'
-        : error.message
+      ? error.message
       : 'Unknown error';
 
     await handleDeliveryFailure(supabase, delivery, webhook, errorMessage);
@@ -267,18 +258,12 @@ export async function sendTestWebhook(
   const payloadString = JSON.stringify(testPayload);
   const headers = createWebhookHeaders(payloadString, webhook.secret, webhook.headers);
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
-
   try {
-    const response = await fetch(webhook.url, {
-      method: 'POST',
+    const response = await postWebhook(webhook.url, {
       headers,
       body: payloadString,
-      signal: controller.signal,
+      timeoutMs: 10000,
     });
-
-    clearTimeout(timeoutId);
 
     if (response.ok) {
       return {
@@ -287,20 +272,15 @@ export async function sendTestWebhook(
         response_status: response.status,
       };
     } else {
-      const body = await response.text().catch(() => '');
       return {
         success: false,
-        message: `HTTP ${response.status}: ${body.substring(0, 200)}`,
+        message: `HTTP ${response.status}: ${response.body.substring(0, 200)}`,
         response_status: response.status,
       };
     }
   } catch (error) {
-    clearTimeout(timeoutId);
-
     const message = error instanceof Error
-      ? error.name === 'AbortError'
-        ? 'Request timeout (10s)'
-        : error.message
+      ? error.message
       : 'Unknown error';
 
     return {

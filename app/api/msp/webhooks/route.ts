@@ -10,6 +10,7 @@ import { parseAccessToken } from '@/lib/auth-utils';
 import { hasPermission, type MspRole } from '@/lib/msp-permissions';
 import { createAuditLog } from '@/lib/audit-logger';
 import { generateWebhookSecret } from '@/lib/msp/webhook-signatures';
+import { validateWebhookTarget } from '@/lib/webhooks/egress';
 
 const VALID_EVENT_TYPES = [
   'deployment.completed',
@@ -155,17 +156,10 @@ export async function POST(request: NextRequest) {
     }
 
     // Validate URL
-    try {
-      const url = new URL(body.url);
-      if (url.protocol !== 'https:') {
-        return NextResponse.json(
-          { error: 'Webhook URL must use HTTPS' },
-          { status: 400 }
-        );
-      }
-    } catch {
+    const urlValidation = await validateWebhookTarget(body.url);
+    if (!urlValidation.valid) {
       return NextResponse.json(
-        { error: 'Invalid webhook URL' },
+        { error: urlValidation.error || 'Invalid webhook URL' },
         { status: 400 }
       );
     }
