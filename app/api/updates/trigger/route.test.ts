@@ -860,8 +860,8 @@ describe('POST /api/updates/trigger', () => {
       const config = createJobMock.mock.calls[0][0].package_config as {
         description: string;
       };
-      expect(config.description).toContain('Winget: Mozilla.Firefox');
       expect(config.description).toContain('by IT');
+      expect(config.description).not.toContain('Winget:');
       expect(config.description).not.toContain('IntuneGet.com');
     });
 

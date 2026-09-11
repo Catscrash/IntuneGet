@@ -119,6 +119,83 @@ describe('findDuplicateIntuneApp', () => {
     expect(graph.get).toHaveBeenCalledTimes(1);
   });
 
+  it('recognises an app by the marker in notes', async () => {
+    // Where the marker lives today: notes is admin-only, so the fingerprint
+    // stays out of what end users read in Company Portal.
+    const graph = graphMock(
+      {
+        value: [
+          { id: 'app-1', displayName: 'draw.io', description: 'A diagramming app.', notes: 'Winget: JGraph.Draw' },
+        ],
+      },
+      {
+        id: 'app-1',
+        '@odata.type': '#microsoft.graph.win32LobApp',
+        displayName: 'draw.io',
+        publishingState: 'published',
+        committedContentVersion: '1',
+      }
+    );
+
+    const result = await findDuplicateIntuneApp(graph.client, job);
+
+    expect(result?.existingAppId).toBe('app-1');
+    expect(graph.get.mock.calls[0][0]).toContain('notes');
+  });
+
+  it('still recognises apps deployed before the marker moved to notes', async () => {
+    // Without this the whole existing estate reads as unknown, and the next
+    // redeploy creates a second Intune app for every one of them.
+    for (const legacy of [
+      { description: 'A diagramming app.\nWinget: JGraph.Draw' },
+      { description: 'A diagramming app.\nSource: IntuneGet.com' },
+    ]) {
+      const graph = graphMock(
+        { value: [{ id: 'app-1', displayName: 'draw.io', ...legacy }] },
+        {
+          id: 'app-1',
+          '@odata.type': '#microsoft.graph.win32LobApp',
+          displayName: 'draw.io',
+          publishingState: 'published',
+          committedContentVersion: '1',
+        }
+      );
+
+      const result = await findDuplicateIntuneApp(graph.client, job);
+      expect(result?.existingAppId, JSON.stringify(legacy)).toBe('app-1');
+    }
+  });
+
+  it('does not treat another package as a duplicate just because notes exist', async () => {
+    const graph = graphMock({
+      value: [
+        { id: 'app-1', displayName: 'draw.io', notes: 'Winget: Some.OtherApp' },
+      ],
+    });
+
+    expect(await findDuplicateIntuneApp(graph.client, job)).toBeNull();
+  });
+
+  it('lets a package marker override the legacy product line', async () => {
+    // Regression guard: an app carrying both a foreign package marker and the
+    // old product line must read as someone else's, not as ours. Falling
+    // through to the product line here would make any IntuneGet-deployed app
+    // with a matching display name look like a duplicate of this package.
+    const graph = graphMock({
+      value: [
+        {
+          id: 'other-app',
+          displayName: 'draw.io',
+          notes: 'Winget: Different.Package',
+          description: 'Source: IntuneGet.com',
+        },
+      ],
+    });
+
+    expect(await findDuplicateIntuneApp(graph.client, job)).toBeNull();
+    expect(graph.get).toHaveBeenCalledTimes(1);
+  });
+
   it('propagates Graph errors so duplicate protection fails closed', async () => {
     const get = vi.fn().mockRejectedValue(new Error('Graph unavailable'));
 

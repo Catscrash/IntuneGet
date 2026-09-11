@@ -207,9 +207,12 @@ export async function POST(request: NextRequest) {
 
       // Compose the Intune description here rather than at dispatch: the local
       // packager never reaches the dispatch path, it reads this field straight
-      // out of package_config. Doing it once covers both packaging routes, and
-      // buildIntuneAppDescription is idempotent so the dispatch path can run
-      // over the result again without stacking lines.
+      // out of package_config.
+      //
+      // No package-id marker: the packager writes that to the app's `notes`,
+      // which Company Portal does not show. The GitHub Actions path still
+      // appends it at dispatch, because Check-DuplicateApp.ps1 fingerprints
+      // the description.
       const described = item as {
         description?: string;
         displayName?: string;
@@ -221,7 +224,6 @@ export async function POST(request: NextRequest) {
         described.description = buildIntuneAppDescription({
           description: described.description,
           fallback: described.displayName || packageId,
-          wingetId: described.wingetId,
           sourceText: appDescriptionSuffix,
         });
       }

@@ -383,10 +383,13 @@ export class IntuneUploader {
     // Append the package-id marker (same convention as the web app) so
     // tenant-wide duplicate detection recognises this app. The web app has
     // usually appended it already; this covers the paths that have not.
+    // The package-id marker goes in `notes`, not in the description: notes is
+    // an admin-only field in the Intune console, so the fingerprint the
+    // duplicate guard needs stays out of what end users read in Company
+    // Portal. Older apps carry it in the description instead; the guard still
+    // reads that as a fallback.
     const sourceMarker = intuneAppSourceMarker(job.winget_id);
-    const description = baseDescription.includes(sourceMarker)
-      ? baseDescription
-      : `${baseDescription}\n${sourceMarker}`;
+    const description = baseDescription;
     const largeIcon = await this.fetchLargeIcon(job);
     // Graph rejects the create call with "The Win32LobApp must have at least
     // one detection rule specified" if `rules` is empty at creation time, so
@@ -420,6 +423,7 @@ export class IntuneUploader {
       // setupFilePath, which names the entry point inside that package.
       fileName: packageFileName,
       setupFilePath: 'Invoke-AppDeployToolkit.exe',
+      notes: sourceMarker,
       installExperience: {
         runAsAccount: job.install_scope === 'user' ? 'user' : 'system',
         deviceRestartBehavior: 'suppress',

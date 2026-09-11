@@ -35,6 +35,8 @@ interface GraphMobileAppSummary {
   id: string;
   displayName?: string;
   description?: string | null;
+  /** Admin-only field; where the package-id marker lives today. */
+  notes?: string | null;
 }
 
 interface GraphWin32AppDetails extends GraphMobileAppSummary {
@@ -50,13 +52,37 @@ interface GraphAppPage {
   '@odata.nextLink'?: string;
 }
 
-function isIntuneGetFingerprint(description: string | null | undefined, wingetId: string): boolean {
-  if (!description) return false;
-  const wingetMarker = description.match(/Winget:\s*(\S+)/);
-  if (wingetMarker) {
-    return Boolean(wingetId) && wingetMarker[1].toLowerCase() === wingetId.toLowerCase();
+/** Match "Winget: <id>" against the package being deployed. */
+function matchesPackageMarker(value: string | null | undefined, wingetId: string): boolean {
+  const marker = value?.match(/Winget:\s*(\S+)/);
+  if (!marker) return false;
+  return Boolean(wingetId) && marker[1].toLowerCase() === wingetId.toLowerCase();
+}
+
+/**
+ * Whether an existing Intune app is one of ours for this package.
+ *
+ * The marker is written to `notes`, which Company Portal does not show. Apps
+ * deployed before that carry it in the description - either as the same
+ * "Winget: <id>" line or, older still, as the product marker - so both are
+ * read here. Dropping them would make every existing app look unknown and
+ * turn the next redeploy into a second app object.
+ */
+function isIntuneGetFingerprint(
+  app: Pick<GraphMobileAppSummary, 'description' | 'notes'>,
+  wingetId: string
+): boolean {
+  // A package marker, wherever it sits, is authoritative: it names the package
+  // outright, so a marker for a *different* one is a definite no rather than a
+  // reason to fall through. Only an app carrying no marker at all is judged by
+  // the old product line.
+  for (const field of [app.notes, app.description]) {
+    if (field?.match(/Winget:\s*(\S+)/)) {
+      return matchesPackageMarker(field, wingetId);
+    }
   }
-  return description.includes(LEGACY_INTUNE_APP_SOURCE_MARKER);
+
+  return Boolean(app.description?.includes(LEGACY_INTUNE_APP_SOURCE_MARKER));
 }
 
 function graphPathFromNextLink(nextLink: string): string {
@@ -75,14 +101,14 @@ export async function findDuplicateIntuneApp(
   const displayNameLower = job.display_name.toLowerCase();
   let nextPath: string | null =
     `/deviceAppManagement/mobileApps?$filter=isof('microsoft.graph.win32LobApp')` +
-    `&$select=id,displayName,description`;
+    `&$select=id,displayName,description,notes`;
 
   while (nextPath) {
     const page: GraphAppPage = await graphClient.get<GraphAppPage>(nextPath);
     for (const app of page.value ?? []) {
       if (
         app.displayName?.toLowerCase() !== displayNameLower ||
-        !isIntuneGetFingerprint(app.description, job.winget_id)
+        !isIntuneGetFingerprint(app, job.winget_id)
       ) {
         continue;
       }

@@ -687,12 +687,11 @@ async function triggerWithoutSupabase(
             removeAssignmentsFromPreviousApp: globalCarryOver,
           },
           // Composed here, not at dispatch: the local packager reads this
-          // field straight out of package_config and never runs the dispatch
-          // path that would otherwise build it.
+          // field straight out of package_config. The package-id marker is
+          // not part of it - the packager writes that to the app's `notes`.
           description: buildIntuneAppDescription({
             description: config.description,
             fallback: config.displayName,
-            wingetId: req.winget_id,
             sourceText: appDescriptionSuffix,
           }),
           notes: config.notes,

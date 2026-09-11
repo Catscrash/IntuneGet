@@ -610,9 +610,10 @@ describe('POST /api/package (workflow dispatch)', () => {
     await POST(request);
 
     const config = createMock.mock.calls[0][0].package_config as { description: string };
-    expect(config.description).toBe(
-      'A file archiver.\nWinget: Test.App\npackaged with care by IT'
-    );
+    // No package-id marker: the packager writes that to the app's notes,
+    // which Company Portal does not show.
+    expect(config.description).toBe('A file archiver.\npackaged with care by IT');
+    expect(config.description).not.toContain('Winget:');
   });
 
   it('adds only the package-id marker when no signature is configured', async () => {
@@ -634,8 +635,9 @@ describe('POST /api/package (workflow dispatch)', () => {
     await POST(request);
 
     const config = createMock.mock.calls[0][0].package_config as { description: string };
-    expect(config.description).toBe('A file archiver.\nWinget: Test.App');
+    expect(config.description).toBe('A file archiver.');
     expect(config.description).not.toContain('IntuneGet.com');
+    expect(config.description).not.toContain('Winget:');
   });
 
   it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
