@@ -83,7 +83,9 @@
     "vitest": "^4.1.10"
   },
   "overrides": {
-    "picomatch@<=2.3.1": "2.3.2"
+    "picomatch@<=2.3.1": "2.3.2",
+    "fflate@<0.6.11": "0.6.11",
+    "fflate@0.8.0 - 0.8.2": "0.8.3"
   },
   "allowScripts": {
     "better-sqlite3@12.11.1": true
