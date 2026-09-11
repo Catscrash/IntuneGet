@@ -70,3 +70,8 @@ packager/.env.*
 
 # Catalog snapshot runtime artifacts
 /data/
+
+# Security scan output: reports carry working proofs of concept, some for
+# findings that are still open upstream, so they stay on the machine that
+# produced them
+/strix_runs/
