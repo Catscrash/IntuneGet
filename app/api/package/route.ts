@@ -204,6 +204,27 @@ export async function POST(request: NextRequest) {
     for (const item of items) {
       (item as { allowAvailableUninstall?: boolean }).allowAvailableUninstall =
         allowAvailableUninstall;
+
+      // Compose the Intune description here rather than at dispatch: the local
+      // packager never reaches the dispatch path, it reads this field straight
+      // out of package_config. Doing it once covers both packaging routes, and
+      // buildIntuneAppDescription is idempotent so the dispatch path can run
+      // over the result again without stacking lines.
+      const described = item as {
+        description?: string;
+        displayName?: string;
+        wingetId?: string;
+        packageIdentifier?: string;
+      };
+      const packageId = described.wingetId || described.packageIdentifier;
+      if (packageId) {
+        described.description = buildIntuneAppDescription({
+          description: described.description,
+          fallback: described.displayName || packageId,
+          wingetId: described.wingetId,
+          sourceText: appDescriptionSuffix,
+        });
+      }
     }
 
     // Partition items into store apps and win32 apps

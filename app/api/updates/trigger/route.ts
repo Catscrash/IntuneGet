@@ -686,7 +686,15 @@ async function triggerWithoutSupabase(
             carryOverAssignments: globalCarryOver,
             removeAssignmentsFromPreviousApp: globalCarryOver,
           },
-          description: config.description,
+          // Composed here, not at dispatch: the local packager reads this
+          // field straight out of package_config and never runs the dispatch
+          // path that would otherwise build it.
+          description: buildIntuneAppDescription({
+            description: config.description,
+            fallback: config.displayName,
+            wingetId: req.winget_id,
+            sourceText: appDescriptionSuffix,
+          }),
           notes: config.notes,
         } as unknown as Json,
         status: 'queued',

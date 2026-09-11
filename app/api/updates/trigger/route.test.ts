@@ -590,6 +590,12 @@ describe('POST /api/updates/trigger', () => {
 
     beforeEach(() => {
       isSupabaseConfiguredMock.mockReturnValue(false);
+      parseAccessTokenMock.mockResolvedValue({
+        userId: 'user-1',
+        userEmail: 'user@example.com',
+        tenantId: 'tenant-1',
+        userName: 'User',
+      });
       getFeatureFlagsMock.mockReturnValue({ localPackager: true });
       getDetectedUpdatesMock.mockResolvedValue([detectedUpdate]);
       buildDeploymentConfigForAppMock.mockResolvedValue({
@@ -611,10 +617,13 @@ describe('POST /api/updates/trigger', () => {
       });
     });
 
-    function triggerRequest() {
+    function triggerRequest(overrides: Partial<{ winget_id: string; tenant_id: string }> = {}) {
       const request = new NextRequest('http://localhost:3000/api/updates/trigger', {
         method: 'POST',
-        body: JSON.stringify({ winget_id: 'Mozilla.Firefox', tenant_id: 'tenant-1' }),
+        body: JSON.stringify({
+          winget_id: overrides.winget_id ?? 'Mozilla.Firefox',
+          tenant_id: overrides.tenant_id ?? 'tenant-1',
+        }),
       });
       request.headers.set('Authorization', 'Bearer test-token');
       return request;
@@ -646,6 +655,16 @@ describe('POST /api/updates/trigger', () => {
       expect(job.package_config.assignments).toEqual([
         { type: 'group', groupId: 'g-1' },
       ]);
+    });
+
+    it('rejects body tenant IDs outside the signed-in SQLite tenant', async () => {
+      const body = await (await POST(triggerRequest({ tenant_id: 'other-tenant' }))).json();
+
+      expect(body.success).toBe(false);
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/signed-in tenant/i);
+      expect(getDetectedUpdatesMock).not.toHaveBeenCalled();
+      expect(createJobMock).not.toHaveBeenCalled();
     });
 
     it('prefers the newest deployment over a stale detected app id', async () => {
@@ -829,6 +848,21 @@ describe('POST /api/updates/trigger', () => {
 
       expect(body.triggered).toBe(1);
       expect(createJobMock).toHaveBeenCalled();
+    });
+
+    it('composes the description into the job for the local packager', async () => {
+      // Same gap as the deployment route: the packager reads this field out of
+      // package_config, so composing it at dispatch never reached it.
+      getUserSettingsMock.mockResolvedValue({ appDescriptionSuffix: 'by IT' });
+
+      await POST(triggerRequest());
+
+      const config = createJobMock.mock.calls[0][0].package_config as {
+        description: string;
+      };
+      expect(config.description).toContain('Winget: Mozilla.Firefox');
+      expect(config.description).toContain('by IT');
+      expect(config.description).not.toContain('IntuneGet.com');
     });
 
     it('deploys normally when a notify policy is set', async () => {

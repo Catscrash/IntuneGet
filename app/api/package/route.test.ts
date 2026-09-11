@@ -588,6 +588,56 @@ describe('POST /api/package (workflow dispatch)', () => {
     );
   });
 
+  it('writes the composed description into the job, not only into the dispatch', async () => {
+    // The local packager reads package_config.description and never runs the
+    // dispatch path, so composing it there left self-hosted deployments with
+    // the raw catalog text and no operator signature.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    getUserSettingsMock.mockResolvedValue({ appDescriptionSuffix: 'packaged with care by IT' });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({ description: 'A file archiver.' })],
+      }),
+    });
+
+    await POST(request);
+
+    const config = createMock.mock.calls[0][0].package_config as { description: string };
+    expect(config.description).toBe(
+      'A file archiver.\nWinget: Test.App\npackaged with care by IT'
+    );
+  });
+
+  it('adds only the package-id marker when no signature is configured', async () => {
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    getUserSettingsMock.mockResolvedValue(null);
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({ description: 'A file archiver.' })],
+      }),
+    });
+
+    await POST(request);
+
+    const config = createMock.mock.calls[0][0].package_config as { description: string };
+    expect(config.description).toBe('A file archiver.\nWinget: Test.App');
+    expect(config.description).not.toContain('IntuneGet.com');
+  });
+
   it('does not apply the QA gate a second time when the demand pipeline ran', async () => {
     // With Supabase, ensureQaDemand already decides the job's QA state; gating
     // again here would double-report the same verdict.
