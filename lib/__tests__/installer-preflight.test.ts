@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getLiveInstallersMock, hashRemoteInstallerMock } = vi.hoisted(() => ({
+const {
+  getLiveInstallersMock,
+  hashRemoteInstallerMock,
+  assertPublicInstallerUrlMock,
+} = vi.hoisted(() => ({
   getLiveInstallersMock: vi.fn(),
   hashRemoteInstallerMock: vi.fn(),
+  assertPublicInstallerUrlMock: vi.fn(),
 }));
 
 vi.mock('@/lib/manifest-api', () => ({
@@ -14,6 +19,7 @@ vi.mock('@/lib/installer-download', async (importOriginal) => {
   return {
     ...original,
     hashRemoteInstaller: hashRemoteInstallerMock,
+    assertPublicInstallerUrl: assertPublicInstallerUrlMock,
   };
 });
 
@@ -55,9 +61,10 @@ describe('installer dispatch preflight', () => {
       bytes: 42,
       finalUrl: request.installerUrl,
     });
+    assertPublicInstallerUrlMock.mockResolvedValue(undefined);
   });
 
-  it('skips custom installers', async () => {
+  it('skips custom installers but still checks where the URL points', async () => {
     await expect(enforceInstallerPreflight({
       ...request,
       wingetId: 'Custom.Example.App',
@@ -66,6 +73,28 @@ describe('installer dispatch preflight', () => {
     })).resolves.toEqual(expect.objectContaining({ status: 'skipped', source: 'custom' }));
     expect(getLiveInstallersMock).not.toHaveBeenCalled();
     expect(hashRemoteInstallerMock).not.toHaveBeenCalled();
+    expect(assertPublicInstallerUrlMock).toHaveBeenCalledWith(request.installerUrl);
+  });
+
+  it('blocks a custom installer URL pointing into the network', async () => {
+    // Nothing else stands between this URL and the packager's download: the
+    // hash check and the health cache are both skipped for a custom app.
+    assertPublicInstallerUrlMock.mockRejectedValue(
+      new Error('Installer URL resolves to a private or reserved address')
+    );
+
+    await expect(enforceInstallerPreflight({
+      ...request,
+      wingetId: 'Custom.Example.App',
+      installerUrl: 'http://169.254.169.254/latest/meta-data/',
+      installerSha256: '',
+      sourceType: 'custom',
+    })).rejects.toMatchObject({
+      name: 'InstallerPreflightError',
+      code: 'INSTALLER_URL_BLOCKED',
+      retryable: false,
+      message: 'Installer URL resolves to a private or reserved address',
+    });
   });
 
   it('checks the exact live manifest and caches a healthy tuple', async () => {

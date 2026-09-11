@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getLiveInstallers } from '@/lib/manifest-api';
 import {
+  assertPublicInstallerUrl,
   hashRemoteInstaller,
   hashesEqual,
   InstallerDownloadDeadlineError,
@@ -422,6 +423,18 @@ export async function enforceInstallerPreflight(
   trustedInstallers?: NormalizedInstaller[],
 ): Promise<InstallerPreflightResult> {
   if (input.sourceType === 'custom' || input.wingetId.startsWith('Custom.')) {
+    // A custom installer has no manifest hash to verify and no health cache
+    // entry, so the preflight itself is skipped - but the URL still decides
+    // where the packager will connect, which is checked here instead.
+    try {
+      await assertPublicInstallerUrl(input.installerUrl);
+    } catch (error) {
+      throw new InstallerPreflightError(
+        'INSTALLER_URL_BLOCKED',
+        error instanceof Error ? error.message : 'Installer URL is not allowed',
+        false,
+      );
+    }
     return { cacheKey: '', status: 'skipped', source: 'custom' };
   }
   if (isHostedRuntime() && !getHealthClient()) {

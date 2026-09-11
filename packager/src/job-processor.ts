@@ -5,12 +5,25 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import { spawn } from 'child_process';
 import { PackagerConfig } from './config.js';
 import { PackagingJob, JobPoller } from './job-poller.js';
 import { IntuneUploader, IntuneAppResult, DuplicateAppError } from './intune-uploader.js';
 import { createLogger, Logger } from './logger.js';
 import { fetchWithProxy } from './fetch-with-proxy.js';
+
+// Matches the web app's INSTALLER_PREFLIGHT_MAX_BYTES default, so a download
+// the server would have refused to hash does not get pulled onto this host.
+const DEFAULT_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+
+function maxDownloadBytes(): number {
+  const configured = Number(process.env.PACKAGER_MAX_DOWNLOAD_BYTES);
+  return Number.isSafeInteger(configured) && configured >= 1_000_000
+    ? configured
+    : DEFAULT_MAX_DOWNLOAD_BYTES;
+}
 
 interface PackagingResult {
   intunewinPath: string;
@@ -265,8 +278,36 @@ export class JobProcessor {
       throw new Error(`Failed to download ${url}: ${response.statusText}`);
     }
 
-    const buffer = await response.arrayBuffer();
-    await fs.promises.writeFile(destPath, Buffer.from(buffer));
+    const maxBytes = maxDownloadBytes();
+    const declaredBytes = Number(response.headers.get('content-length'));
+    if (Number.isSafeInteger(declaredBytes) && declaredBytes > maxBytes) {
+      throw new Error(`Download exceeds the ${maxBytes}-byte limit`);
+    }
+    if (!response.body) {
+      throw new Error(`Failed to download ${url}: the response had no body`);
+    }
+
+    // Streamed rather than buffered whole: a response that lies about (or
+    // omits) its length would otherwise be held in memory in full before
+    // anything noticed how large it is.
+    let receivedBytes = 0;
+    const limit = new Transform({
+      transform(chunk, _encoding, callback) {
+        receivedBytes += (chunk as Buffer).length;
+        if (receivedBytes > maxBytes) {
+          callback(new Error(`Download exceeds the ${maxBytes}-byte limit`));
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
+
+    try {
+      await pipeline(response.body, limit, fs.createWriteStream(destPath));
+    } catch (error) {
+      await fs.promises.rm(destPath, { force: true });
+      throw error;
+    }
   }
 
   /**
@@ -337,7 +378,12 @@ export class JobProcessor {
     const hash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
     if (hash.toLowerCase() !== expectedSha256.toLowerCase()) {
-      throw new Error(`Checksum mismatch: expected ${expectedSha256}, got ${hash}`);
+      // The computed hash stays in the local log. It travels to the server as
+      // the job's error message otherwise, and back to whoever submitted the
+      // job - which for a submitter who set the expected hash wrong on purpose
+      // is the digest of whatever the installer URL actually returned.
+      this.logger.error('Checksum mismatch', { filePath, expectedSha256, actualSha256: hash });
+      throw new Error(`Checksum mismatch: the download did not match ${expectedSha256}`);
     }
 
     this.logger.debug('Checksum verified', { sha256: hash });

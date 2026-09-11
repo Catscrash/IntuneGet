@@ -143,6 +143,44 @@ function validateUrl(value: string): URL {
   return url;
 }
 
+/**
+ * Reject a custom installer URL before it is stored and handed to a packager
+ *
+ * Catalog installers reach the network through hashRemoteInstaller(), which
+ * resolves the host and refuses a private or reserved address. A custom app's
+ * URL skips all of that - it has no manifest to verify against - yet it still
+ * decides where the packager connects, so the same destination rules are
+ * applied here at submission time.
+ *
+ * Operators who serve installers from inside their own network can set
+ * INSTALLER_ALLOW_PRIVATE_URLS=true, which keeps the scheme and credential
+ * rules and drops the address and port restrictions.
+ */
+export async function assertPublicInstallerUrl(value: string): Promise<void> {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('Installer URL is not a valid URL');
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Installer URL must use HTTP or HTTPS');
+  }
+  if (url.username || url.password) {
+    throw new Error('Installer URL must not contain credentials');
+  }
+
+  if (process.env.INSTALLER_ALLOW_PRIVATE_URLS === 'true') {
+    return;
+  }
+
+  if (url.port && !['80', '443'].includes(url.port)) {
+    throw new Error('Installer URL uses a disallowed port');
+  }
+  await resolvePublicAddress(url.hostname);
+}
+
 export function shouldUseRangedInstallerHash(installerUrl: string): boolean {
   try {
     const url = new URL(installerUrl);

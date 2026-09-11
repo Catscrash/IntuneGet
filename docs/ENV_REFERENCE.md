@@ -77,6 +77,7 @@ repository, so it reads its own compact JSON without a cross-repository token.
 
 | Variable | Notes |
 |---|---|
+| `INSTALLER_ALLOW_PRIVATE_URLS` | Allow custom-app installer URLs that resolve into the deployment's own network, and on non-standard ports. Off by default: such a URL is rejected when the job is submitted, since it decides where the packager connects. Set to `true` only when installers are served from an internal host |
 | `CRON_SECRET` | Protect cron routes. Required to run them at all: while it is unset every cron route answers 401, so a scheduled deployment needs it configured on both the app and the scheduler |
 | `MSP_STATE_SECRET` | MSP state/signing support |
 
@@ -115,6 +116,7 @@ Packager binary (`@ugurkocde/intuneget-packager`) supports two communication mod
 | `WORK_DIR` | `./work` | packaging working dir |
 | `TOOLS_DIR` | `./tools` | IntuneWinAppUtil + PSADT path |
 | `AZURE_TENANT_ID` | none | optional default tenant hint |
+| `PACKAGER_MAX_DOWNLOAD_BYTES` | `2147483648` | largest installer this host will download; a response that exceeds it is abandoned mid-stream |
 
 ## Naming Compatibility
 

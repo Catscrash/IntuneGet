@@ -78,10 +78,24 @@ export function buildCustomWingetId(publisher: string, displayName: string): str
   return `Custom.${publisherSlug}.${nameSlug}`;
 }
 
+/**
+ * Shape check for a custom installer URL, safe to run in the browser
+ *
+ * The destination itself - whether the host resolves somewhere public - is
+ * decided server-side by assertPublicInstallerUrl(), which needs DNS. This
+ * rejects the shapes that are wrong regardless of where they point, so the
+ * form can say so before the request is made.
+ */
 export function isValidInstallerUrl(value: string): boolean {
   try {
     const parsed = new URL(value);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    if (parsed.username || parsed.password) {
+      return false;
+    }
+    return true;
   } catch {
     return false;
   }
