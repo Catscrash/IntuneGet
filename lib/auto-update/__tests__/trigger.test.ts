@@ -3,6 +3,7 @@
  * per-package PSADT settings must survive app updates (issue follow-up to #96).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Mock } from 'vitest';
 import { AutoUpdateTrigger, getLatestInstallerInfo } from '../trigger';
 import type { AppUpdatePolicy, DeploymentConfig } from '@/types/update-policies';
 import type { QaResultRow } from '@/types/qa';
@@ -30,13 +31,29 @@ vi.mock('@/lib/qa/demand', () => ({
   ensureQaDemand: ensureQaDemandMock,
 }));
 
+type SpyFn = Mock<(...args: unknown[]) => unknown>;
+
 interface TableHandlers {
   maybeSingleResult?: { data: unknown; error: unknown };
-  maybeSingleSpy?: ReturnType<typeof vi.fn>;
+  maybeSingleSpy?: SpyFn;
   singleResult?: { data: unknown; error: unknown };
-  updateSpy?: ReturnType<typeof vi.fn>;
-  insertSpy?: ReturnType<typeof vi.fn>;
+  updateSpy?: SpyFn;
+  insertSpy?: SpyFn;
   terminalError?: unknown;
+}
+
+/**
+ * Spy on a private AutoUpdateTrigger method
+ *
+ * The methods under test are private, so they are reached through an index
+ * signature rather than casting the instance to never - a never-typed spy has
+ * no mockResolvedValue() to call.
+ */
+function spyOnTriggerInternal(trigger: AutoUpdateTrigger, method: string) {
+  return vi.spyOn(
+    trigger as unknown as Record<string, (...args: never[]) => Promise<unknown>>,
+    method
+  );
 }
 
 function createSupabaseMock(tables: Record<string, TableHandlers>) {
@@ -428,9 +445,9 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     });
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
-    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
-    const createHistorySpy = vi.spyOn(trigger as never, 'createHistoryRecord' as never);
+    spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    const createHistorySpy = spyOnTriggerInternal(trigger, 'createHistoryRecord');
 
     const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true });
 
@@ -462,15 +479,15 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
 
-    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
-      .mockResolvedValue({ id: 'history-camera-hub' } as never);
-    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
-      .mockResolvedValue({ id: 'job-camera-hub' } as never);
-    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+    spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'createHistoryRecord')
+      .mockResolvedValue({ id: 'history-camera-hub' });
+    const createPackagingJobSpy = spyOnTriggerInternal(trigger, 'createPackagingJob')
+      .mockResolvedValue({ id: 'job-camera-hub' });
+    spyOnTriggerInternal(trigger, 'updateHistoryRecord').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'updatePolicyTracking').mockResolvedValue(undefined);
 
     const result = await trigger.triggerAutoUpdate(policy, {
       ...UPDATE_INFO,
@@ -530,15 +547,15 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
 
-    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
-      .mockResolvedValue({ id: 'history-claude' } as never);
-    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
-      .mockResolvedValue({ id: 'job-claude' } as never);
-    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+    spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'createHistoryRecord')
+      .mockResolvedValue({ id: 'history-claude' });
+    const createPackagingJobSpy = spyOnTriggerInternal(trigger, 'createPackagingJob')
+      .mockResolvedValue({ id: 'job-claude' });
+    spyOnTriggerInternal(trigger, 'updateHistoryRecord').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'updatePolicyTracking').mockResolvedValue(undefined);
 
     const result = await trigger.triggerAutoUpdate(policy, {
       ...UPDATE_INFO,
@@ -586,15 +603,15 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
 
-    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
-      .mockResolvedValue({ id: 'history-zalo' } as never);
-    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
-      .mockResolvedValue({ id: 'job-zalo' } as never);
-    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+    spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'createHistoryRecord')
+      .mockResolvedValue({ id: 'history-zalo' });
+    const createPackagingJobSpy = spyOnTriggerInternal(trigger, 'createPackagingJob')
+      .mockResolvedValue({ id: 'job-zalo' });
+    spyOnTriggerInternal(trigger, 'updateHistoryRecord').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'updatePolicyTracking').mockResolvedValue(undefined);
 
     const result = await trigger.triggerAutoUpdate(policy, {
       ...UPDATE_INFO,
@@ -635,15 +652,15 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
 
-    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'createHistoryRecord' as never)
-      .mockResolvedValue({ id: 'history-notesnook' } as never);
-    const createPackagingJobSpy = vi.spyOn(trigger as never, 'createPackagingJob' as never)
-      .mockResolvedValue({ id: 'job-notesnook' } as never);
-    vi.spyOn(trigger as never, 'updateHistoryRecord' as never).mockResolvedValue(undefined as never);
-    vi.spyOn(trigger as never, 'updatePolicyTracking' as never).mockResolvedValue(undefined as never);
+    spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'createHistoryRecord')
+      .mockResolvedValue({ id: 'history-notesnook' });
+    const createPackagingJobSpy = spyOnTriggerInternal(trigger, 'createPackagingJob')
+      .mockResolvedValue({ id: 'job-notesnook' });
+    spyOnTriggerInternal(trigger, 'updateHistoryRecord').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'updatePolicyTracking').mockResolvedValue(undefined);
 
     const result = await trigger.triggerAutoUpdate(policy, {
       ...UPDATE_INFO,
@@ -819,8 +836,8 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       });
       policy.original_upload_history_id = 'prior-upload';
       policy.consecutive_failures = 0;
-      vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
-      vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(undefined as never);
+      spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
+      spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
 
       await trigger.triggerAutoUpdate(policy, {
         ...UPDATE_INFO,
@@ -893,8 +910,9 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
         uninstallCommand: '',
         installScope: 'machine',
         detectionRules: [],
+        // Deliberately trimmed, to prove the job stores what the policy holds
         psadtConfig: PSADT_CONFIG,
-      } as Partial<DeploymentConfig>);
+      } as unknown as Partial<DeploymentConfig>);
 
       const result = await (trigger as unknown as {
         createPackagingJob: (

@@ -1,3 +1,4 @@
+import type { Mock } from 'vitest';
 import { NextRequest } from 'next/server';
 import type { AppUpdatePolicy, DeploymentConfig } from '@/types/update-policies';
 
@@ -88,18 +89,13 @@ vi.mock('@/lib/features', () => ({
 import { POST } from '@/app/api/updates/trigger/route';
 
 interface TriggerSupabaseMocks {
-  supabase: {
-    from: (table: string) => {
-      select?: (...args: unknown[]) => {
-        eq: (...args: unknown[]) => unknown;
-      };
-      update?: (payload: Record<string, unknown>) => {
-        eq: (column: string, value: string) => Promise<{ data: null; error: null }>;
-      };
-    };
-  };
+  // The route only ever reaches for from(<table>) and chains off the builder
+  // it gets back, so the mocked builders are described by their shape
+  supabase: { from: (table: string) => Record<string, unknown> };
   policyUpdatePayloads: Array<Record<string, unknown>>;
 }
+
+type ChainFn = Mock<(...args: unknown[]) => unknown>;
 
 function createTriggerSupabaseMocks(
   policy: AppUpdatePolicy,
@@ -112,8 +108,8 @@ function createTriggerSupabaseMocks(
 
   const createSingleResultChain = <T,>(data: T) => {
     const chain: {
-      eq: ReturnType<typeof vi.fn>;
-      single: ReturnType<typeof vi.fn>;
+      eq: ChainFn;
+      single: ChainFn;
     } = {
       eq: vi.fn(),
       single: vi.fn(),
@@ -149,7 +145,7 @@ function createTriggerSupabaseMocks(
       }
 
       if (table === 'upload_history') {
-        const uploadChain: Record<string, ReturnType<typeof vi.fn>> = {
+        const uploadChain: Record<string, ChainFn> = {
           select: vi.fn(),
           eq: vi.fn(),
           order: vi.fn(),
@@ -170,7 +166,7 @@ function createTriggerSupabaseMocks(
       }
 
       if (table === 'user_settings') {
-        const settingsChain: Record<string, ReturnType<typeof vi.fn>> = {
+        const settingsChain: Record<string, ChainFn> = {
           select: vi.fn(),
           eq: vi.fn(),
           maybeSingle: vi.fn().mockResolvedValue({

@@ -456,7 +456,14 @@ describe('POST /api/package (workflow dispatch)', () => {
         testedVersion: '1.0.0',
         testedAtUtc: '2026-08-07T12:00:00Z',
         architecture: 'x64',
-        classification: 'install_failed',
+        classification: {
+          signal: 'install_failed',
+          bucket: 'vendor_installer',
+          confidence: 'high',
+          evidence: 'Installer exited with 1603',
+          remediation: 'Check the installer switches',
+          source: 'heuristic',
+        },
       })
     );
 
@@ -524,7 +531,14 @@ describe('POST /api/package (workflow dispatch)', () => {
         testedVersion: '1.0.0',
         testedAtUtc: '2026-08-07T12:00:00Z',
         architecture: 'x64',
-        classification: 'install_failed',
+        classification: {
+          signal: 'install_failed',
+          bucket: 'vendor_installer',
+          confidence: 'high',
+          evidence: 'Installer exited with 1603',
+          remediation: 'Check the installer switches',
+          source: 'heuristic',
+        },
       })
     );
 

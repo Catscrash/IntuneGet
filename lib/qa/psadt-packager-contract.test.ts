@@ -2995,7 +2995,7 @@ $ambiguous = Select-Localized @('Mozilla Firefox (x64 de)', 'Mozilla Firefox (x8
   it.runIf(canRunWindowsPowerShellPackager)(
     'narrows an ambiguous executable-wrapper display-name match to the single top-level entry',
     () => {
-      for (const installerType of ['burn', 'exe']) {
+      for (const installerType of ['burn', 'exe'] as const) {
         const generated = generateRegistryUninstallPackage(installerType, 'Wrapped App');
 
         expect(generated).toContain('if ($selectedApplications.Count -gt 1)');

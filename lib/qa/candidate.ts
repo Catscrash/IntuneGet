@@ -19,7 +19,7 @@ export interface WingetInstallerCandidate {
   };
   InstallLocationRequired?: boolean;
   DefaultInstallLocation?: string;
-  AppsAndFeaturesEntries?: Array<{ ProductCode?: string }>;
+  AppsAndFeaturesEntries?: Array<{ ProductCode?: string; DisplayName?: string }>;
 }
 
 export interface QaInstallerSelection {

@@ -113,6 +113,7 @@ function createTestPreparation(
     wingetPackage: createTestWingetPackage(),
     installer: createTestInstaller(),
     cartItem: {
+      appSource: 'win32',
       wingetId: 'TestCorp.TestApp',
       displayName: 'Test Application',
       publisher: 'Test Corp',

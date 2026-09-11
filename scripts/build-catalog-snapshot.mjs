@@ -82,6 +82,15 @@ const jsonOrNull = (v) => (v == null ? null : JSON.stringify(v));
 /**
  * Build the SQLite snapshot file at dbPath from in-memory rows. Pure and
  * deterministic given the inputs, so the self-test can exercise it offline.
+ *
+ * @param {string} dbPath
+ * @param {{
+ *   curatedApps: Record<string, unknown>[],
+ *   versionHistory: Record<string, unknown>[],
+ *   sccmMappings: Record<string, unknown>[],
+ *   qaResults?: Record<string, unknown>[],
+ *   fileReputations?: Record<string, unknown>[],
+ * }} rows
  */
 export function buildSqlite(dbPath, { curatedApps, versionHistory, sccmMappings, qaResults = [], fileReputations = [] }) {
   const db = new Database(dbPath);
