@@ -9,6 +9,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import { getMspCustomerConsentUrl } from '@/lib/msal-config';
 import { parseAccessToken, signConsentState, getBaseUrl } from '@/lib/auth-utils';
+import { hasPermission, type MspRole } from '@/lib/msp-permissions';
 import type {
   MspManagedTenant,
   MspManagedTenantWithStats,
@@ -22,6 +23,7 @@ import type {
  */
 interface MembershipWithOrg {
   msp_organization_id: string;
+  role: MspRole;
   access_mode: 'full' | 'customer_only';
   msp_organizations: {
     is_active: boolean;
@@ -34,6 +36,7 @@ interface MembershipWithOrg {
  */
 interface UserMspMembership {
   mspOrgId: string;
+  role: MspRole;
   accessMode: 'full' | 'customer_only';
   primaryTenantId: string;
 }
@@ -46,7 +49,7 @@ async function getUserMspMembership(userId: string): Promise<UserMspMembership |
 
   const { data } = await supabase
     .from('msp_user_memberships')
-    .select('msp_organization_id, access_mode, msp_organizations!inner(is_active, primary_tenant_id)')
+    .select('msp_organization_id, role, access_mode, msp_organizations!inner(is_active, primary_tenant_id)')
     .eq('user_id', userId)
     .eq('msp_organizations.is_active', true)
     .single();
@@ -56,6 +59,7 @@ async function getUserMspMembership(userId: string): Promise<UserMspMembership |
 
   return {
     mspOrgId: membership.msp_organization_id,
+    role: membership.role,
     accessMode: membership.access_mode || 'full',
     primaryTenantId: membership.msp_organizations.primary_tenant_id,
   };
@@ -197,6 +201,13 @@ export async function POST(request: NextRequest) {
     }
     const mspOrgId = membership.mspOrgId;
 
+    if (!hasPermission(membership.role, 'manage_tenants')) {
+      return NextResponse.json(
+        { error: 'You do not have permission to manage tenants' },
+        { status: 403 }
+      );
+    }
+
     // Parse request body
     const body: AddTenantRequest = await request.json();
     const { display_name, notes } = body;
@@ -297,6 +308,13 @@ export async function DELETE(request: NextRequest) {
       );
     }
     const mspOrgId = membership.mspOrgId;
+
+    if (!hasPermission(membership.role, 'manage_tenants')) {
+      return NextResponse.json(
+        { error: 'You do not have permission to manage tenants' },
+        { status: 403 }
+      );
+    }
 
     // Get tenant record ID from query params
     const { searchParams } = new URL(request.url);
