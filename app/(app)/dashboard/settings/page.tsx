@@ -69,6 +69,19 @@ const SETTINGS_TABS: Array<{
   { id: 'data', label: <T>Data</T>, icon: Database, description: <T>Data management</T> },
 ];
 
+/**
+ * Marks a setting that is stored once for the whole instance rather than per
+ * account: with several admins signed in, a change here changes how everyone's
+ * deployments are built, which is worth saying before someone flips a toggle.
+ */
+function SharedSettingBadge() {
+  return (
+    <span className="ml-2 align-middle rounded-full border border-overlay/10 px-2 py-0.5 text-[10px] font-normal uppercase tracking-wide text-text-muted">
+      <T>Shared</T>
+    </span>
+  );
+}
+
 export default function SettingsPage() {
   const { user, getAccessToken, requestAdminConsent } = useMicrosoftAuth();
   const prefersReducedMotion = useReducedMotion();
@@ -501,7 +514,10 @@ export default function SettingsPage() {
                   >
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-text-primary font-medium"><T>Carry over assignments on app updates</T></p>
+                        <p className="text-text-primary font-medium">
+                          <T>Carry over assignments on app updates</T>
+                          <SharedSettingBadge />
+                        </p>
                         <p className="text-sm text-text-muted">
                           <T>When enabled, assignments from the previous app version are copied to the new version and removed from the old app. When disabled, new app versions are created without assignments.</T>
                         </p>
@@ -529,7 +545,10 @@ export default function SettingsPage() {
                   >
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-text-primary font-medium"><T>Supersede previous version on update</T></p>
+                        <p className="text-text-primary font-medium">
+                          <T>Supersede previous version on update</T>
+                          <SharedSettingBadge />
+                        </p>
                         <p className="text-sm text-text-muted">
                           <T>When an app is updated, mark the new version as superseding the replaced one in Intune. The previous app keeps working but Intune treats the new app as its update.</T>
                         </p>
@@ -557,7 +576,10 @@ export default function SettingsPage() {
                   >
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-text-primary font-medium"><T>Allow available uninstall</T></p>
+                        <p className="text-text-primary font-medium">
+                          <T>Allow available uninstall</T>
+                          <SharedSettingBadge />
+                        </p>
                         <p className="text-sm text-text-muted">
                           <T>Let end users uninstall the app themselves from the Company Portal. Applies to assignments made available to users; required assignments stay in place either way.</T>
                         </p>
@@ -584,7 +606,10 @@ export default function SettingsPage() {
                     className="glass-light rounded-xl p-6 border border-overlay/5 hover:border-accent-cyan/20 transition-colors"
                   >
                     <div>
-                      <p className="text-text-primary font-medium"><T>Description signature</T></p>
+                      <p className="text-text-primary font-medium">
+                          <T>Description signature</T>
+                          <SharedSettingBadge />
+                        </p>
                       <p className="text-sm text-text-muted">
                         <T>Appended to every deployed app&apos;s description in Intune, where end users see it in Company Portal. Leave empty to add nothing.</T>
                       </p>
@@ -620,7 +645,10 @@ export default function SettingsPage() {
                   >
                     <div className="flex items-center justify-between gap-4">
                       <div>
-                        <p className="text-text-primary font-medium"><T>Block on antivirus findings</T></p>
+                        <p className="text-text-primary font-medium">
+                          <T>Block on antivirus findings</T>
+                          <SharedSettingBadge />
+                        </p>
                         <p className="text-sm text-text-muted">
                           <T>How many VirusTotal engines must flag an installer before packaging is refused. A single engine is often a false positive on legitimate software. Set to 0 to never block on this.</T>
                         </p>

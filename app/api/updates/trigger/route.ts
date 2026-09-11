@@ -8,6 +8,7 @@ import { sanitizeAssignmentsForDispatch } from '@/lib/assignment-intents';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { getDatabase } from '@/lib/db';
+import { readEffectiveSettings } from '@/lib/user-settings-store';
 import { parseAccessToken } from '@/lib/auth-utils';
 import {
   AutoUpdateTrigger,
@@ -522,7 +523,7 @@ async function triggerWithoutSupabase(
   // move to the new version and whether Intune records the new app as
   // superseding it. Reading them is not optional - defaulting to false leaves
   // both versions assigned and nothing superseded.
-  const storedSettings = (await db.userSettings.get(user.userId)) ?? {};
+  const storedSettings = await readEffectiveSettings(db, user.userId);
   const globalCarryOver = Boolean(storedSettings.carryOverAssignments);
   const appDescriptionSuffix = resolveAppDescriptionSuffix(
     storedSettings.appDescriptionSuffix

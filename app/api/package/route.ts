@@ -12,6 +12,7 @@ import {
 import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
+import { readEffectiveSettings } from '@/lib/user-settings-store';
 import {
   isGitHubActionsConfigured,
   triggerPackagingWorkflow,
@@ -189,7 +190,9 @@ export async function POST(request: NextRequest) {
     // per-cart choice, so it is stamped onto every item once here. The whole
     // item becomes the job's package_config further down, so each of the job
     // creation paths below inherits it without repeating the lookup.
-    const operatorSettings = await db.userSettings.get(userId);
+    // Deployment-wide settings come from the shared row, so a package is
+    // built the same way no matter which admin clicked Deploy.
+    const operatorSettings = await readEffectiveSettings(db, userId);
     const allowAvailableUninstall = Boolean(operatorSettings?.allowAvailableUninstall);
     // How many VirusTotal engines must flag an installer before packaging is
     // refused. An operator house rule like the settings above, not a per-app

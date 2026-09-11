@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import {
+  readEffectiveSettings,
+  SHARED_SETTINGS_ROW_ID,
+  splitSettingsUpdate,
+} from '@/lib/user-settings-store';
+import {
   DEFAULT_USER_SETTINGS,
   resolveAppDescriptionSuffix,
   resolveVirusTotalMaliciousThreshold,
@@ -105,7 +110,9 @@ export async function GET(request: NextRequest) {
     // in a self-hosted install these settings could never be read or saved,
     // and the update path silently fell back to "carry over off, no
     // supersedence" no matter what the toggles showed.
-    const stored = await getDatabase().userSettings.get(user.userId);
+    // Deployment-wide keys come from the shared row, personal ones from this
+    // user's; see lib/user-settings-store.ts for which is which.
+    const stored = await readEffectiveSettings(getDatabase(), user.userId);
 
     const sanitizedStoredSettings = isStoredSettings(stored)
       ? sanitizeSettings(stored as Record<string, unknown>)
@@ -151,12 +158,22 @@ export async function PATCH(request: NextRequest) {
 
     // The adapter merges read-and-write in one step, so a concurrent save
     // cannot merge onto a stale base and drop the other one's keys.
+    const { shared, personal } = splitSettingsUpdate(settingsUpdate);
     let mergedRow: Record<string, unknown>;
     try {
-      mergedRow = await getDatabase().userSettings.merge(
-        user.userId,
-        settingsUpdate as Record<string, unknown>
-      );
+      const db = getDatabase();
+      const [personalRow] = await Promise.all([
+        Object.keys(personal).length > 0
+          ? db.userSettings.merge(user.userId, personal)
+          : db.userSettings.get(user.userId).then((row) => row ?? {}),
+        Object.keys(shared).length > 0
+          ? db.userSettings.merge(SHARED_SETTINGS_ROW_ID, shared)
+          : Promise.resolve({}),
+      ]);
+      // Answer with what now applies to this user, not with one of the rows:
+      // a shared key just written has to come back even though it lives
+      // elsewhere, or the page would show the old value until a reload.
+      mergedRow = { ...personalRow, ...shared };
     } catch {
       return NextResponse.json(
         { error: 'Failed to update user settings' },

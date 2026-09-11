@@ -14,6 +14,7 @@ vi.mock('@/lib/db', () => ({
 }));
 
 import { GET, PATCH } from '@/app/api/user/settings/route';
+import { SHARED_SETTINGS_ROW_ID } from '@/lib/user-settings-store';
 
 function patch(body: Record<string, unknown>) {
   return new NextRequest('http://localhost:3000/api/user/settings', {
@@ -50,7 +51,7 @@ describe('user settings sanitizer', () => {
 
     expect(response.status).toBe(200);
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ virusTotalMaliciousThreshold: 4 })
     );
   });
@@ -59,7 +60,7 @@ describe('user settings sanitizer', () => {
     await PATCH(patch({ virusTotalMaliciousThreshold: 0 }));
 
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ virusTotalMaliciousThreshold: 0 })
     );
   });
@@ -68,7 +69,7 @@ describe('user settings sanitizer', () => {
     await PATCH(patch({ virusTotalMaliciousThreshold: 'nonsense' }));
 
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ virusTotalMaliciousThreshold: 1 })
     );
   });
@@ -80,7 +81,7 @@ describe('user settings sanitizer', () => {
     await PATCH(patch({ appDescriptionSuffix: 'Packaged with care by IT' }));
 
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ appDescriptionSuffix: 'Packaged with care by IT' })
     );
   });
@@ -90,7 +91,7 @@ describe('user settings sanitizer', () => {
     await PATCH(patch({ appDescriptionSuffix: 'by\u0000 IT\u0007' }));
 
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ appDescriptionSuffix: 'by IT' })
     );
   });
@@ -115,7 +116,7 @@ describe('user settings sanitizer', () => {
     await PATCH(patch({ allowAvailableUninstall: true, carryOverAssignments: true }));
 
     expect(mergeSettingsMock).toHaveBeenCalledWith(
-      'user-1',
+      SHARED_SETTINGS_ROW_ID,
       expect.objectContaining({ allowAvailableUninstall: true, carryOverAssignments: true })
     );
   });
@@ -125,5 +126,70 @@ describe('user settings sanitizer', () => {
 
     expect(response.status).toBe(400);
     expect(mergeSettingsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('shared vs personal settings', () => {
+  it('keeps cart behaviour on the signed-in user', async () => {
+    await PATCH(patch({ cartAutoOpenOnAdd: true }));
+
+    expect(mergeSettingsMock).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ cartAutoOpenOnAdd: true })
+    );
+    expect(mergeSettingsMock).not.toHaveBeenCalledWith(
+      SHARED_SETTINGS_ROW_ID,
+      expect.anything()
+    );
+  });
+
+  it('writes a mixed payload to both rows, each key only once', async () => {
+    await PATCH(patch({ theme: 'dark', supersedePreviousApp: true }));
+
+    expect(mergeSettingsMock).toHaveBeenCalledWith('user-1', { theme: 'dark' });
+    expect(mergeSettingsMock).toHaveBeenCalledWith(SHARED_SETTINGS_ROW_ID, {
+      supersedePreviousApp: true,
+    });
+  });
+
+  it('touches no personal row when only shared settings change', async () => {
+    await PATCH(patch({ carryOverAssignments: true }));
+
+    expect(mergeSettingsMock).not.toHaveBeenCalledWith('user-1', expect.anything());
+  });
+
+  it('answers with the shared value it just wrote', async () => {
+    // The shared value lives in another row, so echoing the personal row back
+    // would show the page the old value until the next reload.
+    getSettingsMock.mockResolvedValue({ theme: 'dark' });
+    mergeSettingsMock.mockResolvedValue({ theme: 'dark' });
+
+    const body = await (await PATCH(patch({ appDescriptionSuffix: 'by IT' }))).json();
+
+    expect(body.settings.appDescriptionSuffix).toBe('by IT');
+  });
+
+  it('serves one admin the value another admin set', async () => {
+    getSettingsMock.mockImplementation(async (id: string) =>
+      id === SHARED_SETTINGS_ROW_ID
+        ? { appDescriptionSuffix: 'by IT', virusTotalMaliciousThreshold: 4 }
+        : { appDescriptionSuffix: 'by Alice', theme: 'dark' }
+    );
+
+    const body = await (await GET(get())).json();
+
+    expect(body.settings.appDescriptionSuffix).toBe('by IT');
+    expect(body.settings.virusTotalMaliciousThreshold).toBe(4);
+    expect(body.settings.theme).toBe('dark');
+  });
+
+  it('still shows a value set before the key became shared', async () => {
+    getSettingsMock.mockImplementation(async (id: string) =>
+      id === SHARED_SETTINGS_ROW_ID ? null : { carryOverAssignments: true }
+    );
+
+    const body = await (await GET(get())).json();
+
+    expect(body.settings.carryOverAssignments).toBe(true);
   });
 });
