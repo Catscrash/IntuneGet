@@ -10,6 +10,7 @@ import { getCatalogSource } from '@/lib/catalog';
 import { getDatabase } from '@/lib/db';
 import { readEffectiveSettings } from '@/lib/user-settings-store';
 import { parseAccessToken } from '@/lib/auth-utils';
+import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import {
   AutoUpdateTrigger,
   getLatestInstallerInfo,
@@ -149,6 +150,29 @@ export async function POST(request: NextRequest) {
             tenant_id: req.tenant_id,
             success: false,
             error: `${req.winget_id} keeps itself up to date on the device (Click-to-Run); IntuneGet does not deploy updates for it. Refresh the updates list to remove it.`,
+          });
+          continue;
+        }
+
+        // The tenant comes from the request body, so it has to be proved
+        // before it decides where a deployment goes: a managed tenant of the
+        // caller's MSP organization, with a role that may deploy, or the
+        // caller's own. The lookups below filter on user_id as well, but a
+        // row existing is not the same as being allowed to act on it.
+        const { errorResponse: tenantError } = await resolveTargetTenantId({
+          supabase,
+          userId: user.userId,
+          tokenTenantId: user.tenantId,
+          requestedTenantId: req.tenant_id,
+          requiredPermission: 'deploy_apps',
+        });
+        if (tenantError) {
+          response.failed++;
+          response.results.push({
+            winget_id: req.winget_id,
+            tenant_id: req.tenant_id,
+            success: false,
+            error: 'Not authorized to deploy updates for this tenant',
           });
           continue;
         }

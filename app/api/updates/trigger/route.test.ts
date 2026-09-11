@@ -121,6 +121,13 @@ function createTriggerSupabaseMocks(
 
   const supabase = {
     from: (table: string) => {
+      // resolveTargetTenantId() looks the caller's MSP membership up first.
+      // No row means a plain single-tenant user, which is what these tests
+      // describe; the MSP cases live in lib/msp/tenant-resolution.test.ts.
+      if (table === 'msp_user_memberships') {
+        return { select: vi.fn(() => createSingleResultChain(null)) };
+      }
+
       if (table === 'update_check_results') {
         return {
           select: vi.fn(() =>
@@ -214,9 +221,56 @@ describe('POST /api/updates/trigger', () => {
     parseAccessTokenMock.mockResolvedValue({
       userId: 'user-1',
       userEmail: 'user@example.com',
-      tenantId: 'home-tenant',
+      // The same tenant the request bodies below name: a plain user may only
+      // deploy into their own, which the foreign-tenant test covers.
+      tenantId: 'tenant-1',
       userName: 'User',
     });
+  });
+
+  it('refuses a body tenant that is not the caller\'s', async () => {
+    const policy: AppUpdatePolicy = {
+      id: 'policy-1',
+      user_id: 'user-1',
+      tenant_id: 'tenant-1',
+      winget_id: 'Microsoft.Edge',
+      policy_type: 'notify',
+      pinned_version: null,
+      deployment_config: null,
+      original_upload_history_id: null,
+      last_auto_update_at: null,
+      last_auto_update_version: null,
+      is_enabled: false,
+      consecutive_failures: 0,
+      created_at: '2026-02-01T00:00:00Z',
+      updated_at: '2026-02-01T00:00:00Z',
+    };
+    const { supabase } = createTriggerSupabaseMocks(policy);
+    createServerClientMock.mockReturnValue(supabase);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/trigger', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ winget_id: 'Microsoft.Edge', tenant_id: 'someone-elses-tenant' }),
+    });
+
+    const response = await POST(request);
+    const body = await response.json();
+
+    expect(body).toMatchObject({
+      failed: 1,
+      triggered: 0,
+      results: [expect.objectContaining({
+        tenant_id: 'someone-elses-tenant',
+        success: false,
+        error: 'Not authorized to deploy updates for this tenant',
+      })],
+    });
+    expect(triggerAutoUpdateMock).not.toHaveBeenCalled();
+    expect(createJobMock).not.toHaveBeenCalled();
   });
 
   it('restores original policy fields when installer lookup fails', async () => {
