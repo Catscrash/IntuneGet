@@ -71,7 +71,12 @@ function makeRequest(body: Record<string, unknown>) {
 beforeEach(() => {
   vi.clearAllMocks();
   getDatabaseMock.mockReturnValue({
-    uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
+    uploadHistory: {
+        getByUserIdAndTenantId: getHistoryMock,
+        // Provenance is a tenant fact, not a per-user one: an app a
+        // colleague deployed is still an IntuneGet app.
+        getByTenantId: getHistoryMock,
+      },
     jobs: { getById: getJobByIdMock },
     updateCheckResults: { getByUserId: getDetectedUpdatesMock },
     updatePolicies: {

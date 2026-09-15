@@ -207,7 +207,12 @@ describe('POST /api/updates/trigger', () => {
     isSupabaseConfiguredMock.mockReturnValue(true);
     getDatabaseMock.mockReturnValue({
       updateCheckResults: { getByUserId: getDetectedUpdatesMock },
-      uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
+      uploadHistory: {
+        getByUserIdAndTenantId: getHistoryMock,
+        // Provenance is a tenant fact, not a per-user one: an app a
+        // colleague deployed is still an IntuneGet app.
+        getByTenantId: getHistoryMock,
+      },
       jobs: { create: createJobMock },
       userSettings: { get: getUserSettingsMock },
       updatePolicies: { getForWingetIds: getPoliciesMock },

@@ -57,7 +57,6 @@ export async function ensureUpdatePolicy(args: {
 
     if (policyType === 'auto_update') {
       const built = await buildDeploymentConfigForApp(supabase, {
-        userId,
         tenantId,
         wingetId,
         latestVersion: deployedVersion,

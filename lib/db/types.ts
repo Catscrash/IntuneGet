@@ -304,6 +304,19 @@ export interface DatabaseAdapter {
      * tenants cannot have this tenant's rows pushed out by another tenant's.
      */
     getByUserIdAndTenantId(userId: string, tenantId: string): Promise<UploadHistoryRecord[]>;
+
+    /**
+     * Every deployment into one tenant, whoever made it.
+     *
+     * A tenant is usually worked by several administrators, and an app one of
+     * them deployed is still an IntuneGet app to all of them. Provenance
+     * questions - "is this app ours", "what config did it go out with" - must
+     * therefore be asked of the tenant, not of the signed-in user; asking per
+     * user makes a colleague's app look foreign and loses its configuration on
+     * the next update. Callers must have proved the user may act on the tenant
+     * before calling (a row existing is not permission to read it).
+     */
+    getByTenantId(tenantId: string): Promise<UploadHistoryRecord[]>;
   };
 
   userSettings: {

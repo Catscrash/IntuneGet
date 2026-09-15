@@ -547,10 +547,11 @@ export class AutoUpdateTrigger {
     }
 
     try {
+      // Tenant-wide: the PSADT settings belong to the app as it was deployed,
+      // not to the administrator who happens to own this policy.
       const { data: uploadHistory } = await this.supabase
         .from('upload_history')
         .select('packaging_job_id')
-        .eq('user_id', policy.user_id)
         .eq('intune_tenant_id', policy.tenant_id)
         .eq('winget_id', policy.winget_id)
         .not('packaging_job_id', 'is', null)

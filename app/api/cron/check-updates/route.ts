@@ -144,10 +144,12 @@ async function processAutoUpdates(
       // Intune app ID, since update_check_results.intune_app_id can be stale
       // if the app was redeployed since the last update check.
       installerInfo.currentVersion = update.current_version;
+      // Tenant-wide, like the manual trigger: the app object to supersede and
+      // to take assignments from is the newest one in the tenant, whichever
+      // administrator deployed it.
       const { data: latestUploadForCron } = await supabase
         .from('upload_history')
         .select('intune_app_id')
-        .eq('user_id', update.user_id)
         .eq('intune_tenant_id', update.tenant_id)
         .eq('winget_id', update.winget_id)
         .order('deployed_at', { ascending: false })

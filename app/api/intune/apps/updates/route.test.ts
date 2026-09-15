@@ -55,7 +55,11 @@ vi.mock('@/lib/msp/tenant-resolution', () => ({
   resolveTargetTenantId: resolveTargetTenantIdMock,
 }));
 
-vi.mock('@/lib/app-matching', () => ({
+// isValidWingetId is not mocked: the marker path validates the id it read out
+// of the app with it, and a stub would decide the outcome of exactly the case
+// these tests are about.
+vi.mock('@/lib/app-matching', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/app-matching')>()),
   matchAppToWinget: matchAppToWingetMock,
   matchAppToWingetWithDatabase: matchAppToWingetWithDatabaseMock,
 }));
@@ -127,7 +131,12 @@ describe('GET /api/intune/apps/updates', () => {
     vi.clearAllMocks();
     isSupabaseConfiguredMock.mockReturnValue(true);
     getDatabaseMock.mockReturnValue({
-      uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
+      uploadHistory: {
+        getByUserIdAndTenantId: getHistoryMock,
+        // Provenance is a tenant fact, not a per-user one: an app a
+        // colleague deployed is still an IntuneGet app.
+        getByTenantId: getHistoryMock,
+      },
     });
     getHistoryMock.mockResolvedValue([]);
     getCatalogSourceMock.mockReturnValue({ getAppsByWingetIds: getAppsByWingetIdsMock });
@@ -386,6 +395,158 @@ describe('GET /api/intune/apps/updates', () => {
     expect(matchAppToWingetWithDatabaseMock).not.toHaveBeenCalled();
   });
 
+  it("recognises a colleague's app by the package-id marker in notes", async () => {
+    // The packager writes the marker to `notes` (admin-only, so end users
+    // never read it in Company Portal). Reading only the description made
+    // every app the current packager deployed look like a fuzzy name match to
+    // the next administrator who signed in - and "not managed by IntuneGet" is
+    // what talks them out of, or through, a destructive update.
+    createServerClientMock.mockReturnValue(
+      createSupabaseMock([{ winget_id: 'Git.Git', latest_version: '2.45.0' }])
+    );
+
+    matchAppToWingetMock.mockReturnValue(null);
+    matchAppToWingetWithDatabaseMock.mockResolvedValue(null);
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ access_token: 'graph-token' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: 'app-git',
+              displayName: 'Git',
+              description: 'Distributed version control',
+              notes: 'Winget: Git.Git',
+              publisher: 'Git',
+              displayVersion: '2.43.0',
+              lastModifiedDateTime: '2026-02-02T00:00:00Z',
+            },
+          ],
+        }),
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const request = new NextRequest('http://localhost:3000/api/intune/apps/updates', {
+      headers: {
+        Authorization: 'Bearer mock-token',
+      },
+    });
+
+    const response = await GET(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.updates[0].wingetId).toBe('Git.Git');
+    expect(body.updates[0].isManaged).toBe(true);
+    expect(matchAppToWingetMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps apps carrying only the legacy description marker managed', async () => {
+    // Deployed before the package-id marker existed: the old line names no
+    // package, so the winget id still has to come from the heuristics, but the
+    // app is demonstrably ours and must not be demoted to a fuzzy match.
+    createServerClientMock.mockReturnValue(
+      createSupabaseMock([{ winget_id: 'Git.Git', latest_version: '2.45.0' }])
+    );
+
+    matchAppToWingetMock.mockReturnValue({
+      confidence: 'high',
+      wingetId: 'Git.Git',
+      matchReason: 'Known app mapping',
+    });
+    matchAppToWingetWithDatabaseMock.mockResolvedValue(null);
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ access_token: 'graph-token' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: 'app-git-legacy',
+              displayName: 'Git',
+              description: 'Distributed version control\nSource: IntuneGet.com',
+              publisher: 'Git',
+              displayVersion: '2.43.0',
+              lastModifiedDateTime: '2026-02-02T00:00:00Z',
+            },
+          ],
+        }),
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const request = new NextRequest('http://localhost:3000/api/intune/apps/updates', {
+      headers: {
+        Authorization: 'Bearer mock-token',
+      },
+    });
+
+    const response = await GET(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.updates[0].isManaged).toBe(true);
+  });
+
+  it('leaves a genuine fuzzy match unmanaged', async () => {
+    createServerClientMock.mockReturnValue(
+      createSupabaseMock([{ winget_id: 'Git.Git', latest_version: '2.45.0' }])
+    );
+
+    matchAppToWingetMock.mockReturnValue({
+      confidence: 'high',
+      wingetId: 'Git.Git',
+      matchReason: 'Known app mapping',
+    });
+    matchAppToWingetWithDatabaseMock.mockResolvedValue(null);
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ access_token: 'graph-token' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          value: [
+            {
+              id: 'app-git-foreign',
+              displayName: 'Git',
+              description: 'Packaged by hand',
+              notes: 'internal ticket 4711',
+              publisher: 'Git',
+              displayVersion: '2.43.0',
+              lastModifiedDateTime: '2026-02-02T00:00:00Z',
+            },
+          ],
+        }),
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const request = new NextRequest('http://localhost:3000/api/intune/apps/updates', {
+      headers: {
+        Authorization: 'Bearer mock-token',
+      },
+    });
+
+    const response = await GET(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.updates[0].isManaged).toBe(false);
+  });
+
   it('tags deployment-history matches as managed without fuzzy matching', async () => {
     createServerClientMock.mockReturnValue(
       createSupabaseMock(
@@ -495,6 +656,6 @@ describe('GET /api/intune/apps/updates', () => {
     // own tenant instead of going through MSP resolution.
     expect(createServerClientMock).not.toHaveBeenCalled();
     expect(resolveTargetTenantIdMock).not.toHaveBeenCalled();
-    expect(getHistoryMock).toHaveBeenCalledWith('user-1', 'tenant-1');
+    expect(getHistoryMock).toHaveBeenCalledWith('tenant-1');
   });
 });

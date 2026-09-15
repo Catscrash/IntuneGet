@@ -101,7 +101,6 @@ describe('ensureUpdatePolicy', () => {
 
     expect(result).toEqual({ status: 'saved' });
     expect(buildDeploymentConfigForAppMock).toHaveBeenCalledWith(expect.anything(), {
-      userId: 'user-1',
       tenantId: 'tenant-1',
       wingetId: 'Publisher.App',
       latestVersion: '1.2.3',

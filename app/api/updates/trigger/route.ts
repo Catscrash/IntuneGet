@@ -209,7 +209,6 @@ export async function POST(request: NextRequest) {
         // If no policy exists, check for prior deployment to get config
         if (!policy) {
           const built = await buildDeploymentConfigForApp(supabase, {
-            userId: user.userId,
             tenantId: req.tenant_id,
             wingetId: req.winget_id,
             latestVersion: updateResult.latest_version,
@@ -320,10 +319,12 @@ export async function POST(request: NextRequest) {
         // Look up the most recent upload_history record to get the current
         // Intune app ID. The update_check_results.intune_app_id can be stale
         // if the app was redeployed (forceCreate) since the last update check.
+        // Tenant-wide: the newest version of the app in this tenant is the one
+        // to supersede and to take assignments from, whichever administrator
+        // deployed it. The tenant was proved above.
         const { data: latestUpload } = await supabase
           .from('upload_history')
           .select('intune_app_id')
-          .eq('user_id', user.userId)
           .eq('intune_tenant_id', req.tenant_id)
           .eq('winget_id', req.winget_id)
           .order('deployed_at', { ascending: false })
@@ -624,7 +625,6 @@ async function triggerWithoutSupabase(
       }
 
       const built = await buildDeploymentConfigForApp(null, {
-        userId: user.userId,
         tenantId: req.tenant_id,
         wingetId: req.winget_id,
         latestVersion: updateResult.latest_version,
@@ -660,11 +660,9 @@ async function triggerWithoutSupabase(
       const installerInfo = installerResolution.info;
 
       // The detected result's intune_app_id can be stale if the app was
-      // redeployed since the last check, so prefer the newest deployment.
-      const tenantHistory = await db.uploadHistory.getByUserIdAndTenantId(
-        user.userId,
-        req.tenant_id
-      );
+      // redeployed since the last check, so prefer the newest deployment into
+      // this tenant - by whichever administrator made it.
+      const tenantHistory = await db.uploadHistory.getByTenantId(req.tenant_id);
       const latestUpload = tenantHistory.find((row) => row.winget_id === req.winget_id);
       const sourceIntuneAppId =
         latestUpload?.intune_app_id || updateResult.intune_app_id || null;

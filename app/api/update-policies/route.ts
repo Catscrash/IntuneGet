@@ -104,11 +104,9 @@ export async function POST(request: NextRequest) {
 
       if (!derivedPinnedVersion) {
         // No detected update for this app - pin to whatever this tenant last
-        // deployed. getByUserIdAndTenantId returns newest first.
-        const history = await db.uploadHistory.getByUserIdAndTenantId(
-          user.userId,
-          body.tenant_id
-        );
+        // deployed, by whichever administrator. getByTenantId returns newest
+        // first.
+        const history = await db.uploadHistory.getByTenantId(body.tenant_id);
         derivedPinnedVersion =
           history.find((row) => row.winget_id === body.winget_id)?.version || null;
       }
@@ -140,7 +138,6 @@ export async function POST(request: NextRequest) {
       // The builder reads upload_history and packaging_jobs through the db
       // abstraction and resolves its own catalog, so it needs no client.
       const built = await buildDeploymentConfigForApp(null, {
-        userId: user.userId,
         tenantId: body.tenant_id,
         wingetId: body.winget_id,
         latestVersion,

@@ -462,6 +462,15 @@ function createTestAdapter(): TestAdapter {
         `);
         return stmt.all(userId, tenantId) as UploadHistoryRecord[];
       },
+
+      async getByTenantId(tenantId: string): Promise<UploadHistoryRecord[]> {
+        const stmt = db.prepare(`
+          SELECT * FROM upload_history
+          WHERE intune_tenant_id = ?
+          ORDER BY deployed_at DESC
+        `);
+        return stmt.all(tenantId) as UploadHistoryRecord[];
+      },
     },
 
     userSettings: {
@@ -1141,6 +1150,69 @@ describe('SQLite Database Adapter', () => {
       const history = await adapter.uploadHistory.getByUserIdAndTenantId('user-1', 'tenant-quiet');
 
       expect(history.map((h) => h.winget_id)).toEqual(['Quiet.App']);
+    });
+  });
+
+  describe('uploadHistory.getByTenantId', () => {
+    it('should return every administrator\'s deployments into the tenant', async () => {
+      await adapter.uploadHistory.create({
+        user_id: 'admin-a',
+        winget_id: 'Git.Git',
+        version: '2.43.0',
+        display_name: 'Git',
+        intune_app_id: 'app-git',
+        intune_tenant_id: 'tenant-1',
+      });
+      await adapter.uploadHistory.create({
+        user_id: 'admin-b',
+        winget_id: 'Microsoft.VSCode',
+        version: '1.85.0',
+        display_name: 'VS Code',
+        intune_app_id: 'app-code',
+        intune_tenant_id: 'tenant-1',
+      });
+      await adapter.uploadHistory.create({
+        user_id: 'admin-a',
+        winget_id: 'Mozilla.Firefox',
+        version: '121.0',
+        display_name: 'Firefox',
+        intune_app_id: 'app-fox',
+        intune_tenant_id: 'tenant-2',
+      });
+
+      const history = await adapter.uploadHistory.getByTenantId('tenant-1');
+
+      expect(history.map((h) => h.winget_id).sort()).toEqual(['Git.Git', 'Microsoft.VSCode']);
+    });
+
+    it('should not cap the result, so an old deployment stays findable', async () => {
+      // A missing row reads as "never deployed here", which is what strips a
+      // colleague's assignments and requirement scripts on the next update -
+      // so a truncated page would be a wrong answer, not a shorter one.
+      for (let i = 0; i < 120; i++) {
+        await adapter.uploadHistory.create({
+          user_id: 'admin-a',
+          winget_id: `Noise.${i}`,
+          version: '1.0',
+          display_name: `Noise ${i}`,
+          intune_app_id: `noise-${i}`,
+          intune_tenant_id: 'tenant-1',
+          deployed_at: '2026-01-02T00:00:00Z',
+        });
+      }
+      await adapter.uploadHistory.create({
+        user_id: 'admin-b',
+        winget_id: 'Git.Git',
+        version: '2.43.0',
+        display_name: 'Git',
+        intune_app_id: 'app-git',
+        intune_tenant_id: 'tenant-1',
+        deployed_at: '2026-01-01T00:00:00Z',
+      });
+
+      const history = await adapter.uploadHistory.getByTenantId('tenant-1');
+
+      expect(history.map((h) => h.winget_id)).toContain('Git.Git');
     });
   });
   describe('updateCheckResults', () => {

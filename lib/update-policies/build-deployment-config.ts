@@ -366,19 +366,27 @@ export async function buildDeploymentConfigForApp(
   // Supabase-less callers can omit it.
   _supabase: ReturnType<typeof createServerClient> | null | undefined,
   args: {
-    userId: string;
     tenantId: string;
     wingetId: string;
     latestVersion: string;
   }
 ): Promise<BuildDeploymentConfigResult> {
-  const { userId, tenantId, wingetId, latestVersion } = args;
+  const { tenantId, wingetId, latestVersion } = args;
 
   // Get the original deployment config from upload_history. Both reads go
   // through the db abstraction: the rows live in SQLite as well as Supabase,
   // and the adapter already returns them newest-first.
+  //
+  // The whole tenant's history, not just this user's. The previous deployment
+  // carries the assignments, requirement scripts, relationships and PSADT
+  // settings the app went out with, and those belong to the app rather than to
+  // whoever pressed deploy. Looking only at the caller's own history made a
+  // colleague's app fall through to the catalog default below, which assigns
+  // nothing and carries no requirement rules - so a second administrator's
+  // update silently stripped the app's configuration. The caller has already
+  // proved this user may act on the tenant.
   const db = getDatabase();
-  const tenantHistory = await db.uploadHistory.getByUserIdAndTenantId(userId, tenantId);
+  const tenantHistory = await db.uploadHistory.getByTenantId(tenantId);
   const uploadHistory = tenantHistory.find((row) => row.winget_id === wingetId) || null;
 
   if (uploadHistory?.packaging_job_id) {

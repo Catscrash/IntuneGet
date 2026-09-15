@@ -628,6 +628,28 @@ export const supabaseDb: DatabaseAdapter = {
 
       return data || [];
     },
+
+    /**
+     * Every deployment into one tenant, whoever made it
+     */
+    async getByTenantId(tenantId: string): Promise<UploadHistoryRecord[]> {
+      const supabase = createServerClient();
+      const query = getUploadHistoryQuery(supabase);
+
+      // No .limit(): callers read a missing row as "never deployed here", so a
+      // truncated page would be a wrong answer rather than a shorter one.
+      const { data, error } = await query
+        .select('*')
+        .eq('intune_tenant_id', tenantId)
+        .order('deployed_at', { ascending: false });
+
+      if (isError(error)) {
+        console.error('Error fetching tenant upload history:', error);
+        throw error;
+      }
+
+      return data || [];
+    },
   },
 
   userSettings: {

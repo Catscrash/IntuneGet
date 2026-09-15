@@ -70,17 +70,19 @@ export async function GET(request: NextRequest) {
 
     // Deployment history tells us which apps went out through IntuneGet; it
     // exists in both backends. Query per tenant rather than fetching a capped
-    // page of the user's whole history and filtering here - has_prior_deployment
+    // page of the whole history and filtering here - has_prior_deployment
     // reads a missing row as "never deployed", so a truncated page would be a
     // wrong answer rather than a shorter one. The tenants involved are bounded
-    // by the updates themselves (one, outside MSP setups).
+    // by the updates themselves (one, outside MSP setups), and each of them
+    // already backs a row this user's own update scan wrote.
+    //
+    // Tenant-wide, not per user: "has this app been deployed from IntuneGet
+    // before" is a fact about the tenant. Asked per user, an app a colleague
+    // deployed prompts the "new app" confirmation for everyone else.
     const tenantsInPlay = [...new Set(updates.map((u) => u.tenant_id))];
     const deployedSet = new Set<string>();
     for (const tenant of tenantsInPlay) {
-      const history = await getDatabase().uploadHistory.getByUserIdAndTenantId(
-        user.userId,
-        tenant
-      );
+      const history = await getDatabase().uploadHistory.getByTenantId(tenant);
       for (const row of history) {
         if (wingetIds.includes(row.winget_id)) {
           deployedSet.add(`${row.winget_id}:${tenant}`);

@@ -160,6 +160,7 @@ function initializeSchema(db: Database.Database): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_upload_history_user_id ON upload_history(user_id);
     CREATE INDEX IF NOT EXISTS idx_upload_history_deployed_at ON upload_history(deployed_at);
+    CREATE INDEX IF NOT EXISTS idx_upload_history_tenant_id ON upload_history(intune_tenant_id);
   `);
 
   // Cache of detected app updates. Mirrors the update_check_results table in
@@ -729,6 +730,21 @@ export const sqliteDb: DatabaseAdapter = {
         ORDER BY deployed_at DESC
       `);
       return stmt.all(userId, tenantId) as UploadHistoryRecord[];
+    },
+
+    /**
+     * Every deployment into one tenant, whoever made it
+     */
+    async getByTenantId(tenantId: string): Promise<UploadHistoryRecord[]> {
+      const database = getDb();
+      // No LIMIT: callers read a missing row as "never deployed here", so a
+      // truncated page would be a wrong answer rather than a shorter one.
+      const stmt = database.prepare(`
+        SELECT * FROM upload_history
+        WHERE intune_tenant_id = ?
+        ORDER BY deployed_at DESC
+      `);
+      return stmt.all(tenantId) as UploadHistoryRecord[];
     },
   },
 

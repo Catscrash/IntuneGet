@@ -29,7 +29,12 @@ describe('GET /api/updates/available', () => {
     vi.clearAllMocks();
     getDatabaseMock.mockReturnValue({
       updateCheckResults: { getByUserId: getUpdatesMock },
-      uploadHistory: { getByUserIdAndTenantId: getHistoryMock },
+      uploadHistory: {
+        getByUserIdAndTenantId: getHistoryMock,
+        // Provenance is a tenant fact, not a per-user one: an app a
+        // colleague deployed is still an IntuneGet app.
+        getByTenantId: getHistoryMock,
+      },
       updatePolicies: { getForWingetIds: getPoliciesMock },
     });
     getUpdatesMock.mockResolvedValue([]);
@@ -201,6 +206,42 @@ describe('GET /api/updates/available', () => {
     expect(body.updates[0].winget_id).toBe('Microsoft.Edge');
     expect(body.updates[0].has_prior_deployment).toBe(true);
     expect(body.updates[0].policy).toBeNull();
+  });
+
+  it("counts a colleague's deployment as a prior deployment", async () => {
+    // has_prior_deployment drives the "Create New App" confirmation on the
+    // updates page. Asked per user, an app another administrator deployed
+    // prompted it for everyone else - and confirming there is what sends the
+    // update out without the previous version's configuration.
+    getUpdatesMock.mockResolvedValue([
+      {
+        id: 'upd-1',
+        user_id: 'admin-b',
+        tenant_id: 'tenant-a',
+        winget_id: 'Git.Git',
+        intune_app_id: 'app-git',
+        display_name: 'Git',
+        current_version: '2.43.0',
+        latest_version: '2.45.0',
+        is_critical: false,
+        is_managed: true,
+        detected_at: '2026-02-01T00:00:00Z',
+        notified_at: null,
+        dismissed_at: null,
+      },
+    ]);
+    getHistoryMock.mockResolvedValue([
+      { winget_id: 'Git.Git', intune_tenant_id: 'tenant-a', user_id: 'admin-a' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    const response = await GET(request);
+    const body = await response.json();
+
+    expect(getHistoryMock).toHaveBeenCalledWith('tenant-a');
+    expect(body.updates[0].has_prior_deployment).toBe(true);
   });
 
   it('reports the ignore and pin policies that let the page hold an app back', async () => {

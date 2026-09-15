@@ -18,6 +18,7 @@ import { compareVersions, hasUpdate, normalizeVersion } from '@/lib/version-comp
 import { isSelfUpdatingApp } from '@/lib/self-updating-apps';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { getCatalogSource } from '@/lib/catalog';
+import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
 import type { IntuneWin32App, AppUpdateInfo } from '@/types/inventory';
 
 const GRAPH_API_BASE = 'https://graph.microsoft.com/beta';
@@ -58,12 +59,12 @@ interface ManualAppMappingRow {
   winget_package_id: string;
 }
 
-function extractWingetIdFromDescription(description: string | null): string | null {
-  if (!description) {
+function extractWingetIdMarker(value: string | null): string | null {
+  if (!value) {
     return null;
   }
 
-  const match = description.match(
+  const match = value.match(
     /Winget:\s*([A-Za-z0-9]+\.[A-Za-z0-9]+(?:\.[A-Za-z0-9-]+)*)/i
   );
 
@@ -73,6 +74,29 @@ function extractWingetIdFromDescription(description: string | null): string | nu
 
   const candidate = match[1].trim();
   return isValidWingetId(candidate) ? candidate : null;
+}
+
+/**
+ * The package id IntuneGet stamped on an app when it deployed it.
+ *
+ * The marker is written to `notes` today - an admin-only field, so the
+ * fingerprint stays out of what end users read in Company Portal - and was
+ * written into the description before that. Both are read, in that order, or
+ * every app deployed by the current packager would look like a stranger's.
+ * Same convention as the packager's duplicate guard.
+ */
+function extractDeployedWingetId(app: IntuneWin32App): string | null {
+  return extractWingetIdMarker(app.notes) ?? extractWingetIdMarker(app.description);
+}
+
+/**
+ * Whether an app carries the product marker older releases wrote into the
+ * description. It names no package, so it can only confirm provenance for an
+ * app some other signal already matched to a package - but that is enough to
+ * keep apps deployed before the switch from being demoted to fuzzy matches.
+ */
+function hasLegacyIntuneGetMarker(app: IntuneWin32App): boolean {
+  return Boolean(app.description?.includes(LEGACY_INTUNE_APP_SOURCE_MARKER));
 }
 
 // Extend timeout for Vercel (Pro plan: up to 60s)
@@ -173,12 +197,15 @@ export async function GET(request: NextRequest) {
     // Deployment history is the strongest signal for "this app is ours", and
     // it exists in both backends, so it goes through the db abstraction rather
     // than a direct Supabase query.
+    //
+    // Read for the whole tenant, not just the signed-in user: tenants are
+    // worked by several administrators, and an app a colleague deployed is
+    // still an IntuneGet app. Scoping this to one user made every colleague's
+    // package look like a fuzzy name match. The user's access to this tenant
+    // was proved above (token tenant, or MSP resolution plus consent).
     const uploadHistoryWingetMap = new Map<string, string>();
     const uploadHistoryVersionMap = new Map<string, string>();
-    const tenantHistoryRows = await getDatabase().uploadHistory.getByUserIdAndTenantId(
-      user.userId,
-      tenantId
-    );
+    const tenantHistoryRows = await getDatabase().uploadHistory.getByTenantId(tenantId);
 
     for (const row of tenantHistoryRows as UploadHistoryMappingRow[]) {
       if (row.intune_app_id && row.winget_id) {
@@ -258,11 +285,11 @@ export async function GET(request: NextRequest) {
         continue;
       }
 
-      const descriptionWingetId = extractWingetIdFromDescription(app.description);
-      if (descriptionWingetId) {
+      const markerWingetId = extractDeployedWingetId(app);
+      if (markerWingetId) {
         matchedApps.push({
           app,
-          wingetId: descriptionWingetId,
+          wingetId: markerWingetId,
           isManaged: true,
         });
         continue;
@@ -311,7 +338,10 @@ export async function GET(request: NextRequest) {
       matchedApps.push({
         app,
         wingetId: match.wingetId,
-        isManaged: false,
+        // Apps deployed before the package-id marker existed carry only the
+        // old product line, which names no package - so the match had to come
+        // from the heuristics, but the provenance is still explicit.
+        isManaged: hasLegacyIntuneGetMarker(app),
       });
     }
 
