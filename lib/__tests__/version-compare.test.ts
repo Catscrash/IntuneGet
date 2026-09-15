@@ -66,4 +66,27 @@ describe('normalizeVersion', () => {
     expect(normalizeVersion('1.2')).toBe('1.2.0');
     expect(normalizeVersion(null)).toBe('0.0.0');
   });
+
+  it('keeps the revision of a 4-segment version', () => {
+    expect(normalizeVersion('1.4.1.1030')).toBe('1.4.1.1030');
+    expect(normalizeVersion('v0.85.0.0')).toBe('0.85.0.0');
+  });
+});
+
+describe('normalizeVersion feeding hasUpdate', () => {
+  // The update route normalizes both sides before comparing, so the parser and
+  // comparator being 4-segment aware was not enough: normalizeVersion truncated
+  // to three first, "1.4.1.1030" and "1.4.1.1032" both became "1.4.1", and the
+  // revision update was never reported. Guard the combination, not just the
+  // parts - testing them separately is exactly what let this through.
+  it('reports a revision-only update through the full pipeline', () => {
+    expect(hasUpdate(normalizeVersion('1.4.1.1030'), normalizeVersion('1.4.1.1032'))).toBe(true);
+    expect(hasUpdate(normalizeVersion('1.4.1.1032'), normalizeVersion('1.4.1.1030'))).toBe(false);
+    expect(hasUpdate(normalizeVersion('1.4.1.1030'), normalizeVersion('1.4.1.1030'))).toBe(false);
+  });
+
+  it('still treats a padded 3-segment version as equal to its 4-segment form', () => {
+    expect(hasUpdate(normalizeVersion('1.2'), normalizeVersion('1.2.0.0'))).toBe(false);
+    expect(hasUpdate(normalizeVersion('1.2.0.0'), normalizeVersion('1.2'))).toBe(false);
+  });
 });

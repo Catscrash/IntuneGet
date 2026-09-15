@@ -131,7 +131,15 @@ export function hasUpdate(currentVersion: string, latestVersion: string): boolea
 }
 
 /**
- * Normalize version string for comparison
+ * Normalize a version string for comparison.
+ *
+ * Pads to three segments so "1.2" and "1.2.0" compare equal, and keeps every
+ * segment beyond that. Truncating to three used to drop the revision of
+ * 4-part versions - common for MSI and for winget packages like
+ * "1.4.1.1030" - on all three inputs of the update comparison, so a revision
+ * bump normalized to the same string on both sides and no update was ever
+ * reported. compareVersions itself has handled any number of segments since
+ * the parser was fixed; this was the step in front of it that threw them away.
  */
 export function normalizeVersion(version: string | null | undefined): string {
   if (!version) return '0.0.0';
@@ -148,7 +156,7 @@ export function normalizeVersion(version: string | null | undefined): string {
     parts.push('0');
   }
 
-  return parts.slice(0, 3).join('.');
+  return parts.join('.');
 }
 
 /**

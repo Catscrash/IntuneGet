@@ -26,7 +26,11 @@ import {
   generateInstallCommand,
   generateUninstallCommand,
 } from '@/lib/detection-rules';
-import { normalizeInstaller } from '@/lib/manifest-api';
+import {
+  fetchInstallerManifest,
+  normalizeInstaller,
+  normalizeManifestInstallers,
+} from '@/lib/manifest-api';
 import { upgradeLegacyPackageDefaults } from '@/lib/update-policies/upgrade-legacy-package-defaults';
 import {
   applyApplicationPackagingAdapter,
@@ -922,18 +926,45 @@ export async function getLatestInstallerInfo(
   const latestVersion = curatedApp.latest_version;
 
   // Get the version history for the latest version
-  const versionInfo = await catalog.getVersionInstallerInfo(
+  let versionInfo = await catalog.getVersionInstallerInfo(
     wingetId,
     latestVersion
   );
 
   if (!versionInfo) {
-    return {
-      ok: false,
-      failure: {
-        reason: 'version_record_missing',
-        message: `The catalog has not synced the installer manifest for ${wingetId} ${latestVersion} yet. Try again after the next catalog sync.`,
-      },
+    // latest_version and the manifest row are written by different jobs, so
+    // the catalog can name a version it has no installer row for. The
+    // packaging path already survives that by reading the manifest straight
+    // from WinGet; without the same fallback the update path was the only one
+    // that failed outright, and an update stayed impossible until the next
+    // sync even though the bytes were fetchable all along.
+    //
+    // Best effort: fetchInstallerManifest swallows its own errors, and
+    // normalizeManifestInstallers inherits the manifest-level defaults
+    // (scope, switches, type) into every installer, so the selection below
+    // sees the same shape it gets from a stored row.
+    const liveManifest = await fetchInstallerManifest(wingetId, latestVersion);
+    const liveInstallers = liveManifest
+      ? normalizeManifestInstallers(liveManifest)
+      : [];
+
+    if (liveInstallers.length === 0) {
+      return {
+        ok: false,
+        failure: {
+          reason: 'version_record_missing',
+          message: `The catalog has not synced the installer manifest for ${wingetId} ${latestVersion} yet, and it could not be read from WinGet either. Try again after the next catalog sync.`,
+        },
+      };
+    }
+
+    versionInfo = {
+      installer_url: null,
+      installer_sha256: null,
+      installer_type: null,
+      installer_scope: null,
+      silent_args: null,
+      installers: liveInstallers,
     };
   }
 

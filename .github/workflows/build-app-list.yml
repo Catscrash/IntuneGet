@@ -251,35 +251,93 @@ jobs:
             let totalUpserted = 0;
             let errors = 0;
 
+            // Which apps the catalog already knows. This decides whether the
+            // index may set latest_version, see the split below.
+            const existingIds = new Set();
+            let existingScanOk = true;
+            {
+              const pageSize = 1000;
+              for (let from = 0; ; from += pageSize) {
+                const { data, error } = await supabase
+                  .from('curated_apps')
+                  .select('winget_id')
+                  .order('winget_id')
+                  .range(from, from + pageSize - 1);
+                if (error) {
+                  console.error('Existing-app scan failed:', error.message);
+                  errors++;
+                  existingScanOk = false;
+                  break;
+                }
+                if (!data || data.length === 0) break;
+                for (const row of data) existingIds.add(row.winget_id);
+                if (data.length < pageSize) break;
+              }
+            }
+
+            // The index says which packages exist; it must not say which
+            // version is deployable. It carries a version but no installer
+            // manifest, and the update path resolves installers by looking up
+            // curated_apps.latest_version in version_history. Advancing the
+            // version here left every consumer pointing at a manifest row that
+            // only the manifest sync writes, hours later - reported as "the
+            // catalog has not synced the installer manifest for <app> <version>
+            // yet". So latest_version is written only when the row is new (it
+            // has nothing to invalidate), and for known apps it is left to the
+            // manifest sync, which writes version_history first and advances
+            // latest_version afterwards.
+            //
+            // A failed scan falls back to treating every app as known: a new
+            // row then starts with a null latest_version, which reads as "no
+            // version recorded yet" and is corrected by the next manifest sync.
+            // Guessing the other way would recreate exactly the gap above.
+            const newApps = existingScanOk
+              ? filteredAppsToUpsert.filter(app => !existingIds.has(app.winget_id))
+              : [];
+            const knownApps = existingScanOk
+              ? filteredAppsToUpsert.filter(app => existingIds.has(app.winget_id))
+              : filteredAppsToUpsert;
+            // Omitted keys are left untouched by an upsert, so dropping
+            // latest_version here preserves whatever the manifest sync stored.
+            const knownAppsWithoutVersion = knownApps.map(({ latest_version, ...rest }) => rest);
+            console.log(`Upserting ${newApps.length} new apps (with index version) and ${knownAppsWithoutVersion.length} known apps (version left to the manifest sync)`);
+
+            const upsertPasses = [
+              { label: 'new', rows: newApps },
+              { label: 'known', rows: knownAppsWithoutVersion },
+            ];
+
             let purgedExisting = 0;
             let purgedRecased = 0;
             try {
-              for (let i = 0; i < filteredAppsToUpsert.length; i += batchSize) {
-                const batch = filteredAppsToUpsert.slice(i, i + batchSize);
+              for (const pass of upsertPasses) {
+                for (let i = 0; i < pass.rows.length; i += batchSize) {
+                  const batch = pass.rows.slice(i, i + batchSize);
 
-                const { error } = await supabase
-                  .from('curated_apps')
-                  .upsert(batch, {
-                    onConflict: 'winget_id',
-                    ignoreDuplicates: false
-                  });
+                  const { error } = await supabase
+                    .from('curated_apps')
+                    .upsert(batch, {
+                      onConflict: 'winget_id',
+                      ignoreDuplicates: false
+                    });
 
-                if (error) {
-                  console.error(`Batch ${Math.floor(i / batchSize) + 1} failed:`, error.message);
-                  errors++;
-                  // Continue with next batch
-                } else {
-                  totalUpserted += batch.length;
-                }
+                  if (error) {
+                    console.error(`Batch ${Math.floor(i / batchSize) + 1} (${pass.label}) failed:`, error.message);
+                    errors++;
+                    // Continue with next batch
+                  } else {
+                    totalUpserted += batch.length;
+                  }
 
-                // Progress logging every 10 batches
-                if ((i / batchSize) % 10 === 0) {
-                  console.log(`Progress: ${Math.min(i + batchSize, filteredAppsToUpsert.length)}/${filteredAppsToUpsert.length}`);
-                }
+                  // Progress logging every 10 batches
+                  if ((i / batchSize) % 10 === 0) {
+                    console.log(`Progress (${pass.label}): ${Math.min(i + batchSize, pass.rows.length)}/${pass.rows.length}`);
+                  }
 
-                // Small delay between batches to avoid rate limiting
-                if (i + batchSize < filteredAppsToUpsert.length) {
-                  await new Promise(r => setTimeout(r, 100));
+                  // Small delay between batches to avoid rate limiting
+                  if (i + batchSize < pass.rows.length) {
+                    await new Promise(r => setTimeout(r, 100));
+                  }
                 }
               }
 

@@ -14,11 +14,21 @@ const {
   getAppForInstallerMock,
   getVersionInstallerInfoMock,
   ensureQaDemandMock,
+  fetchInstallerManifestMock,
 } = vi.hoisted(() => ({
   getQaResultMock: vi.fn(),
   getAppForInstallerMock: vi.fn(),
   getVersionInstallerInfoMock: vi.fn(),
   ensureQaDemandMock: vi.fn(),
+  fetchInstallerManifestMock: vi.fn(),
+}));
+
+// Only the network reach is stubbed. normalizeManifestInstallers and
+// normalizeInstaller stay real, so the fallback is exercised through the same
+// manifest shaping the production path uses.
+vi.mock('@/lib/manifest-api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/manifest-api')>()),
+  fetchInstallerManifest: fetchInstallerManifestMock,
 }));
 vi.mock('@/lib/catalog', () => ({
   getCatalogSource: () => ({
@@ -158,6 +168,9 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     getQaResultMock.mockResolvedValue(null);
     getAppForInstallerMock.mockReset();
     getVersionInstallerInfoMock.mockReset();
+    // No live manifest unless a case asks for one.
+    fetchInstallerManifestMock.mockReset();
+    fetchInstallerManifestMock.mockResolvedValue(null);
     ensureQaDemandMock.mockResolvedValue({
       state: 'waiting',
       candidateId: 'candidate-1',
@@ -290,9 +303,10 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     expect(result.failure.message).toContain('Test.App');
   });
 
-  it('reports when the latest version manifest has not been synced', async () => {
+  it('reports when neither the catalog nor WinGet has the manifest', async () => {
     getAppForInstallerMock.mockResolvedValue({ name: 'Test App', latest_version: '2.0.0' });
     getVersionInstallerInfoMock.mockResolvedValue(null);
+    fetchInstallerManifestMock.mockResolvedValue(null);
 
     const result = await getLatestInstallerInfo({} as never, 'Test.App');
 
@@ -302,6 +316,69 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     });
     if (result.ok) throw new Error('Expected installer resolution to fail');
     expect(result.failure.message).toContain('Test.App');
+  });
+
+  it('falls back to the live WinGet manifest when the catalog row is missing', async () => {
+    // curated_apps.latest_version and the version_history row are written by
+    // different jobs, so the catalog can name a version it has no installer
+    // row for. The packaging path already reads the manifest live; without the
+    // same fallback here an update was impossible until the next sync even
+    // though the installer was fetchable the whole time.
+    getAppForInstallerMock.mockResolvedValue({ name: 'Test App', latest_version: '2.0.0' });
+    getVersionInstallerInfoMock.mockResolvedValue(null);
+    fetchInstallerManifestMock.mockResolvedValue({
+      PackageIdentifier: 'Test.App',
+      PackageVersion: '2.0.0',
+      InstallerType: 'msi',
+      Scope: 'machine',
+      Installers: [
+        {
+          Architecture: 'x64',
+          InstallerUrl: 'https://example.com/test-2.0.0-x64.msi',
+          InstallerSha256: 'C'.repeat(64),
+        },
+      ],
+    });
+
+    const result = await getLatestInstallerInfo({} as never, 'Test.App', 'x64');
+
+    expect(fetchInstallerManifestMock).toHaveBeenCalledWith('Test.App', '2.0.0');
+    expect(result).toMatchObject({ ok: true });
+    if (!result.ok) throw new Error('Expected installer resolution to succeed');
+    expect(result.info).toMatchObject({
+      latestVersion: '2.0.0',
+      installerUrl: 'https://example.com/test-2.0.0-x64.msi',
+      installerSha256: 'C'.repeat(64),
+      installerType: 'msi',
+    });
+    // Manifest-level defaults have to reach the selected installer, or the
+    // fallback would silently drop scope and switches the stored row carries.
+    expect(result.info.installScope).toBe('machine');
+  });
+
+  it('prefers the catalog row and does not reach for WinGet when one exists', async () => {
+    getAppForInstallerMock.mockResolvedValue({ name: 'Test App', latest_version: '2.0.0' });
+    getVersionInstallerInfoMock.mockResolvedValue({
+      installer_url: 'https://example.com/from-catalog.msi',
+      installer_sha256: 'D'.repeat(64),
+      installer_type: 'msi',
+      installer_scope: 'machine',
+      silent_args: null,
+      installers: [
+        {
+          Architecture: 'x64',
+          InstallerUrl: 'https://example.com/from-catalog.msi',
+          InstallerSha256: 'D'.repeat(64),
+          InstallerType: 'msi',
+          Scope: 'machine',
+        },
+      ],
+    });
+
+    const result = await getLatestInstallerInfo({} as never, 'Test.App', 'x64');
+
+    expect(result).toMatchObject({ ok: true });
+    expect(fetchInstallerManifestMock).not.toHaveBeenCalled();
   });
 
   it('reports missing per-architecture installer metadata', async () => {
