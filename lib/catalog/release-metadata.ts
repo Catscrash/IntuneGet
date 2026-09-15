@@ -12,6 +12,7 @@ export const releasePairKey = (row: ReleasePair) => JSON.stringify([row.winget_i
 export async function loadReleaseMetadata(
   rows: ReleasePair[],
   fetchBatch: (batch: ReleasePair[]) => PromiseLike<MetadataResponse>,
+  fetchSingle?: (row: ReleasePair) => PromiseLike<MetadataResponse>,
 ) {
   const batches = Array.from({ length: Math.ceil(rows.length / 10) }, (_, i) => rows.slice(i * 10, (i + 1) * 10));
   const results = await Promise.allSettled(batches.map(async batch => {
@@ -19,6 +20,7 @@ export async function loadReleaseMetadata(
       try {
         const response = await fetchBatch(batch);
         if (!response.error && response.data) return response.data;
+        if (fetchSingle && response.status === 0) throw new Error('Release metadata unavailable (request aborted)');
         const transient = response.status === 0 || response.status === 408 || response.status === 429 || response.status >= 500 || response.error?.code === '57014';
         if (!transient || attempt === 1) throw new Error(`Release metadata unavailable (HTTP ${response.status})`);
       } catch (error) {
@@ -36,5 +38,22 @@ export async function loadReleaseMetadata(
       console.warn('Release metadata batch unavailable', { batchSize: batches[i].length });
     }
   });
+  // Recover healthy rows individually when a batch fails. Limit database pressure.
+  if (fetchSingle && unavailable.size) {
+    const pending = rows.filter(row => unavailable.has(releasePairKey(row)));
+    let next = 0;
+    await Promise.all(Array.from({length: Math.min(4, pending.length)}, async () => {
+      while (next < pending.length) {
+        const row = pending[next++];
+        try {
+          const response = await fetchSingle(row);
+          if (!response.error && response.data) {
+            metadata.push(...response.data);
+            unavailable.delete(releasePairKey(row));
+          }
+        } catch { /* Preserve the unavailable state only for this pair. */ }
+      }
+    }));
+  }
   return { metadata, unavailable };
 }

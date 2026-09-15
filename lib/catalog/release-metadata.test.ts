@@ -32,3 +32,32 @@ describe('release metadata loading', () => {
     warn.mockRestore();
   });
 });
+
+it('recovers failed batches with bounded single-row lookups and isolates one failed file', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  let active = 0;
+  let peak = 0;
+  const singles = vi.fn(async (row: typeof rows[number]) => {
+    peak = Math.max(peak, ++active);
+    await new Promise(resolve => setTimeout(resolve, 1));
+    active--;
+    if (row.winget_id === 'Example.3') throw new Error('Unavailable');
+    return {data: evidence([row]), error:null, status:200};
+  });
+  const result = await loadReleaseMetadata(rows, async () => ({data:null,error:{},status:503}), singles);
+  expect(peak).toBeLessThanOrEqual(4);
+  expect(singles).toHaveBeenCalledTimes(40);
+  expect(result.metadata).toHaveLength(39);
+  expect([...result.unavailable]).toEqual([releasePairKey(rows[3])]);
+  warn.mockRestore();
+});
+
+it('skips an aborted batch retry when individual recovery is available', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const batch = vi.fn(async () => ({data:null,error:{},status:0}));
+  const result = await loadReleaseMetadata(rows.slice(0,1), batch, async row => ({data:evidence([row]),error:null,status:200}));
+  expect(batch).toHaveBeenCalledTimes(1);
+  expect(result.unavailable.size).toBe(0);
+  expect(result.metadata).toHaveLength(1);
+  warn.mockRestore();
+});

@@ -199,13 +199,14 @@ describe('enforceQaGate', () => {
     ).rejects.toBeInstanceOf(QaSecurityGateError);
   });
 
-  it('does not allow a QA override to bypass an exact compatibility block', async () => {
+  it.each(['expired_signing_certificate', 'failed_managed_lifecycle', 'unverified_file_reputation'])(
+    'does not allow a QA override to bypass an exact %s block', async (code) => {
     getPackageCompatibilityBlockMock.mockResolvedValueOnce({
       wingetId: 'r12f.DivoomGateway',
       version: '0.1.42.0',
       architecture: 'x64',
       installerSha256,
-      code: 'expired_signing_certificate',
+      code,
       detail: 'The signing certificate is expired.',
     });
 
@@ -218,6 +219,78 @@ describe('enforceQaGate', () => {
     })).rejects.toBeInstanceOf(QaCompatibilityGateError);
 
     expect(getPackageResultMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks the exact Twinkstar release with override=%s', async (qaOverride) => {
+    const tuple = {
+      wingetId: 'Twinkstar.TwinkstarBrowser', version: '11.4.1000.2609',
+      architecture: 'x64',
+      installerSha256: '3671D4C0693240501854274692724B9A98C35B1E869066CF40985F43D4738668',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Exact registration remained.',
+    });
+    await expect(enforceQaGate({ ...tuple, qaOverride })).rejects.toBeInstanceOf(QaCompatibilityGateError);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), tuple);
+    expect(getPackageResultMock).not.toHaveBeenCalled();
+    expect(getQaResultMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks the exact failed SSIS release with override=%s', async (qaOverride) => {
+    const tuple = {
+      wingetId: 'Microsoft.DataTools.IntegrationServices', version: '17.0.1010.2',
+      architecture: 'x86',
+      installerSha256: '75D8444333303D5B449660A669AF07862289E5F2BBDEF0AE7520C5BA3E47D65B',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Install failed with exit 1626.',
+    });
+    await expect(enforceQaGate({ ...tuple, qaOverride })).rejects.toBeInstanceOf(QaCompatibilityGateError);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), tuple);
+    expect(getPackageResultMock).not.toHaveBeenCalled();
+    expect(getQaResultMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks the exact Pithflow release with override=%s', async (qaOverride) => {
+    const tuple = {
+      wingetId: 'Pithflow.Pithflow', version: '1.37.0', architecture: 'x64',
+      installerSha256: '536AD9787092DFBD9F23C9F5FD4EA1ED81B1A363736AE68B3B3BFCED627028D4',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Registered uninstaller was absent.',
+    });
+    await expect(enforceQaGate({ ...tuple, qaOverride })).rejects.toBeInstanceOf(QaCompatibilityGateError);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), tuple);
+    expect(getPackageResultMock).not.toHaveBeenCalled();
+    expect(getQaResultMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks the exact Orca release with override=%s', async (qaOverride) => {
+    const tuple = {
+      wingetId: 'StablyAI.Orca', version: '1.4.203', architecture: 'x64',
+      installerSha256: 'DC347211CE31DC1D37BD6522B2BB96169747F626A19754C57F6868769E878A7C',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Registered uninstaller was absent.',
+    });
+    await expect(enforceQaGate({ ...tuple, qaOverride })).rejects.toBeInstanceOf(QaCompatibilityGateError);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), tuple);
+    expect(getPackageResultMock).not.toHaveBeenCalled();
+    expect(getQaResultMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks the mismatched MTGA Launcher release with override=%s', async (qaOverride) => {
+    const tuple = {
+      wingetId: 'WizardsoftheCoast.MTGALauncher', version: '1.0.124', architecture: 'x64',
+      installerSha256: '96C64E5E0CD4D5758F3C9AE1AF7A2C6FFCF4782E273AEDE28FA92B8E63FFC368',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Manifest launcher identity was absent.',
+    });
+    await expect(enforceQaGate({ ...tuple, qaOverride })).rejects.toBeInstanceOf(QaCompatibilityGateError);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), tuple);
+    expect(getPackageResultMock).not.toHaveBeenCalled();
+    expect(getQaResultMock).not.toHaveBeenCalled();
   });
 
   it('blocks a flagged current version even when its installation test passed', async () => {

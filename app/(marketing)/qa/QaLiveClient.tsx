@@ -1,11 +1,11 @@
 'use client';
 
 import { useState } from 'react';
-import Image from 'next/image';
 import { T, Var } from 'gt-next';
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronRight,
   ListOrdered,
   Loader2,
   Monitor,
@@ -19,6 +19,7 @@ import {
 import { AppIcon } from '@/components/AppIcon';
 import { QueryProvider } from '@/components/providers/QueryProvider';
 import { QaDetailsDialog } from '@/components/qa/QaDetailsDialog';
+import { QaVmViewer } from '@/components/qa/QaVmViewer';
 import { QaLiveActivityDialog } from '@/components/qa/QaLiveActivityDialog';
 import { QaLiveStepTimeline } from '@/components/qa/QaLiveStepTimeline';
 import { StatusBadge, type StatusTone } from '@/components/ui/status-badge';
@@ -32,6 +33,7 @@ import {
 } from '@/lib/qa/presentation';
 import { cn } from '@/lib/utils';
 import type { QaLivePhase, QaLiveResponse, QaVirusTotalStatus } from '@/types/qa';
+import styles from './QaLiveClient.module.css';
 
 function healthTone(state: string): StatusTone {
   if (state === 'healthy' || state === 'testing' || state === 'idle') return 'success';
@@ -113,48 +115,10 @@ function QaVirusTotalCell({ status }: { status: QaVirusTotalStatus | null }) {
   return <span className="text-xs text-text-muted" aria-hidden="true">—</span>;
 }
 
-function resultEdgeClass(outcome: 'Passed' | 'Failed'): string {
-  return outcome === 'Passed'
-    ? 'border-l-status-success/60'
-    : 'border-l-status-error/60';
-}
-
-function LiveFrameImage({ src, alt }: { src: string; alt: string }) {
-  const [visibleSrc, setVisibleSrc] = useState<string | null>(null);
-
-  return (
-    <>
-      {visibleSrc ? (
-        <Image
-          src={visibleSrc}
-          alt={alt}
-          fill
-          unoptimized
-          loading="eager"
-          sizes="(min-width: 1024px) 960px, 100vw"
-          className="animate-fade-in object-contain motion-reduce:animate-none"
-        />
-      ) : null}
-      {src !== visibleSrc ? (
-        <Image
-          src={src}
-          alt=""
-          aria-hidden="true"
-          fill
-          unoptimized
-          loading="eager"
-          sizes="(min-width: 1024px) 960px, 100vw"
-          className="object-contain opacity-0"
-          onLoad={() => setVisibleSrc(src)}
-        />
-      ) : null}
-    </>
-  );
-}
-
 function ServiceHealth({ data }: { data: QaLiveResponse }) {
   const runnerAge = formatRelativeTime(data.runner.heartbeatAt, data.serverTime);
   const pollAge = formatRelativeTime(data.scheduler.lastPollAt, data.serverTime);
+  const pollIsRunning = data.scheduler.lastOutcome === 'running';
   const schedulerIssue = schedulerIssueLabel(data.scheduler.issue);
   const hasIncident = data.runner.state === 'stalled' || data.scheduler.state === 'degraded';
   const passCount = data.recent.filter((item) => item.outcome === 'Passed').length;
@@ -193,10 +157,16 @@ function ServiceHealth({ data }: { data: QaLiveResponse }) {
             <p className="text-[11px] uppercase tracking-wide text-text-muted"><T>WinGet polling</T></p>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <StatusBadge tone={healthTone(data.scheduler.state)}>
-                <T>{data.scheduler.state === 'healthy' ? 'Healthy' : data.scheduler.state === 'degraded' ? 'Degraded' : 'Waiting for first scan'}</T>
+                <T>{data.scheduler.state === 'healthy' ? (pollIsRunning ? 'Scanning' : 'Healthy') : data.scheduler.state === 'degraded' ? 'Degraded' : 'Waiting for first scan'}</T>
               </StatusBadge>
               <span className="text-xs text-text-muted">
-                {pollAge ? <T>Last scan <Var>{pollAge}</Var></T> : <T>No scan recorded yet</T>}
+                {pollIsRunning
+                  ? pollAge
+                    ? <T>Started <Var>{pollAge}</Var></T>
+                    : <T>Scanning now</T>
+                  : pollAge
+                    ? <T>Last scan <Var>{pollAge}</Var></T>
+                    : <T>No scan recorded yet</T>}
               </span>
             </div>
           </div>
@@ -298,20 +268,23 @@ function CurrentTest({ data }: { data: QaLiveResponse }) {
 
             <div className="grid items-stretch gap-4 lg:grid-cols-[minmax(0,1fr)_360px] xl:grid-cols-[minmax(0,1fr)_400px]">
               <div
-                className="relative -mx-5 aspect-video w-[calc(100%+2.5rem)] overflow-hidden bg-black sm:mx-0 sm:w-auto sm:rounded-xl lg:aspect-auto lg:min-h-[36rem]"
+                className="relative isolate aspect-video w-full self-start rounded-xl"
                 aria-label={`Preparing the isolated QA VM for ${next.displayName}`}
               >
-                <div className="absolute inset-0 animate-shimmer bg-[radial-gradient(circle_at_center,rgba(8,145,178,0.12),transparent_45%)] motion-reduce:animate-none" />
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 px-6 text-center">
-                  <span className="relative flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-accent-cyan">
-                    <span className="absolute inset-0 animate-ping rounded-2xl border border-accent-cyan/20 motion-reduce:animate-none" aria-hidden="true" />
-                    <Monitor className="h-7 w-7" aria-hidden="true" />
-                  </span>
-                  <div>
-                    <p className="font-medium text-white/85"><T>Preparing a clean test VM</T></p>
-                    <p className="mt-1 max-w-md text-sm text-white/50">
-                      <T>The runner will start <Var>{next.displayName}</Var> automatically and the live preview will appear here.</T>
-                    </p>
+                <span className={styles.viewerBorder} aria-hidden="true" />
+                <div className="absolute inset-0 overflow-hidden rounded-[inherit] bg-black">
+                  <div className="absolute inset-0 animate-shimmer bg-[radial-gradient(circle_at_center,rgba(8,145,178,0.12),transparent_45%)] motion-reduce:animate-none" />
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 px-6 text-center">
+                    <span className="relative flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-accent-cyan">
+                      <span className="absolute inset-0 animate-ping rounded-2xl border border-accent-cyan/20 motion-reduce:animate-none" aria-hidden="true" />
+                      <Monitor className="h-7 w-7" aria-hidden="true" />
+                    </span>
+                    <div>
+                      <p className="font-medium text-white/85"><T>Preparing a clean test VM</T></p>
+                      <p className="mt-1 max-w-md text-sm text-white/50">
+                        <T>The runner will start <Var>{next.displayName}</Var> automatically and the live preview will appear here.</T>
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -413,29 +386,20 @@ function CurrentTest({ data }: { data: QaLiveResponse }) {
 
         <div className="grid items-stretch gap-4 lg:grid-cols-[minmax(0,1fr)_360px] xl:grid-cols-[minmax(0,1fr)_400px]">
           <div
-            className="relative -mx-5 aspect-video w-[calc(100%+2.5rem)] overflow-hidden bg-black sm:mx-0 sm:w-auto sm:rounded-xl lg:aspect-auto lg:min-h-[36rem]"
+            className="relative isolate aspect-video w-full self-start rounded-xl"
             aria-labelledby="live-console-heading"
           >
+            <span className={styles.viewerBorder} aria-hidden="true" />
             <h3 id="live-console-heading" className="sr-only"><T>Live test VM</T></h3>
-            {frameState === 'live' ? (
-              <span className="absolute right-4 top-4 z-10 animate-pulse text-xs font-semibold uppercase tracking-[0.16em] text-status-success drop-shadow-[0_1px_3px_rgba(0,0,0,0.9)] motion-reduce:animate-none">
-                <T>Live</T>
-              </span>
-            ) : null}
-            <div className="absolute inset-0">
-              {data.viewer.available && data.viewer.sequence != null && data.viewer.candidateId ? (
-                <LiveFrameImage
-                  key={data.viewer.candidateId}
-                  src={`/api/qa/live/frame?candidate=${encodeURIComponent(data.viewer.candidateId)}&sequence=${data.viewer.sequence}`}
-                  alt={`Read-only live view of the isolated QA VM while testing ${data.current.displayName}`}
-                />
-              ) : (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
-                  <Monitor className="h-8 w-8 text-white/25" aria-hidden="true" />
-                  <p className="max-w-md text-sm text-white/50"><T>The private host is preparing a safe, read-only VM console view. No keyboard, mouse, clipboard, or audio channel is exposed.</T></p>
-                </div>
-              )}
-            </div>
+            <QaVmViewer
+              key={`${data.current.wingetId}-${data.current.startedAt}`}
+              src={data.viewer.available && data.viewer.sequence != null && data.viewer.candidateId
+                ? `/api/qa/live/frame?candidate=${encodeURIComponent(data.viewer.candidateId)}&sequence=${data.viewer.sequence}`
+                : null}
+              appName={data.current.displayName}
+              phaseLabel={phase.label}
+              frameState={frameState}
+            />
           </div>
           <QaLiveStepTimeline
             phase={data.current.phase}
@@ -443,6 +407,7 @@ function CurrentTest({ data }: { data: QaLiveResponse }) {
           />
           <div className="lg:col-start-1 lg:row-start-2">
             <QaLiveActivityDialog
+              app={data.current}
               activity={data.activity}
               log={data.log}
               phase={data.current.phase}
@@ -472,8 +437,8 @@ function DashboardContent() {
         <div className="space-y-6" aria-hidden="true">
           <div className="h-64 sm:h-32 lg:h-16 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
           <div className="h-[600px] lg:h-[480px] animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
-            <div className="h-80 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
+          <div className="space-y-6">
+            <div className="h-40 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
             <div className="h-80 animate-pulse rounded-2xl border border-overlay/10 bg-bg-elevated motion-reduce:animate-none" />
           </div>
         </div>
@@ -496,7 +461,7 @@ function DashboardContent() {
       <ServiceHealth data={data} />
       <CurrentTest data={data} />
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+      <div className="space-y-6">
         <section className="min-w-0 rounded-2xl border border-overlay/10 bg-bg-elevated p-5 sm:p-6" aria-labelledby="queue-heading">
           <div className="mb-4 flex items-baseline justify-between gap-3">
             <h2 id="queue-heading" className="text-lg font-semibold text-text-primary"><T>Next in queue</T></h2>
@@ -504,11 +469,11 @@ function DashboardContent() {
           </div>
           {data.queue.next.length ? (
             <>
-              <ol id="qa-queue-list" className="divide-y divide-overlay/10">
+              <ol id="qa-queue-list" className="grid gap-x-5 sm:grid-cols-3">
                 {data.queue.next.map((item, index) => (
                   <li
                     key={`${item.wingetId}-${item.version}-${item.architecture}`}
-                    className={cn('items-center gap-3 py-3', index >= 3 && !showFullQueue ? 'hidden sm:flex' : 'flex')}
+                    className={cn('items-center gap-3 py-3', index >= 3 && !showFullQueue ? 'hidden' : 'flex')}
                   >
                     <span className="w-5 text-xs tabular-nums text-text-muted">{index + 1}</span>
                     <AppIcon packageId={item.wingetId} packageName={item.displayName} size="sm" />
@@ -523,7 +488,7 @@ function DashboardContent() {
                 <button
                   type="button"
                   onClick={() => setShowFullQueue((current) => !current)}
-                  className="mt-3 min-h-10 w-full rounded-lg border border-overlay/10 px-3 text-sm text-text-secondary hover:bg-overlay/5 hover:text-text-primary sm:hidden"
+                  className="mt-3 min-h-10 w-full rounded-lg border border-overlay/10 px-3 text-sm text-text-secondary hover:bg-overlay/5 hover:text-text-primary"
                   aria-expanded={showFullQueue}
                   aria-controls="qa-queue-list"
                 >
@@ -541,99 +506,33 @@ function DashboardContent() {
           </div>
 
           {data.recent.length ? (
-            <>
-              <div className="divide-y divide-overlay/10 sm:hidden">
-                {data.recent.map((item) => (
+            <ul className="divide-y divide-overlay/10 border-t border-overlay/10">
+              {data.recent.map((item) => (
+                <li key={item.packageProfileSha256}>
                   <button
-                    key={item.packageProfileSha256}
                     type="button"
-                    onClick={() => setSelected({
-                      wingetId: item.wingetId,
-                      catalogVersion: item.catalogVersion,
-                      packageProfileSha256: item.packageProfileSha256,
-                    })}
-                    className={cn(
-                      'flex min-h-20 w-full items-center gap-3 border-l-2 px-5 py-3 text-left transition-colors hover:bg-overlay/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-cyan',
-                      resultEdgeClass(item.outcome)
-                    )}
+                    onClick={() => setSelected({ wingetId: item.wingetId, catalogVersion: item.catalogVersion, packageProfileSha256: item.packageProfileSha256 })}
+                    aria-label={`View QA result for ${item.displayName}, version ${item.testedVersion}`}
+                    className="group flex w-full items-center gap-3 px-5 py-4 text-left transition-colors hover:bg-overlay/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-cyan sm:gap-4 sm:px-6"
                   >
-                    <AppIcon packageId={item.wingetId} packageName={item.displayName} size="sm" />
+                    <AppIcon packageId={item.wingetId} packageName={item.displayName} size="md" />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium text-text-primary">{item.displayName}</span>
-                      <span className="mt-0.5 block text-xs text-text-muted">
-                        {item.testedVersion} · {item.architecture} · {formatQaDuration(item.durationSeconds)}
-                      </span>
-                      <span className="mt-0.5 block text-xs text-text-muted">
-                        {formatRelativeTime(item.testedAtUtc, data.serverTime) ?? <T>Test time unavailable</T>}
+                      <span className="block break-words text-sm font-semibold text-text-primary [overflow-wrap:anywhere]">{item.displayName}</span>
+                      <span className="mt-1 block break-words text-xs text-text-muted [overflow-wrap:anywhere]">{item.testedVersion} · {item.architecture}</span>
+                      <span className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-muted">
+                        <span><T>Duration</T> {formatQaDuration(item.durationSeconds)}</span>
+                        <span>{formatRelativeTime(item.testedAtUtc, data.serverTime) ?? <T>Test time unavailable</T>}</span>
+                        <QaVirusTotalCell status={item.virusTotalStatus} />
                       </span>
                     </span>
-                    <span className="flex flex-col items-end gap-1">
+                    <span className="flex shrink-0 flex-col items-end gap-2">
                       <QaResultStatus outcome={item.outcome} />
-                      {item.virusTotalStatus === 'clean' ||
-                      item.virusTotalStatus === 'flagged' ||
-                      item.virusTotalStatus === 'suspicious' ? (
-                        <QaVirusTotalCell status={item.virusTotalStatus} />
-                      ) : null}
+                      <span className="inline-flex items-center gap-1 text-xs font-medium text-accent-cyan"><T>Details</T><ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5 motion-reduce:transition-none" aria-hidden="true" /></span>
                     </span>
                   </button>
-                ))}
-              </div>
-
-              <div className="hidden overflow-x-auto sm:block">
-                <table className="w-full text-left text-sm">
-                  <thead className="border-y border-overlay/10 text-xs text-text-muted">
-                    <tr>
-                      <th className="w-full px-6 py-3 font-medium"><T>Application</T></th>
-                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>Result</T></th>
-                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>VirusTotal</T></th>
-                      <th className="whitespace-nowrap px-3 py-3 font-medium"><T>Duration</T></th>
-                      <th className="whitespace-nowrap px-6 py-3 font-medium"><T>Tested</T></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-overlay/10">
-                    {data.recent.map((item) => (
-                      <tr
-                        key={item.packageProfileSha256}
-                        onClick={() => setSelected({
-                          wingetId: item.wingetId,
-                          catalogVersion: item.catalogVersion,
-                          packageProfileSha256: item.packageProfileSha256,
-                        })}
-                        className="cursor-pointer transition-colors hover:bg-overlay/5"
-                      >
-                        <td className={cn('w-full max-w-0 border-l-2 px-6 py-3', resultEdgeClass(item.outcome))}>
-                          <button
-                            type="button"
-                            onClick={() => setSelected({
-                              wingetId: item.wingetId,
-                              catalogVersion: item.catalogVersion,
-                              packageProfileSha256: item.packageProfileSha256,
-                            })}
-                            className="flex min-w-0 items-center gap-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan"
-                          >
-                            <AppIcon packageId={item.wingetId} packageName={item.displayName} size="sm" />
-                            <span className="min-w-0">
-                              <span className="block truncate font-medium text-text-primary">{item.displayName}</span>
-                              <span className="block text-xs text-text-muted">{item.testedVersion} · {item.architecture}</span>
-                            </span>
-                          </button>
-                        </td>
-                        <td className="whitespace-nowrap px-3 py-3">
-                          <QaResultStatus outcome={item.outcome} />
-                        </td>
-                        <td className="whitespace-nowrap px-3 py-3">
-                          <QaVirusTotalCell status={item.virusTotalStatus} />
-                        </td>
-                        <td className="whitespace-nowrap px-3 py-3 font-mono text-xs text-text-secondary">{formatQaDuration(item.durationSeconds)}</td>
-                        <td className="whitespace-nowrap px-6 py-3 text-xs text-text-muted">
-                          {formatRelativeTime(item.testedAtUtc, data.serverTime) ?? <T>Not recorded</T>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+                </li>
+              ))}
+            </ul>
           ) : (
             <p className="border-t border-overlay/10 px-6 py-8 text-sm text-text-muted"><T>No QA results have been published yet.</T></p>
           )}

@@ -161,6 +161,48 @@ describe('PSADT QA package identity', () => {
     expect(profile.installer.successCodes).toEqual([1223]);
   });
 
+  it('binds SketchUp 2025 QA and customer profiles to exact unattended removal', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'Trimble.SketchUp.2025',
+      displayName: 'SketchUp 2025',
+      publisher: 'Trimble, Inc.',
+      version: '25.0.660',
+      architecture: 'x64',
+      installerSha256: '0AB6635E4740F415FC102F4DE23E28F6DE95BF4085E84001791A17C5FCBF320E',
+      installerType: 'exe',
+      silentSwitches: '/silent',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{BF6A8902-D556-5B2D-9FD7-83F19CE65B5C}:SketchUp 2025',
+      installScope: 'machine',
+    });
+    expect(normalized.identity.profile).toMatchObject({
+      installer: {
+        silentArgs: '/silent',
+        uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{BF6A8902-D556-5B2D-9FD7-83F19CE65B5C}:SketchUp 2025',
+      },
+      psadtConfig: { reviewedUninstallArguments: ['-silent'] },
+    });
+    expect(JSON.parse(normalized.psadtConfigJson).reviewedUninstallArguments)
+      .toEqual(['-silent']);
+  });
+
+  it('binds LPub3D QA profiles to managed-context NSIS removal', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'trevorsandy.lpub3d', displayName: 'LPub3D', publisher: 'trevorsandy',
+      version: '2.4.9.86.4133', architecture: 'x64', installerSha256: 'b'.repeat(64),
+      installerType: 'exe', silentSwitches: '/S /allusers',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:LPub3D:LPub3D', installScope: 'machine',
+    });
+    const profile = normalized.identity.profile as {
+      psadtConfig: { reviewedUninstallArguments?: string[] };
+      installer: { uninstallCommand?: string; silentArgs?: string };
+    };
+
+    expect(profile.psadtConfig.reviewedUninstallArguments).toEqual(['/shelluser', '/S']);
+    expect(JSON.parse(normalized.psadtConfigJson).reviewedUninstallArguments).toEqual(['/shelluser', '/S']);
+    expect(profile.installer.uninstallCommand).toBe('REGISTRY_UNINSTALL_KEY:LPub3D:LPub3D');
+    expect(profile.installer.silentArgs).toBe('/S /allusers');
+  });
+
   it('binds JetBrains Toolbox customer packages to headless removal', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'JetBrains.Toolbox',
@@ -433,6 +475,23 @@ describe('PSADT QA package identity', () => {
     expect(
       JSON.parse(normalized.psadtConfigJson).reviewedUninstallWindowAutomation
     ).toEqual(expected);
+  });
+
+  it('binds WithSecure silent removal to the normalized QA profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'WithSecure.ElementsAgent', displayName: 'WithSecure Elements Agent',
+      publisher: 'WithSecure', version: '26.3.298.0', architecture: 'x64',
+      installerSha256: '1DC76B171B77161754BA6AC883CCFD2D7730D80E7A827779BAD905B1F9483D55',
+      installerType: 'msi', silentSwitches: '/quiet ALLUSERS=1',
+      uninstallCommand: 'msiexec /x "{26E3718A-7CCD-40E0-BE8B-7F1E756A05F5}" /qn /norestart',
+      installScope: 'machine',
+    });
+    const profile = normalized.identity.profile as {
+      psadtConfig: { reviewedUninstallArguments?: string[] };
+    };
+
+    expect(JSON.parse(normalized.psadtConfigJson).reviewedUninstallArguments).toEqual(['--silent']);
+    expect(profile.psadtConfig.reviewedUninstallArguments).toEqual(['--silent']);
   });
 
   it('binds FSLogix restart suppression to customer and QA package identity', () => {
@@ -1454,6 +1513,42 @@ describe('PSADT QA package identity', () => {
     expect(profile.installer.uninstallCommand).toBe(uninstallCommand);
   });
 
+  it('binds WireSock CLI QA to the shared SDK registration adapter', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'NTKERNEL.WireSockVPNClientCLI', displayName: 'WireSock Secure Connect CLI', publisher: 'NTKERNEL',
+      version: '3.6.1', architecture: 'x64',
+      installerSha256: 'BDB676263FFFA4E36EC6B51155A8AFE2AC6D5680DC6D22008DE9C75C8F533ECC',
+      installerType: 'exe', silentSwitches: '/S /NCRC', installScope: 'machine',
+      uninstallCommand: 'REGISTRY_UNINSTALL:WireSock Secure Connect CLI',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile).toMatchObject({
+      psadtConfig: {
+        reviewedRegistryUninstallDisplayName: 'WireSock Secure Connect SDK',
+        reviewedPreferVisiblePrimaryUninstallRegistration: true,
+      },
+      installer: { sourceType: 'exe', silentArgs: '/S /NCRC', installScope: 'machine' },
+    });
+  });
+
+  it('binds Philips QA to its exact NSIS identity while preserving user scope and ZIP metadata', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'Philips.SmartControl', displayName: 'Smart Control', publisher: 'Philips',
+      version: '7.2.0', architecture: 'x64',
+      installerSha256: '82D3632C51CAB9819420F98B885B8499A526CB1A96DCE6893E90E9DE6D2F7E00',
+      installerType: 'zip', nestedInstallerType: 'nullsoft',
+      nestedInstallerPath: 'SmartControl Setup 7.2.0.exe',
+      silentSwitches: '/S', installScope: 'user',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{EAF31A0E-C98A-5E6E-9883-2A487A3337A1}:Smart Control',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile).toMatchObject({ installer: {
+      installScope: 'user', sourceType: 'zip', nestedInstallerType: 'nullsoft',
+      nestedInstallerFiles: ['SmartControl Setup 7.2.0.exe'], silentArgs: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:eaf31a0e-c98a-5e6e-9883-2a487a3337a1:SmartControl',
+    } });
+  });
+
   it('binds DSH Desktop QA to the exact NSIS key used by customer packages', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'JustGenius-s.DSHDesktop',
@@ -1483,6 +1578,42 @@ describe('PSADT QA package identity', () => {
     expect(profile.installer.uninstallCommand).toBe(
       'REGISTRY_UNINSTALL_KEY:239d4e5c-394e-5607-bf11-8b5229505789:DSH-Desktop 0.2.0'
     );
+  });
+
+  it('binds RackSight QA to the captured NSIS key while retaining its trusted installer profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'AuthorityGate.RackSight', displayName: 'RackSight Desktop', publisher: 'AuthorityGate',
+      version: '1.1.9', architecture: 'x64',
+      installerSha256: 'A8C2BB553DB8C7BDE28C90E1587EA6F2992862C3B9E9AC696B23FDF9ACA2B2BA',
+      installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL:RackSight Desktop',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine',
+      sha256: 'A8C2BB553DB8C7BDE28C90E1587EA6F2992862C3B9E9AC696B23FDF9ACA2B2BA',
+      silentArgs: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:3961d0de-ceb1-54d7-a222-b94c8b534c40:RackSight',
+    });
+  });
+
+  it('binds AirUSB QA to the captured Inno key while retaining its trusted installer profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'AirUSB.Client', displayName: 'AirUSB Client', publisher: 'AirUSB',
+      version: '1.1.2', architecture: 'x64',
+      installerSha256: '5498A354C08014A2094D354FA105723246AF79085463277208700695BAFA07C5',
+      installerType: 'inno', installScope: 'machine',
+      silentSwitches: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+      uninstallCommand: 'REGISTRY_UNINSTALL:AirUSB Client',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine',
+      sha256: '5498A354C08014A2094D354FA105723246AF79085463277208700695BAFA07C5',
+      silentArgs: '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:{B7A2E3F1-4D8C-4B2A-9E6F-1A3C5D7E9B0F}_is1:Air USB',
+    });
   });
 
   it('binds JS8Call-improved QA to the exact Inno key used by customer packages', () => {
@@ -2071,6 +2202,42 @@ describe('PSADT QA package identity', () => {
     expect(profile.psadtConfig).toMatchObject(expectedConfig);
   });
 
+  it('binds Product Portal unattended removal into the exact QA profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'iZotope.ProductPortal', displayName: 'Product Portal', publisher: 'iZotope',
+      version: '1.4.9', architecture: 'x64', installerType: 'exe',
+      installerSha256: '29D08FA0A07C93EB81095D448271D0E64C6DDECF47115F1B0DD40091622062ED',
+      silentSwitches: '--mode unattended', uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Product Portal:Product Portal',
+      installScope: 'machine', detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    const expectedConfig = { reviewedUninstallArguments: ['--mode', 'unattended'] };
+    expect(JSON.parse(normalized.psadtConfigJson)).toMatchObject(expectedConfig);
+    expect(normalized.identity.profile).toMatchObject({ psadtConfig: expectedConfig });
+  });
+
+  it('binds PostgreSQL 16 to the bounded vendor removal lifecycle', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'PostgreSQL.PostgreSQL.16',
+      displayName: 'PostgreSQL 16',
+      publisher: 'PostgreSQL',
+      version: '16.15-3',
+      architecture: 'x64',
+      installerSha256: '5AE62E39571AAD71256AC20F769C01B6415E5DBB69A76B44EC643A42037FE45D',
+      installerType: 'exe',
+      silentSwitches: '--mode unattended --unattendedmodeui none',
+      uninstallCommand: 'REGISTRY_UNINSTALL:PostgreSQL 16',
+      installScope: 'machine',
+      detectionRules: '[]',
+      psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    const expectedConfig = {
+      reviewedUninstallArguments: ['--mode', 'unattended', '--unattendedmodeui', 'none'],
+      uninstallCompletionTimeoutMinutes: 15,
+    };
+    expect(JSON.parse(normalized.psadtConfigJson)).toMatchObject(expectedConfig);
+    expect(normalized.identity.profile).toMatchObject({ psadtConfig: expectedConfig });
+  });
+
   it('binds SSMS 21 Preview to the unattended Visual Studio Installer removal lifecycle', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'Microsoft.SQLServerManagementStudio.21.Preview',
@@ -2507,6 +2674,19 @@ describe('current catalog QA package validation', () => {
     expect(
       validateCompatiblePassedCatalogQaProfile(candidateFromIdentity(legacyIdentity))
     ).toMatchObject({ valid: true });
+  });
+
+  it('requires fresh archive identity evidence but preserves unrelated prior passes', () => {
+    const archive = identityWithPackagerCommit(buildQaPackageIdentity({
+      ...input, sourceInstallerType: 'zip', nestedInstallerType: 'exe',
+      nestedInstallerFiles: ['setup.exe'],
+    }), '6bdefc387d1402c71d30a6fbfcf850038f60f37a');
+    expect(validateCompatiblePassedCatalogQaProfile(candidateFromIdentity(archive)))
+      .toEqual({ valid: false, reason: 'compatible-archive-product-identity-changed' });
+    const unaffected = identityWithPackagerCommit(buildQaPackageIdentity(input),
+      '6bdefc387d1402c71d30a6fbfcf850038f60f37a');
+    expect(validateCompatiblePassedCatalogQaProfile(candidateFromIdentity(unaffected)))
+      .toMatchObject({ valid: true });
   });
 
   it('does not reuse a process lifecycle pass from before the lifecycle release', () => {

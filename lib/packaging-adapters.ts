@@ -75,6 +75,11 @@ const POSTGRESQL_PACKAGING_ADAPTER: ApplicationPackagingAdapter = {
   // unattended mode is supplied. Apply this to every versioned PostgreSQL
   // package ID so a new major release cannot silently lose the lifecycle fix.
   wingetId: 'PostgreSQL.PostgreSQL.*',
+  // The vendor removes its server and bundled components asynchronously.
+  // 16.15-1 needed 280 seconds; 16.15-3 was still removing files at the
+  // generic five-minute deadline (QA run 34465115340). Keep exact ARP
+  // removal authoritative while allowing a bounded fifteen-minute lifecycle.
+  uninstallCompletionTimeoutMinutes: 15,
   reviewedUninstallArguments: [
     '--mode',
     'unattended',
@@ -138,6 +143,14 @@ const SSMS_VISUAL_STUDIO_INSTALLER_WINGET_IDS = [
  * in the QA execution-profile hash.
  */
 export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapter[] = [
+  {
+    // WithSecure's Intune deployment guide requires --silent for the registered
+    // OneClient uninstaller. QA run 34599096712 captured fs_uninstall_32.exe
+    // without arguments and correctly failed while its exact ARP key remained.
+    // https://support.withsecure.com/userguides/data/pdf/wseep_portal_adminguide_eng.pdf
+    wingetId: 'WithSecure.ElementsAgent',
+    reviewedUninstallArguments: ['--silent'],
+  },
   {
     // Amazon's official WinGet submission intentionally declares its user-scope
     // bootstrapper without switches and passed Microsoft's unattended validation
@@ -584,6 +597,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     reviewedUninstallArguments: ['-q'],
   },
   {
+    // Product Portal registers its exact product uninstaller without quiet
+    // arguments (QA run 34878280391). WinGet declares --mode unattended;
+    // InstallBuilder supports the same mode for its generated uninstallers:
+    // https://installbuilder.com/uninstall-functionality-screenshot
+    // Keep registry-owned identity, bounded completion, and removal verification.
+    wingetId: 'iZotope.ProductPortal',
+    reviewedUninstallArguments: ['--mode', 'unattended'],
+  },
+  {
     // OpenWebStart documents its Windows payload as an install4j application
     // with a root-level uninstall.exe. The registered command is interactive,
     // and the generic framework detector cannot infer install4j from WinGet's
@@ -624,6 +646,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     // Select the single visible entry only after ordinary identity matching;
     // zero or multiple visible matches remain an ambiguity failure.
     wingetId: 'Surfshark.Surfshark',
+    reviewedPreferVisiblePrimaryUninstallRegistration: true,
+  },
+  {
+    // The official CLI manifest distributes the Secure Connect SDK bundle.
+    // Run 34838391079 observed its visible SDK wrapper, hidden SDK/driver
+    // MSIs, and an unrelated Edge update. Bind the exact registered SDK name;
+    // select only one visible match and retain its captured removal command.
+    wingetId: 'NTKERNEL.WireSockVPNClientCLI',
+    reviewedRegistryUninstallDisplayName: 'WireSock Secure Connect SDK',
     reviewedPreferVisiblePrimaryUninstallRegistration: true,
   },
   {
@@ -755,6 +786,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     // command so Intune removal cannot wait behind an invisible UI.
     wingetId: 'JetBrains.Toolbox',
     reviewedUninstallArguments: ['/headless'],
+  },
+  {
+    // LPub3D's un.onInit restarts elevated uninstallers via ExecShellAsUser
+    // unless /shelluser is present. Preserve the managed execution context,
+    // exact registered scope, single-instance checks, and normal NSIS removal.
+    // Source: trevorsandy/lpub3d at 717082cdde0c7a1a34ce66cf1361c1f9ff418d18,
+    // builds/utilities/nsis-scripts/Uninstall.nsh (un.onInit).
+    wingetId: 'trevorsandy.lpub3d',
+    reviewedUninstallArguments: ['/shelluser', '/S'],
   },
   {
     // Zen Browser uses Mozilla's NSIS helper.exe lifecycle. Its captured ARP
@@ -1596,6 +1636,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     reviewedUninstallArguments: ['-silent'],
   },
   {
+    // QA run 34414113432 observed the exact SketchUp 2025 InstallShield
+    // registration invoking -remove -runfromtemp without unattended mode.
+    // Reuse the reviewed wrapper contract; retain exact registration lookup
+    // and bounded removal verification for QA and customer packages.
+    // https://forums.sketchup.com/t/unattended-uninstall-leaves-sketchup-entry-in-the-control-panel/342617
+    wingetId: 'Trimble.SketchUp.2025',
+    reviewedUninstallArguments: ['-silent'],
+  },
+  {
     // NeoLoad registers its install4j uninstaller without an unattended
     // argument. install4j documents -q for both installers and uninstallers;
     // append it to the exact captured registration instead of guessing a
@@ -1768,6 +1817,14 @@ const REVIEWED_REGISTRY_UNINSTALL_IDENTITIES: Readonly<Record<string, Readonly<{
   registeredDisplayName: string;
   registeredRegistryKey?: string;
 }>>> = {
+  // RackSight v1.1.9 uses electron-builder appId net.authoritygate.racksight
+  // and productName RackSight. Isolated run 34787649769 captured this exact
+  // NSIS key alongside WebView2 servicing; never select the runtime instead.
+  'authoritygate.racksight': {
+    generatedDisplayName: 'RackSight Desktop',
+    registeredDisplayName: 'RackSight',
+    registeredRegistryKey: '3961d0de-ceb1-54d7-a222-b94c8b534c40',
+  },
   // RobotStudio's InstallShield wrapper updates Edge during installation. The
   // exact 2025.2 MSI identity prevents that unrelated servicing delta from
   // being captured as RobotStudio's uninstall command.
@@ -1794,6 +1851,14 @@ const REVIEWED_REGISTRY_UNINSTALL_IDENTITIES: Readonly<Record<string, Readonly<{
     manifestRegistryKey: 'Google Chrome',
     registeredDisplayName: 'Google Chrome Beta',
     registeredRegistryKey: 'Google Chrome Beta',
+  },
+  // AirUSB 1.1.2 registered this exact Inno identity in isolated run
+  // 34781866170. Its catalog name and publisher differ from Air USB / Zed Axis;
+  // an unrelated Edge update must never become an uninstall candidate.
+  'airusb.client': {
+    generatedDisplayName: 'AirUSB Client',
+    registeredDisplayName: 'Air USB',
+    registeredRegistryKey: '{B7A2E3F1-4D8C-4B2A-9E6F-1A3C5D7E9B0F}_is1',
   },
   // JS8Call-improved's catalog title differs from the vendor's Inno AppName.
   // The official installer source keeps a stable AppId while AppVerName adds
@@ -1932,6 +1997,15 @@ const REVIEWED_REGISTRY_UNINSTALL_IDENTITIES: Readonly<Record<string, Readonly<{
   'msys2.msys2': {
     generatedDisplayName: 'MSYS2 Installer',
     registeredDisplayName: 'MSYS2',
+  },
+  // WinGet 7.2.0 and QA run 34666488057 agree on this unbraced NSIS
+  // key. The generated catalog command incorrectly decorates it as an MSI
+  // GUID and uses a spaced title. Preserve the exact vendor registration.
+  'philips.smartcontrol': {
+    generatedDisplayName: 'Smart Control',
+    manifestRegistryKey: '{EAF31A0E-C98A-5E6E-9883-2A487A3337A1}',
+    registeredDisplayName: 'SmartControl',
+    registeredRegistryKey: 'eaf31a0e-c98a-5e6e-9883-2a487a3337a1',
   },
   // Quassel's WinGet ProductCode omits the space used by the application's
   // actual NSIS ARP identity, and the registered build version is a Git

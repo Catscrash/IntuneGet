@@ -14,7 +14,7 @@ import type { PackagedWingetDependency } from '@/lib/winget-dependencies';
 
 export const QA_PSADT_TOOLCHAIN = {
   packagerRepository: 'ugurkocde/IntuneGet',
-  packagerCommit: 'd33825c2b786af7c3f22f4b828108c4129299ef9',
+  packagerCommit: '6dfeaea03893e63cf7aba747638d7ea1768ac6b7',
   packagerScriptPath: '.github/scripts/Create-PSADTPackage.ps1',
   psadtVersion: '4.1.8',
   templateUrl:
@@ -582,6 +582,36 @@ export const QA_PACKAGER_RELEASE_HISTORY = [
   // Arvis now runs in the vendor-supported signed-in user context. Preserve
   // every unrelated compatible pass from the JS8Call exact-identity release.
   'f6bff5d1879b5cd11e285b1f1f0d140349d82215',
+  // SketchUp 2025 gains unattended removal. Other application profiles keep
+  // their existing execution behavior and remain eligible for compatibility.
+  'd33825c2b786af7c3f22f4b828108c4129299ef9',
+  // PostgreSQL receives a longer bounded vendor removal window. Its canonical
+  // config changes; unrelated matching execution profiles remain compatible.
+  'a27749fb895eaa142da413bb6b4b9ebaa5477ad4',
+  // WithSecure gains silent removal; unchanged application profiles remain compatible.
+  '0ff16a2420976f28a232ad1c015c8023f805fbb3',
+  // Archived EXE-family MSI identities now survive normalization. Unchanged
+  // profiles remain compatible; old archive display fallbacks are excluded below.
+  '6bdefc387d1402c71d30a6fbfcf850038f60f37a',
+  // Philips' exact NSIS key changes only its failing identity path. Other
+  // canonical execution profiles remain compatible with the preceding pin.
+  '7238616608f888449fa2e132fffc8d7314c26745',
+  // AirUSB's exact Inno identity changes only its failed catalog profile.
+  // Unchanged profiles remain compatible; exact-pin cohort audits stay separate.
+  '5fdfc187c77c3223dc76287b41232770108ee7be',
+  // RackSight gains an exact NSIS identity. Unchanged execution profiles remain
+  // compatible; exact-pin cohort reporting continues to audit the current pin.
+  '05f550c4ec6d14b2cf3d4c2ce32db418da3dd0ba',
+  // Only WireSock CLI's previously failing SDK registration selection changes.
+  // Existing successful execution profiles keep their compatibility history.
+  '9e51c9ab6cc3a28346f13266e566c9896fa4101b',
+  // Product Portal gains unattended uninstall arguments in its canonical
+  // config. Unchanged execution profiles remain compatible; strict cohort
+  // reporting still requires the exact current shared pin.
+  '305b9c41a4ccbd271a9873a4fd858d2515586b76',
+  // LPub3D gains managed-context uninstall arguments. Its profile changes;
+  // unrelated identical execution profiles retain compatibility, not strict count credit.
+  'ada1a8a5d1ad0ae9ad953306a6b528c71479a803',
   QA_PSADT_TOOLCHAIN.packagerCommit,
 ] as const;
 
@@ -781,6 +811,14 @@ function passingProfileCompatibilityReason(
     : [];
 
   for (const release of QA_PACKAGER_RELEASE_HISTORY.slice(priorIndex + 1, currentIndex + 1)) {
+    if (
+      release === '7238616608f888449fa2e132fffc8d7314c26745' &&
+      lowerTextValue(installer.sourceType) === 'zip' &&
+      ['exe', 'inno', 'nullsoft', 'burn'].includes(lowerTextValue(installer.nestedInstallerType)) &&
+      textValue(installer.uninstallCommand).startsWith('REGISTRY_UNINSTALL:')
+    ) {
+      return 'compatible-archive-product-identity-changed';
+    }
     // 42bf6e2 introduced the reviewed process-close lifecycle. A prior pass
     // with no configured process list remains valid; one that expected this
     // behavior must be exercised again. Later releases inherit the behavior

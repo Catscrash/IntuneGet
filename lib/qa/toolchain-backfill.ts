@@ -666,6 +666,96 @@ const ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS = [
 ] as const;
 
 const TOOLCHAIN_TERMINAL_RETRY_TARGETS: Readonly<Record<string, readonly string[]>> = {
+  '6dfeaea03893e63cf7aba747638d7ea1768ac6b7': [
+    'trevorsandy.lpub3d',
+    'iZotope.ProductPortal',
+    'NTKERNEL.WireSockVPNClientCLI',
+    'AuthorityGate.RackSight',
+    'AirUSB.Client',
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  'ada1a8a5d1ad0ae9ad953306a6b528c71479a803': [
+    'iZotope.ProductPortal',
+    'NTKERNEL.WireSockVPNClientCLI',
+    'AuthorityGate.RackSight',
+    'AirUSB.Client',
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '305b9c41a4ccbd271a9873a4fd858d2515586b76': [
+    'NTKERNEL.WireSockVPNClientCLI',
+    'AuthorityGate.RackSight',
+    'AirUSB.Client',
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '9e51c9ab6cc3a28346f13266e566c9896fa4101b': [
+    'AuthorityGate.RackSight',
+    'AirUSB.Client',
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '05f550c4ec6d14b2cf3d4c2ce32db418da3dd0ba': [
+    // Retry the exact AirUSB registration repair and retain unconsumed targets.
+    'AirUSB.Client',
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '5fdfc187c77c3223dc76287b41232770108ee7be': [
+    'Philips.SmartControl',
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '7238616608f888449fa2e132fffc8d7314c26745': [
+    'Adobe.Acrobat.Pro',
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    // Carry only previously reviewed targets; security blocks stay authoritative.
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '6bdefc387d1402c71d30a6fbfcf850038f60f37a': [
+    'WithSecure.ElementsAgent',
+    'PostgreSQL.PostgreSQL.16',
+    'Trimble.SketchUp.2025',
+    // Preserve prior unconsumed reviewed retries; security blocks remain authoritative.
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  '0ff16a2420976f28a232ad1c015c8023f805fbb3': [
+    'PostgreSQL.PostgreSQL.16',
+    // Preserve existing unconsumed targets; security eligibility still blocks
+    // quarantined releases before a candidate can enter the VM.
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
+  'a27749fb895eaa142da413bb6b4b9ebaa5477ad4': [
+    'Trimble.SketchUp.2025',
+    ...ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
+  ],
   'd33825c2b786af7c3f22f4b828108c4129299ef9':
     ARVIS_USER_SCOPE_RELEASE_RETRY_TARGETS,
   'f6bff5d1879b5cd11e285b1f1f0d140349d82215':

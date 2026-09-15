@@ -10,6 +10,36 @@ import {
 } from './packaging-adapters';
 
 describe('application packaging adapters', () => {
+  it('adds unattended removal only to the exact Product Portal identity', () => {
+    for (const id of ['iZotope.ProductPortal', ' izotope.productportal ']) {
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedUninstallArguments).toEqual(['--mode', 'unattended']);
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+      expect(adapted.uninstallCompletionTimeoutMinutes).toBe(DEFAULT_PSADT_CONFIG.uninstallCompletionTimeoutMinutes);
+    }
+    expect(applyApplicationPackagingAdapter('iZotope.Other', DEFAULT_PSADT_CONFIG)
+      .reviewedUninstallArguments).toEqual(DEFAULT_PSADT_CONFIG.reviewedUninstallArguments);
+  });
+  it('binds RackSight to the captured exact NSIS key without changing custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:3961d0de-ceb1-54d7-a222-b94c8b534c40:RackSight';
+    expect(resolveApplicationUninstallCommand(' AuthorityGate.RackSight ', 'REGISTRY_UNINSTALL:RackSight Desktop')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('AuthorityGate.RackSight', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('AuthorityGate.Other', 'REGISTRY_UNINSTALL:RackSight Desktop')).toBe('REGISTRY_UNINSTALL:RackSight Desktop');
+    expect(resolveApplicationUninstallCommand('AuthorityGate.RackSight', 'custom.exe /remove')).toBe('custom.exe /remove');
+  });
+  it('binds AirUSB to the captured exact Inno key without changing custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:{B7A2E3F1-4D8C-4B2A-9E6F-1A3C5D7E9B0F}_is1:Air USB';
+    expect(resolveApplicationUninstallCommand(' AirUSB.Client ', 'REGISTRY_UNINSTALL:AirUSB Client')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('AirUSB.Client', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('AirUSB.Other', 'REGISTRY_UNINSTALL:AirUSB Client')).toBe('REGISTRY_UNINSTALL:AirUSB Client');
+    expect(resolveApplicationUninstallCommand('AirUSB.Client', 'custom.exe /remove')).toBe('custom.exe /remove');
+  });
+  it('requires WithSecure unattended removal only for its exact application identity', () => {
+    expect(applyApplicationPackagingAdapter('WithSecure.ElementsAgent', DEFAULT_PSADT_CONFIG)
+      .reviewedUninstallArguments).toEqual(['--silent']);
+    expect(applyApplicationPackagingAdapter('WithSecure.Other', DEFAULT_PSADT_CONFIG)
+      .reviewedUninstallArguments).toEqual(DEFAULT_PSADT_CONFIG.reviewedUninstallArguments);
+  });
   it('attests Amazon Music as an argument-free unattended bootstrapper', () => {
     const adapted = applyApplicationPackagingAdapter(
       'Amazon.Music',
@@ -106,6 +136,15 @@ describe('application packaging adapters', () => {
     ).toEqual(['/silent']);
   });
 
+  it('binds only WireSock CLI to the visible SDK registration', () => {
+    const adapted = applyApplicationPackagingAdapter(' NTKERNEL.WireSockVPNClientCLI ', DEFAULT_PSADT_CONFIG);
+    expect(adapted.reviewedRegistryUninstallDisplayName).toBe('WireSock Secure Connect SDK');
+    expect(adapted.reviewedPreferVisiblePrimaryUninstallRegistration).toBe(true);
+    const other = applyApplicationPackagingAdapter('NTKERNEL.WireSockVPNClient', adapted);
+    expect(other.reviewedRegistryUninstallDisplayName).toBeUndefined();
+    expect(other.reviewedPreferVisiblePrimaryUninstallRegistration).toBeUndefined();
+  });
+
   it('uses the reviewed Chrome EXE registry identity without widening matching', () => {
     expect(resolveApplicationUninstallCommand(
       'Google.Chrome.EXE',
@@ -143,6 +182,17 @@ describe('application packaging adapters', () => {
       'js8call-improved.js8call-improved',
       'vendor-uninstall.exe --custom'
     )).toBe('vendor-uninstall.exe --custom');
+  });
+
+  it('binds Philips SmartControl only to its reviewed exact NSIS identity', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{EAF31A0E-C98A-5E6E-9883-2A487A3337A1}:Smart Control';
+    const expected = 'REGISTRY_UNINSTALL_KEY:eaf31a0e-c98a-5e6e-9883-2a487a3337a1:SmartControl';
+    expect(resolveApplicationUninstallCommand(' Philips.SmartControl ', original)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Philips.SmartControl', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Philips.Other', original)).toBe(original);
+    for (const command of ['vendor-uninstall.exe --custom', original.replace('EAF31A0E', 'AAF31A0E')]) {
+      expect(resolveApplicationUninstallCommand('Philips.SmartControl', command)).toBe(command);
+    }
   });
 
   it('binds DSH Desktop to its exact unbraced NSIS key despite the catalog typo', () => {
@@ -765,6 +815,14 @@ describe('application packaging adapters', () => {
       ).reviewedUninstallArguments
     ).toEqual(['-silent']);
     expect(
+      applyApplicationPackagingAdapter('Trimble.SketchUp.2025', DEFAULT_PSADT_CONFIG)
+        .reviewedUninstallArguments
+    ).toEqual(['-silent']);
+    expect(
+      applyApplicationPackagingAdapter('Trimble.SketchUp.2025.Other', DEFAULT_PSADT_CONFIG)
+        .reviewedUninstallArguments
+    ).not.toContain('-silent');
+    expect(
       applyApplicationPackagingAdapter('Tricentis.NeoLoad', DEFAULT_PSADT_CONFIG)
         .reviewedUninstallArguments
     ).toEqual(['-q']);
@@ -874,6 +932,7 @@ describe('application packaging adapters', () => {
     for (const wingetId of [
       'PostgreSQL.PostgreSQL.9.6',
       'PostgreSQL.PostgreSQL.13',
+      'PostgreSQL.PostgreSQL.16',
       'PostgreSQL.PostgreSQL.18',
       'postgresql.postgresql.19',
     ]) {
@@ -881,6 +940,8 @@ describe('application packaging adapters', () => {
         applyApplicationPackagingAdapter(wingetId, DEFAULT_PSADT_CONFIG)
           .reviewedUninstallArguments
       ).toEqual(['--mode', 'unattended', '--unattendedmodeui', 'none']);
+      expect(applyApplicationPackagingAdapter(wingetId, DEFAULT_PSADT_CONFIG)
+        .uninstallCompletionTimeoutMinutes).toBe(15);
     }
     expect(
       applyApplicationPackagingAdapter('PostgreSQL.pgAdmin', DEFAULT_PSADT_CONFIG)
@@ -1490,6 +1551,15 @@ describe('application packaging adapters', () => {
 
     expect(adapted.reviewedUninstallArguments).toEqual(['/S']);
     expect(adapted.reviewedInstallArgumentsOverride).toBeUndefined();
+  });
+
+  it('keeps LPub3D managed uninstall in its caller context without affecting other NSIS apps', () => {
+    const adapted = applyApplicationPackagingAdapter('TREVORSANDY.LPUB3D', DEFAULT_PSADT_CONFIG);
+    expect(adapted.reviewedUninstallArguments).toEqual(['/shelluser', '/S']);
+    expect(adapted.reviewedInstallArgumentsOverride).toBeUndefined();
+    expect(adapted.reviewedManagedUninstall).toBeUndefined();
+    expect(applyApplicationPackagingAdapter('trevorsandy.Other', DEFAULT_PSADT_CONFIG)
+      .reviewedUninstallArguments).not.toContain('/shelluser');
   });
 
   it('uses Mozilla NSIS silent mode with the exact Waterfox ARP command', () => {

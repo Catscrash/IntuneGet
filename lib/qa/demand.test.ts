@@ -78,13 +78,20 @@ describe('ensureQaDemand app-version evidence reuse', () => {
     getPackageCompatibilityBlockMock.mockResolvedValue(null);
   });
 
-  it('does not queue or resolve dependencies for a retired catalog app', async () => {
+  it.each([
+    ['Example.App', 'vendor_retired'],
+    ['Wondershare.Filmora', 'unsupported_managed_install'],
+    ['GlassWire.GlassWire', 'unsupported_managed_uninstall'],
+    ['Wargaming.GameCenter', 'unsupported_managed_uninstall'],
+    ['Microsoft.VCLibs.14', 'unsupported_managed_uninstall'],
+    ['Microsoft.VCLibs.Desktop.14', 'unsupported_managed_uninstall'],
+  ])('does not queue or resolve dependencies for blocked %s', async (wingetId, code) => {
     getPackageEligibilityBlocksMock.mockResolvedValue([
-      { wingetId: 'Example.App', code: 'vendor_retired' },
+      { wingetId, code },
     ]);
     const client = { from: vi.fn() };
 
-    const result = await ensureQaDemand(client as never, demandInput());
+    const result = await ensureQaDemand(client as never, { ...demandInput(), wingetId });
 
     expect(result).toMatchObject({
       state: 'failed',
@@ -112,13 +119,14 @@ describe('ensureQaDemand app-version evidence reuse', () => {
     expect(client.from).not.toHaveBeenCalled();
   });
 
-  it('blocks an exact reviewed installer tuple before resolving dependencies', async () => {
+  it.each(['expired_signing_certificate', 'failed_managed_lifecycle', 'unverified_file_reputation'])(
+    'blocks an exact %s tuple before resolving dependencies', async (code) => {
     getPackageCompatibilityBlockMock.mockResolvedValue({
       wingetId: 'r12f.DivoomGateway',
       version: '0.1.42.0',
       architecture: 'x64',
       installerSha256: 'A'.repeat(64),
-      code: 'expired_signing_certificate',
+      code,
       detail: 'The signing certificate is expired.',
     });
     const client = { from: vi.fn() };
@@ -140,6 +148,132 @@ describe('ensureQaDemand app-version evidence reuse', () => {
       architecture: 'x64',
       installerSha256: 'A'.repeat(64),
     });
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks the failed Copilot profile before normalization or queue insertion', async () => {
+    const tuple = {
+      wingetId: 'Microsoft.365Copilot', version: '19.2609.33020.0',
+      architecture: 'x64' as const,
+      installerSha256: '7B2A6D88E87F068E8775D1DE267EE932914F430BFA054A2012DEC43FA279E61A',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Reviewed compatibility quarantine.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, installerType: 'exe', installScope: 'user',
+      silentSwitches: '--quiet --start -p',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Microsoft 365 Copilot',
+    })).resolves.toMatchObject({ state: 'failed', candidateId: null });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('returns a blocked normalized profile for Twinkstar without creating a queue row', async () => {
+    const tuple = {
+      wingetId: 'Twinkstar.TwinkstarBrowser', version: '11.4.1000.2609',
+      architecture: 'x64' as const,
+      installerSha256: '3671D4C0693240501854274692724B9A98C35B1E869066CF40985F43D4738668',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Exact registration remained.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '-silent', uninstallCommand: 'REGISTRY_UNINSTALL:Twinkstar',
+    })).resolves.toMatchObject({ state: 'failed', candidateId: null });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks the exact failed SSIS profile before dependency resolution or queue insertion', async () => {
+    const tuple = {
+      wingetId: 'Microsoft.DataTools.IntegrationServices', version: '17.0.1010.2',
+      architecture: 'x86' as const,
+      installerSha256: '75D8444333303D5B449660A669AF07862289E5F2BBDEF0AE7520C5BA3E47D65B',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Install failed with exit 1626.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, installerType: 'burn', installScope: 'machine',
+      silentSwitches: '/quiet /norestart',
+      uninstallCommand: 'REGISTRY_UNINSTALL:SQL Server Integration Services Projects',
+    })).resolves.toMatchObject({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+    });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks the exact Pithflow profile before dependency resolution or queue insertion', async () => {
+    const tuple = {
+      wingetId: 'Pithflow.Pithflow', version: '1.37.0', architecture: 'x64' as const,
+      installerSha256: '536AD9787092DFBD9F23C9F5FD4EA1ED81B1A363736AE68B3B3BFCED627028D4',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Registered uninstaller was absent.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '/S', uninstallCommand: 'REGISTRY_UNINSTALL:Pithflow',
+    })).resolves.toMatchObject({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+    });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks the exact Orca profile before dependency resolution or queue insertion', async () => {
+    const tuple = {
+      wingetId: 'StablyAI.Orca', version: '1.4.203', architecture: 'x64' as const,
+      installerSha256: 'DC347211CE31DC1D37BD6522B2BB96169747F626A19754C57F6868769E878A7C',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Registered uninstaller was absent.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '/S', uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{2B325EC9-0ED1-575F-AD70-E08307AEE879}:Orca',
+    })).resolves.toMatchObject({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+    });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
+    expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
+    expect(client.from).not.toHaveBeenCalled();
+  });
+
+  it('blocks the mismatched MTGA Launcher normalized profile before queue insertion', async () => {
+    const tuple = {
+      wingetId: 'WizardsoftheCoast.MTGALauncher', version: '1.0.124', architecture: 'x64' as const,
+      installerSha256: '96C64E5E0CD4D5758F3C9AE1AF7A2C6FFCF4782E273AEDE28FA92B8E63FFC368',
+    };
+    getPackageCompatibilityBlockMock.mockResolvedValue({
+      ...tuple, code: 'failed_managed_lifecycle', detail: 'Manifest launcher identity was absent.',
+    });
+    const client = { from: vi.fn() };
+    await expect(ensureQaDemand(client as never, {
+      ...demandInput(), ...tuple, displayName: 'MTGA Launcher', publisher: 'WizardsoftheCoast',
+      installerType: 'exe', installScope: 'machine', silentSwitches: '/quiet',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{BB91E8E1-8030-43C7-8461-1E54166F3AAB}:MTGA Launcher',
+    })).resolves.toMatchObject({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+    });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, tuple);
     expect(resolveWingetPackageDependenciesMock).not.toHaveBeenCalled();
     expect(client.from).not.toHaveBeenCalled();
   });

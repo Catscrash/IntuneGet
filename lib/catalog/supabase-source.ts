@@ -64,28 +64,32 @@ export class SupabaseCatalogSource implements CatalogSource {
   async getReleaseHistory(filters: ReleaseHistoryFilters): Promise<ReleaseHistoryResult> {
     const client = serviceOrAnonClient();
     if (!client) throw new Error('Catalog unavailable');
-    const { data, error } = await client.rpc('get_catalog_release_history', {
+    const { data, error } = await client.rpc('get_catalog_release_history_v2', {
+      app_filter: filters.app ?? "", date_from: filters.from || null, date_to: filters.to || null, architecture_filter: filters.architecture ?? "",
       search_text: filters.query, month_filter: filters.month,
       kind_filter: filters.kind, page_number: filters.page,
     }).abortSignal(AbortSignal.timeout(15_000));
     if (error) throw new Error('Catalog history unavailable', { cause: error });
     const result = data as ReleaseHistoryResult;
     if (!result.rows.length) return result;
+    let recoverySignal: AbortSignal | undefined;
     const {metadata, unavailable} = await loadReleaseMetadata(result.rows, batch => {
       const pairs = batch.map(row => `and(winget_id.eq.${quotePostgrestValue(row.winget_id)},version.eq.${quotePostgrestValue(row.version)})`).join(',');
-      return client.from('version_history').select('winget_id,version,release_notes_url,installer_sha256,installers').or(pairs).limit(batch.length).abortSignal(AbortSignal.timeout(10_000));
+      return client.from('version_history').select('winget_id,version,release_notes_url,installer_sha256,installers').or(pairs).limit(batch.length).abortSignal(AbortSignal.timeout(3000));
+    }, row => {
+      recoverySignal ??= AbortSignal.timeout(8000);
+      return client.from('version_history').select('winget_id,version,release_notes_url,installer_sha256,installers').eq('winget_id', row.winget_id).eq('version', row.version).limit(1).abortSignal(AbortSignal.any([recoverySignal, AbortSignal.timeout(3000)]));
     });
-    const hashes = [...new Set(metadata.map(v => v.installer_sha256?.toLowerCase()).filter((hash): hash is string => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)))];
+    const hashes = [...new Set(result.rows.map(row => enrichRelease(row, metadata, [], Date.now(), filters.architecture).virusTotal?.hash).filter((hash): hash is string => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)))];
     let reputations: FileReputation[] = [];
     if (hashes.length) {
-      const responses = await Promise.allSettled([
-        client.from('catalog_file_reputation').select('sha256,status,malicious,suspicious,total_engines,analyzed_at').in('sha256', hashes).abortSignal(AbortSignal.timeout(5000)),
-        process.env.SUPABASE_SERVICE_ROLE_KEY ? client.rpc('request_catalog_file_reputation', {hashes, prioritized: true}).abortSignal(AbortSignal.timeout(5000)) : Promise.resolve(null),
-      ]);
-      const cached = responses[0];
-      if (cached.status === 'fulfilled' && cached.value && !cached.value.error) reputations = (cached.value.data ?? []) as FileReputation[];
+      // Public history only consumes cached evidence. Never enqueue a lookup.
+      try {
+        const cached = await client.from('catalog_file_reputation').select('sha256,status,malicious,suspicious,total_engines,analyzed_at').in('sha256', hashes).abortSignal(AbortSignal.timeout(5000));
+        if (!cached.error) reputations = (cached.data ?? []) as FileReputation[];
+      } catch { /* Exact-hash links remain available when the cache cannot be read. */ }
     }
-    return {...result, rows: result.rows.map(row => unavailable.has(releasePairKey(row)) ? {...row, detailsUnavailable: true} : enrichRelease(row, metadata, reputations))};
+    return {...result, rows: result.rows.map(row => unavailable.has(releasePairKey(row)) ? {...row, detailsUnavailable: true} : enrichRelease(row, metadata, reputations, Date.now(), filters.architecture))};
   }
 
   // ---------------------------------------------------------------------------

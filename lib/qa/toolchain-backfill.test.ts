@@ -6,6 +6,103 @@ import {
 } from './toolchain-backfill';
 
 describe('QA toolchain targeted retries', () => {
+  it('adds only LPub3D to the managed-context release retry targets', () => {
+    const previous = 'ada1a8a5d1ad0ae9ad953306a6b528c71479a803';
+    const current = QA_PSADT_TOOLCHAIN.packagerCommit;
+    expect(terminalToolchainRetryTargets(current)).toEqual([
+      'trevorsandy.lpub3d', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(previous,
+      { wingetId: 'trevorsandy.lpub3d', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'trevorsandy.lpub3d', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'trevorsandy.Other', status: 'failed' })).toBe(false);
+  });
+  it('retries Product Portal only on its unattended uninstall release', () => {
+    const previous = '305b9c41a4ccbd271a9873a4fd858d2515586b76';
+    const current = 'ada1a8a5d1ad0ae9ad953306a6b528c71479a803';
+    expect(terminalToolchainRetryTargets(current)).toEqual([
+      'iZotope.ProductPortal', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(previous,
+      { wingetId: 'iZotope.ProductPortal', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'iZotope.ProductPortal', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'iZotope.Other', status: 'failed' })).toBe(false);
+  });
+  it('retries only WireSock CLI in addition to the prior release targets', () => {
+    const previous = '9e51c9ab6cc3a28346f13266e566c9896fa4101b';
+    const current = '305b9c41a4ccbd271a9873a4fd858d2515586b76';
+    expect(terminalToolchainRetryTargets(current)).toEqual([
+      'NTKERNEL.WireSockVPNClientCLI', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(previous,
+      { wingetId: 'NTKERNEL.WireSockVPNClientCLI', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'NTKERNEL.WireSockVPNClientCLI', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'NTKERNEL.WireSockVPNClient', status: 'failed' })).toBe(false);
+  });
+  it('retries RackSight only after its exact identity repair and preserves older targets', () => {
+    const previous = '05f550c4ec6d14b2cf3d4c2ce32db418da3dd0ba';
+    const current = '9e51c9ab6cc3a28346f13266e566c9896fa4101b';
+    expect(shouldRetryTerminalToolchainCandidate(previous,
+      { wingetId: 'AuthorityGate.RackSight', status: 'failed' })).toBe(false);
+    expect(terminalToolchainRetryTargets(current)).toEqual([
+      'AuthorityGate.RackSight', ...terminalToolchainRetryTargets(previous),
+    ]);
+  });
+  it('retries AirUSB only on its repaired release while preserving existing targets', () => {
+    const previous = '5fdfc187c77c3223dc76287b41232770108ee7be';
+    const current = '05f550c4ec6d14b2cf3d4c2ce32db418da3dd0ba';
+    expect(shouldRetryTerminalToolchainCandidate(previous,
+      { wingetId: 'AirUSB.Client', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'AirUSB.Client', status: 'failed' })).toBe(true);
+    expect(terminalToolchainRetryTargets(current)).toEqual([
+      'AirUSB.Client', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(current,
+      { wingetId: 'AirUSB.Other', status: 'failed' })).toBe(false);
+  });
+  it('retries Philips only after the exact NSIS identity repair', () => {
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Philips.SmartControl', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('7238616608f888449fa2e132fffc8d7314c26745',
+      { wingetId: 'Philips.SmartControl', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Philips.Other', status: 'failed' })).toBe(false);
+  });
+  it('retries Acrobat only after its archive MSI identity repair', () => {
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Adobe.Acrobat.Pro', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('6bdefc387d1402c71d30a6fbfcf850038f60f37a',
+      { wingetId: 'Adobe.Acrobat.Pro', status: 'failed' })).toBe(false);
+    expect(terminalToolchainRetryTargets(QA_PSADT_TOOLCHAIN.packagerCommit))
+      .not.toContain('Adobe.CreativeCloud');
+  });
+  it('retries WithSecure only on the reviewed silent-removal release', () => {
+    expect(shouldRetryTerminalToolchainCandidate(
+      QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'WithSecure.ElementsAgent', status: 'failed' }
+    )).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(
+      '0ff16a2420976f28a232ad1c015c8023f805fbb3',
+      { wingetId: 'WithSecure.ElementsAgent', status: 'failed' }
+    )).toBe(false);
+  });
+  it('retries SketchUp 2025 only after its unattended removal activation', () => {
+    expect(shouldRetryTerminalToolchainCandidate(
+      QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Trimble.SketchUp.2025', status: 'failed' }
+    )).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(
+      'd33825c2b786af7c3f22f4b828108c4129299ef9',
+      { wingetId: 'Trimble.SketchUp.2025', status: 'failed' }
+    )).toBe(false);
+  });
   it('retries Retoolkit after activating the 45-minute bounded install wait', () => {
     const wingetId = 'mentebinaria.retoolkit';
     expect(shouldRetryTerminalToolchainCandidate(
@@ -1513,6 +1610,17 @@ describe('QA toolchain targeted retries', () => {
     expect(shouldRetryTerminalToolchainCandidate(
       '7e83c363bcbafca153f00113b12ede2e332b2d2d',
       { wingetId: 'abbodi1406.vcredist', status: 'failed' }
+    )).toBe(false);
+  });
+
+  it('adds PostgreSQL 16 to the bounded removal release without arbitrary retries', () => {
+    expect(shouldRetryTerminalToolchainCandidate(
+      '0ff16a2420976f28a232ad1c015c8023f805fbb3',
+      { wingetId: 'PostgreSQL.PostgreSQL.16', status: 'failed' }
+    )).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(
+      '0ff16a2420976f28a232ad1c015c8023f805fbb3',
+      { wingetId: 'Example.UnreviewedApp', status: 'failed' }
     )).toBe(false);
   });
 

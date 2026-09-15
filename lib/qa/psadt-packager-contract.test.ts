@@ -11,6 +11,9 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { applyApplicationPackagingAdapter, resolveApplicationUninstallCommand } from '@/lib/packaging-adapters';
+import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
+import { generateUninstallCommand } from '@/lib/detection-rules';
 
 const packager = readFileSync(
   resolve(process.cwd(), '.github/scripts/Create-PSADTPackage.ps1'),
@@ -279,6 +282,33 @@ describe('PSADT Inno packaging contract', () => {
 });
 
 describe('PSADT vendor argument contract', () => {
+  it.runIf(canRunWindowsPowerShellPackager)('generates Product Portal unattended removal with exact registration verification', () => {
+    const generated = generateRegistryUninstallPackage(
+      'exe', 'Product Portal', [],
+      applyApplicationPackagingAdapter('iZotope.ProductPortal', DEFAULT_PSADT_CONFIG),
+      [], 'iZotope.ProductPortal', 'Product Portal', '1.4.9',
+      'REGISTRY_UNINSTALL_KEY:Product Portal:Product Portal', '--mode unattended'
+    );
+    expect(generated).toContain("'--mode', 'unattended'");
+    expect(generated).toContain('$registeredUninstallArguments += $additionalUninstallArguments');
+    expect(generated).toContain('throw "The vendor uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."');
+  });
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'generates PostgreSQL 16 bounded removal without relaxing exact registration verification',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'exe', 'PostgreSQL 16', [],
+        applyApplicationPackagingAdapter('PostgreSQL.PostgreSQL.16', DEFAULT_PSADT_CONFIG),
+        [], 'PostgreSQL.PostgreSQL.16', 'PostgreSQL 16', '16.15-3',
+        'REGISTRY_UNINSTALL:PostgreSQL 16', '--mode unattended --unattendedmodeui none'
+      );
+      expect(generated).toContain('else { 15 }');
+      expect(generated).toContain('$uninstallDeadline = [DateTime]::UtcNow.AddMinutes($effectiveUninstallCompletionTimeoutMinutes)');
+      expect(generated).toContain('throw "The vendor uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."');
+      expect(generated).toContain("'--mode', 'unattended', '--unattendedmodeui', 'none'");
+    }
+  );
+
   it.runIf(canRunWindowsPowerShellPackager)(
     'executes a reviewed archive batch from a confined temporary extraction',
     () => {
@@ -611,6 +641,96 @@ describe('PSADT vendor argument contract', () => {
       expect(uninstallFunction).toContain(
         '$registeredUninstallArguments += $reviewedArgument'
       );
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'executes WithSecure captured uninstall argument merging without install-only switches',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'msi', 'WithSecure Elements Agent', [],
+        applyApplicationPackagingAdapter('WithSecure.ElementsAgent', DEFAULT_PSADT_CONFIG),
+        [], 'WithSecure.ElementsAgent', 'WithSecure Elements Agent', '26.3.298.0',
+        'REGISTRY_UNINSTALL_PRODUCT:{C9EF1C7D-16FA-4C43-B764-1A127CDBAECB}:WithSecure Elements Agent',
+        '/quiet ALLUSERS=1'
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'));
+      const configLine = uninstall.split('\n').find(line => line.includes('$reviewedUninstallArguments ='));
+      const merge = uninstall.match(/foreach \(\$reviewedArgument in \$reviewedUninstallArguments\) \{[\s\S]*?\$registeredUninstallArguments \+= \$reviewedArgument\s*\}\s*\}/)?.[0];
+      expect(configLine).toBeTruthy();
+      expect(merge).toBeTruthy();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${configLine}
+$registeredUninstallArguments = @()
+${merge}
+${merge}
+ConvertTo-Json -InputObject @($registeredUninstallArguments) -Compress
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual(['--silent']);
+      expect(uninstall).toContain("$configuredProductCode = '{C9EF1C7D-16FA-4C43-B764-1A127CDBAECB}'");
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'executes LPub3D registered argument merging without a desktop-shell restart',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'nullsoft', 'LPub3D', [],
+        applyApplicationPackagingAdapter('trevorsandy.lpub3d', DEFAULT_PSADT_CONFIG),
+        [], 'trevorsandy.lpub3d', 'LPub3D', '2.4.9.86.4133',
+        'REGISTRY_UNINSTALL_KEY:LPub3D:LPub3D', '/S /allusers'
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'));
+      const configLine = uninstall.split('\n').find(line => line.includes('$reviewedUninstallArguments ='));
+      const merge = uninstall.match(/foreach \(\$reviewedArgument in \$reviewedUninstallArguments\) \{[\s\S]*?\$registeredUninstallArguments \+= \$reviewedArgument\s*\}\s*\}/)?.[0];
+      expect(configLine).toBeTruthy();
+      expect(merge).toBeTruthy();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${configLine}
+$registeredUninstallArguments = @('/allusers', '/S')
+${merge}
+${merge}
+ConvertTo-Json -InputObject @($registeredUninstallArguments) -Compress
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual(['/allusers', '/S', '/shelluser']);
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
+      expect(uninstall).toContain("'LPub3D'");
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'executes SketchUp 2025 reviewed argument merging without duplicating silent mode',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'exe', 'SketchUp 2025', [],
+        applyApplicationPackagingAdapter('Trimble.SketchUp.2025', DEFAULT_PSADT_CONFIG),
+        [], 'Trimble.SketchUp.2025', 'SketchUp 2025', '25.0.660',
+        'REGISTRY_UNINSTALL_PRODUCT:{BF6A8902-D556-5B2D-9FD7-83F19CE65B5C}:SketchUp 2025',
+        '/silent'
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'));
+      expect(uninstall).toContain("$configuredProductCode = '{BF6A8902-D556-5B2D-9FD7-83F19CE65B5C}'");
+      const configLine = uninstall.split('\n').find(line => line.includes('$reviewedUninstallArguments ='));
+      const merge = uninstall.match(/foreach \(\$reviewedArgument in \$reviewedUninstallArguments\) \{[\s\S]*?\$registeredUninstallArguments \+= \$reviewedArgument\s*\}\s*\}/)?.[0];
+      expect(configLine).toBeTruthy();
+      expect(merge).toBeTruthy();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${configLine}
+$registeredUninstallArguments = @('-remove', '-runfromtemp')
+${merge}
+$first = @($registeredUninstallArguments)
+${merge}
+[pscustomobject]@{ First = $first; Repeated = @($registeredUninstallArguments) } | ConvertTo-Json -Compress
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        First: ['-remove', '-runfromtemp', '-silent'],
+        Repeated: ['-remove', '-runfromtemp', '-silent'],
+      });
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
     }
   );
 
@@ -2211,6 +2331,131 @@ describe('PSADT registry uninstall identity contract', () => {
     expect(packager).not.toContain('$existingNameMatches');
   });
 
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'captures the Acrobat ZIP bootstrapper MSI identity despite its different registered name',
+    () => {
+      const command = generateUninstallCommand({
+        type: 'zip', nestedInstallerType: 'exe', architecture: 'x64',
+        url: 'https://example.com/acrobat.zip', sha256: 'E'.repeat(64),
+        productCode: '{AC76BA86-1033-FFFF-7760-BC15014EA700}',
+        nestedInstallerPath: 'Adobe Acrobat\\setup.exe',
+      }, 'Adobe Acrobat Pro');
+      const generated = generateRegistryUninstallPackage(
+        'zip', 'Adobe Acrobat Pro', [], {}, [], 'Adobe.Acrobat.Pro',
+        'Adobe Acrobat Pro', '26.002.21901', command,
+        '/sAll /rs /msi EULA_ACCEPT=YES', 'machine', 'exe', 'Adobe Acrobat\\setup.exe'
+      );
+      const identityLine = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selectionLine = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identityLine).toBeDefined();
+      expect(selectionLine).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identityLine}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '{AC76BA86-1033-FFFF-7760-BC15014EA700}'; DisplayName = 'Adobe Acrobat (64-bit)' },
+  [pscustomobject]@{ PSChildName = '{AC76BA86-1033-FF00-7760-BC15014EA700}'; DisplayName = 'Adobe Acrobat Reader (64-bit)' }
+)
+${selectionLine}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'Adobe Acrobat (64-bit)') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selectionLine}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '{AC76BA86-1033-FFFF-7760-BC15014EA700}'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the RackSight NSIS key despite the observed Edge registration change',
+    () => {
+      const key = '3961d0de-ceb1-54d7-a222-b94c8b534c40';
+      const command = resolveApplicationUninstallCommand('AuthorityGate.RackSight', 'REGISTRY_UNINSTALL:RackSight Desktop');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'RackSight Desktop', [], {}, [],
+        'AuthorityGate.RackSight', 'RackSight Desktop', '1.1.9', command, '/S');
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'RackSight 1.1.9'; Publisher = 'AuthorityGate' },
+  [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; DisplayName = 'Microsoft EdgeWebView'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'RackSight 1.1.9') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the AirUSB Inno key despite the observed Edge registration change',
+    () => {
+      const key = '{B7A2E3F1-4D8C-4B2A-9E6F-1A3C5D7E9B0F}_is1';
+      const command = resolveApplicationUninstallCommand('AirUSB.Client', 'REGISTRY_UNINSTALL:AirUSB Client');
+      const generated = generateRegistryUninstallPackage('inno', 'AirUSB Client', [], {}, [],
+        'AirUSB.Client', 'AirUSB Client', '1.1.2', command);
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'Air USB'; Publisher = 'Zed Axis' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'Air USB') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'inno'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the Philips NSIS key despite Edge and OneDrive registry changes',
+    () => {
+      const key = 'eaf31a0e-c98a-5e6e-9883-2a487a3337a1';
+      const command = resolveApplicationUninstallCommand('Philips.SmartControl',
+        'REGISTRY_UNINSTALL_PRODUCT:{EAF31A0E-C98A-5E6E-9883-2A487A3337A1}:Smart Control');
+      const generated = generateRegistryUninstallPackage('zip', 'Smart Control', [], {}, [],
+        'Philips.SmartControl', 'Smart Control', '7.2.0', command, '/S', 'user',
+        'nullsoft', 'SmartControl Setup 7.2.0.exe');
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'SmartControl' },
+  [pscustomobject]@{ PSChildName = 'OneDriveSetup.exe'; DisplayName = 'Microsoft OneDrive' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'SmartControl') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1], $changedApplications[2])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
   it('supports a reviewed exact non-MSI uninstall registry key', () => {
     expect(packager).toContain(
       '^REGISTRY_UNINSTALL_KEY:((?:[A-Za-z0-9][A-Za-z0-9 ._{}()+-]{0,255}|'
@@ -2689,6 +2934,41 @@ $ambiguous = Select-Localized @('Mozilla Firefox (x64 de)', 'Mozilla Firefox (x8
       '[string]$_.Publisher -eq $configuredUninstallPublisherName'
     );
   });
+
+  it.runIf(canRunWindowsPowerShellPackager)('selects the WireSock SDK wrapper from the actual failed registry delta', () => {
+    const config = applyApplicationPackagingAdapter('NTKERNEL.WireSockVPNClientCLI', DEFAULT_PSADT_CONFIG);
+    const generated = generateRegistryUninstallPackage('exe', 'WireSock Secure Connect CLI', [], config, [],
+      'NTKERNEL.WireSockVPNClientCLI', 'WireSock Secure Connect CLI', '3.6.1',
+      'REGISTRY_UNINSTALL:WireSock Secure Connect CLI', '/S /NCRC');
+    const identity = generated.split('\n').find(line => line.includes('$configuredUninstallDisplayName ='));
+    const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.DisplayName -eq'));
+    const visible = generated.match(/\$visiblePrimaryMatches = @\(\$selectedApplications \| Where-Object \{[\s\S]*?if \(\$visiblePrimaryMatches.Count -eq 1\) \{ \$selectedApplications = \$visiblePrimaryMatches \}/)?.[0];
+    expect(identity).toContain("'WireSock Secure Connect SDK'");
+    expect(selection).toBeDefined();
+    expect(visible).toBeDefined();
+    const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$wrapper = [pscustomobject]@{ PSChildName = '{2D8B4476-9926-4D30-A5FC-C0F369BBDD9C}'; DisplayName = 'WireSock Secure Connect SDK'; SystemComponent = $false }
+$hidden = [pscustomobject]@{ PSChildName = '{CE9DCD95-C063-448F-8C04-5558F212BCD2}'; DisplayName = 'WireSock Secure Connect SDK'; SystemComponent = $true }
+$driver = [pscustomobject]@{ DisplayName = 'WireSock Kernel Drivers'; SystemComponent = $true }
+$edge = [pscustomobject]@{ DisplayName = 'Microsoft Edge'; SystemComponent = $false }
+$changedApplications = @($wrapper, $hidden, $driver, $edge)
+${selection}
+${visible}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne $wrapper.PSChildName) { throw 'Wrong identity captured' }
+$changedApplications = @($edge, $driver)
+${selection}
+${visible}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated identity selected' }
+$changedApplications = @($wrapper, $wrapper, $hidden)
+${selection}
+${visible}
+if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
+`], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(generated).toContain("$appName = 'WireSock Secure Connect SDK'");
+    expect(generated).toContain('$_.PSChildName -eq $capturedUninstallKey');
+  }, 30_000);
 
   it('keeps visible-primary ARP selection opt-in, identity-bounded, and fail-closed', () => {
     expect(packager).toContain(
@@ -3743,7 +4023,7 @@ $ambiguous = Select-Localized @('Mozilla Firefox (x64 de)', 'Mozilla Firefox (x8
         'Array Config Contract App',
         [],
         [{ processesToClose: [] }]
-      )).toThrow('top-level PSADT_CONFIG value');
+      )).toThrow(/top-level PSADT_CONFIG[\s|]+value/);
 
       expect(() => generateRegistryUninstallPackage(
         'inno',
