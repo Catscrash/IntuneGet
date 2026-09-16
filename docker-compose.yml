@@ -16,6 +16,12 @@ services:
       - DATABASE_MODE=${DATABASE_MODE:-supabase}
       - DATABASE_PATH=/data/intuneget.db
 
+      # Shared secret between the scheduler below and the cron routes. The
+      # routes reject every call while it is unset - they are ordinary HTTP
+      # endpoints, so this is all that separates a scheduled call from an
+      # anonymous one.
+      - CRON_SECRET=${CRON_SECRET:-}
+
       # ===========================================
       # Packager Authentication (for SQLite mode)
       # ===========================================
@@ -81,6 +87,32 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Calls the cron routes on an interval.
+  #
+  # Those routes are plain HTTP endpoints that a hosting platform is expected
+  # to call on a schedule; a container deployment has no such platform, so
+  # without this nothing ever ran them. Runs from the same image as the web
+  # service, so there is no second image to pull or keep in step.
+  #
+  # Deliberately no proxy variables: it only ever talks to `web` on the compose
+  # network, and inheriting an outbound proxy would send those calls through it.
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "scripts/scheduler.mjs"]
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      - CRON_SECRET=${CRON_SECRET:-}
+      # Where the web service answers, and which jobs to call. The default is
+      # the one job that works without Supabase; a Supabase-backed deployment
+      # can list the others here as "/path:seconds,/path:seconds".
+      - SCHEDULER_TARGET=${SCHEDULER_TARGET:-http://web:3000}
+      - SCHEDULER_JOBS=${SCHEDULER_JOBS:-}
+    restart: unless-stopped
 
 volumes:
   intuneget-data:

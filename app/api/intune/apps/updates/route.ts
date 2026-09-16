@@ -153,332 +153,374 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Get service principal token
-    const graphToken = await getServicePrincipalToken(tenantId);
-
-    if (!graphToken) {
-      return NextResponse.json(
-        { error: 'Failed to get Graph API token' },
-        { status: 500 }
-      );
-    }
-
-    // Fetch Win32 apps from Intune using isof filter with pagination
-    // Note: We can't use $select with derived type fields (like displayVersion) when using type filters
-    const apps: IntuneWin32App[] = [];
-    let nextUrl: string | null = `${GRAPH_API_BASE}/deviceAppManagement/mobileApps?$filter=isof('microsoft.graph.win32LobApp')&$top=100`;
-
-    while (nextUrl) {
-      const graphResponse: Response = await fetch(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${graphToken}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!graphResponse.ok) {
-        const errorText = await graphResponse.text();
-        return NextResponse.json(
-          { error: 'Failed to fetch apps from Intune', details: errorText },
-          { status: graphResponse.status }
-        );
-      }
-
-      const graphData = await graphResponse.json();
-      const pageApps: IntuneWin32App[] = graphData.value || [];
-      apps.push(...pageApps);
-
-      nextUrl = graphData['@odata.nextLink'] || null;
-    }
-
-    const liveIntuneAppIds = new Set(apps.map((a) => a.id));
-
-    // Build explicit app-id to winget-id mappings from deployment history.
-    // Deployment history is the strongest signal for "this app is ours", and
-    // it exists in both backends, so it goes through the db abstraction rather
-    // than a direct Supabase query.
-    //
-    // Read for the whole tenant, not just the signed-in user: tenants are
-    // worked by several administrators, and an app a colleague deployed is
-    // still an IntuneGet app. Scoping this to one user made every colleague's
-    // package look like a fuzzy name match. The user's access to this tenant
-    // was proved above (token tenant, or MSP resolution plus consent).
-    const uploadHistoryWingetMap = new Map<string, string>();
-    const uploadHistoryVersionMap = new Map<string, string>();
-    const tenantHistoryRows = await getDatabase().uploadHistory.getByTenantId(tenantId);
-
-    for (const row of tenantHistoryRows as UploadHistoryMappingRow[]) {
-      if (row.intune_app_id && row.winget_id) {
-        uploadHistoryWingetMap.set(row.intune_app_id, row.winget_id);
-      }
-      if (row.intune_app_id && row.version && liveIntuneAppIds.has(row.intune_app_id)) {
-        uploadHistoryVersionMap.set(row.intune_app_id, row.version);
-      }
-    }
-
-    // Build explicit user-link mappings from the Discovered Apps feature.
-    // These take precedence over fuzzy matching: if a user explicitly linked
-    // an app to a Winget package, use that link with high confidence.
-    // Claimed apps and manual mappings are Supabase-only features (see the
-    // claim and mappings routes); without them the matcher simply falls back
-    // to deployment history, the description marker and the heuristics.
-    const claimedWingetByIntuneAppId = new Map<string, string>();
-    const claimedWingetByName = new Map<string, string>();
-    const { data: claimedRows } = supabase
-      ? await supabase
-          .from('claimed_apps')
-          .select('intune_app_id, discovered_app_name, winget_package_id')
-          .eq('tenant_id', tenantId)
-      : { data: null };
-
-    if (claimedRows) {
-      for (const row of claimedRows as ClaimedAppMappingRow[]) {
-        if (!row.winget_package_id) {
-          continue;
-        }
-        if (row.intune_app_id) {
-          claimedWingetByIntuneAppId.set(row.intune_app_id, row.winget_package_id);
-        }
-        if (row.discovered_app_name) {
-          claimedWingetByName.set(
-            row.discovered_app_name.toLowerCase().trim(),
-            row.winget_package_id
-          );
-        }
-      }
-    }
-
-    // Manual mappings are keyed by lowercased display name; include tenant
-    // mappings and global (tenant_id is null) mappings.
-    const manualWingetByName = new Map<string, string>();
-    const { data: manualMappingRows } = supabase
-      ? await supabase
-          .from('manual_app_mappings')
-          .select('discovered_app_name, winget_package_id')
-          .or(`tenant_id.eq.${tenantId},tenant_id.is.null`)
-      : { data: null };
-
-    if (manualMappingRows) {
-      for (const row of manualMappingRows as ManualAppMappingRow[]) {
-        if (row.discovered_app_name && row.winget_package_id) {
-          manualWingetByName.set(
-            row.discovered_app_name.toLowerCase().trim(),
-            row.winget_package_id
-          );
-        }
-      }
-    }
-
-    // Match apps to Winget IDs
-    const updates: AppUpdateInfo[] = [];
-    const checked: CheckedResult[] = [];
-    const matchedApps: MatchedApp[] = [];
-
-    for (const app of apps) {
-      const historyWingetId = uploadHistoryWingetMap.get(app.id);
-      if (historyWingetId) {
-        matchedApps.push({
-          app,
-          wingetId: historyWingetId,
-          isManaged: true,
-        });
-        continue;
-      }
-
-      const markerWingetId = extractDeployedWingetId(app);
-      if (markerWingetId) {
-        matchedApps.push({
-          app,
-          wingetId: markerWingetId,
-          isManaged: true,
-        });
-        continue;
-      }
-
-      // Explicit user links (claimed apps and manual mappings) take
-      // precedence over fuzzy matching.
-      const normalizedDisplayName = app.displayName.toLowerCase().trim();
-      const explicitWingetId =
-        claimedWingetByIntuneAppId.get(app.id) ||
-        manualWingetByName.get(normalizedDisplayName) ||
-        claimedWingetByName.get(normalizedDisplayName);
-      if (explicitWingetId) {
-        matchedApps.push({
-          app,
-          wingetId: explicitWingetId,
-          isManaged: true,
-        });
-        continue;
-      }
-
-      let match = matchAppToWinget(app);
-
-      if (!match || match.confidence === 'low') {
-        match = await matchAppToWingetWithDatabase(app, supabase);
-      }
-
-      if (!match) {
-        checked.push({
-          app: app.displayName,
-          wingetId: null,
-          result: 'No match found',
-        });
-        continue;
-      }
-
-      if (match.confidence === 'low') {
-        checked.push({
-          app: app.displayName,
-          wingetId: match.wingetId,
-          result: 'Low confidence match - skipped',
-        });
-        continue;
-      }
-
-      matchedApps.push({
-        app,
-        wingetId: match.wingetId,
-        // Apps deployed before the package-id marker existed carry only the
-        // old product line, which names no package - so the match had to come
-        // from the heuristics, but the provenance is still explicit.
-        isManaged: hasLegacyIntuneGetMarker(app),
-      });
-    }
-
-    // Batch lookup all Winget versions from curated_apps table (single DB query)
-    const versionMap = new Map<string, string>();
-    const wingetIdsToLookup = Array.from(new Set(matchedApps.map((m) => m.wingetId)));
-
-    if (wingetIdsToLookup.length > 0) {
-      const cachedPackages = await getCatalogSource().getAppsByWingetIds(wingetIdsToLookup);
-
-      for (const pkg of cachedPackages as CuratedPackageRow[]) {
-        if (pkg.latest_version) {
-          versionMap.set(pkg.winget_id, pkg.latest_version);
-        }
-      }
-    }
-
-    // Compute the effective version for an app by taking the MAX of its
-    // displayVersion and the version recorded in upload_history. This prevents
-    // false update detection when Intune's displayVersion lags behind the
-    // actually deployed version (propagation delay) or is null/empty.
-    function getEffectiveVersion(app: IntuneWin32App): string {
-      const displayVer = normalizeVersion(app.displayVersion);
-      const historyVer = normalizeVersion(uploadHistoryVersionMap.get(app.id));
-      return compareVersions(historyVer, displayVer) > 0 ? historyVer : displayVer;
-    }
-
-    // Group by Winget ID and compare using the newest tenant app object.
-    // This prevents older Intune objects from suppressing update detection.
-    const appsByWinget = new Map<string, MatchedApp[]>();
-    for (const matched of matchedApps) {
-      if (!appsByWinget.has(matched.wingetId)) {
-        appsByWinget.set(matched.wingetId, []);
-      }
-      appsByWinget.get(matched.wingetId)!.push(matched);
-    }
-
-    for (const [wingetId, candidates] of appsByWinget.entries()) {
-      // Self-updating apps (e.g. Microsoft 365 Apps via Click-to-Run) must
-      // never be offered as updates - the installed product updates itself
-      // and the winget version only tracks the setup bootstrapper
-      if (isSelfUpdatingApp(wingetId)) {
-        for (const candidate of candidates) {
-          checked.push({
-            app: candidate.app.displayName,
-            wingetId,
-            result: 'Self-updating app, excluded from updates',
-          });
-        }
-        continue;
-      }
-
-      const latestVersion = versionMap.get(wingetId);
-
-      if (!latestVersion) {
-        for (const candidate of candidates) {
-          checked.push({
-            app: candidate.app.displayName,
-            wingetId,
-            result: 'Package not in cache',
-          });
-        }
-        continue;
-      }
-
-      const newestCandidate = candidates.reduce((currentNewest, candidate) => {
-        const currentNewestVersion = getEffectiveVersion(currentNewest.app);
-        const candidateVersion = getEffectiveVersion(candidate.app);
-        const comparison = compareVersions(candidateVersion, currentNewestVersion);
-
-        if (comparison > 0) {
-          return candidate;
-        }
-
-        if (comparison === 0) {
-          const currentModified = new Date(currentNewest.app.lastModifiedDateTime).getTime();
-          const candidateModified = new Date(candidate.app.lastModifiedDateTime).getTime();
-          if (candidateModified > currentModified) {
-            return candidate;
-          }
-        }
-
-        return currentNewest;
-      });
-
-      const currentVersion = getEffectiveVersion(newestCandidate.app);
-      const normalizedLatest = normalizeVersion(latestVersion);
-      const updateAvailable = hasUpdate(currentVersion, normalizedLatest);
-
-      // If IntuneGet has explicit provenance over ANY app object for this
-      // winget ID, treat the whole group as managed -- an unmanaged duplicate
-      // object with a higher version must not mask a package we deployed.
-      const groupIsManaged = candidates.some((candidate) => candidate.isManaged);
-
-      if (updateAvailable) {
-        updates.push({
-          intuneApp: newestCandidate.app,
-          currentVersion: currentVersion !== '0.0.0' ? currentVersion : 'Unknown',
-          latestVersion: latestVersion,
-          wingetId,
-          hasUpdate: true,
-          isManaged: groupIsManaged,
-        });
-      } else {
-        // no-op; tracked in checked entries below
-      }
-
-      for (const candidate of candidates) {
-        if (candidate.app.id === newestCandidate.app.id) {
-          checked.push({
-            app: candidate.app.displayName,
-            wingetId,
-            result: updateAvailable
-              ? `Update available (newest tenant app): ${currentVersion} -> ${normalizedLatest}`
-              : 'Up to date (newest tenant app)',
-          });
-          continue;
-        }
-
-        checked.push({
-          app: candidate.app.displayName,
-          wingetId,
-          result: `Older tenant app object (${getEffectiveVersion(candidate.app)}) - compared using newest ${currentVersion}`,
-        });
-      }
-    }
+    const scan = await scanTenantForUpdates({
+      userId: user.userId,
+      tenantId,
+      supabase,
+    });
 
     return NextResponse.json({
-      updates,
-      updateCount: updates.length,
-      totalApps: apps.length,
-      checkedApps: checked,
+      updates: scan.updates,
+      updateCount: scan.updates.length,
+      totalApps: scan.totalApps,
+      checkedApps: scan.checked,
     });
-  } catch {
+  } catch (error) {
+    const status = error instanceof TenantUpdateScanError ? error.status : 500;
     return NextResponse.json(
       { error: 'Failed to check for updates' },
-      { status: 500 }
+      { status }
     );
   }
 }
+
+/** Raised when the scan cannot reach Intune; the HTTP route maps it to a status. */
+export class TenantUpdateScanError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 500) {
+    super(message);
+    this.name = 'TenantUpdateScanError';
+    this.status = status;
+  }
+}
+
+export interface TenantUpdateScan {
+  updates: AppUpdateInfo[];
+  checked: CheckedResult[];
+  totalApps: number;
+}
+
+/**
+ * Scan one tenant for available updates.
+ *
+ * Split out of the request handler so the scheduled refresh can run the same
+ * scan without a signed-in user: Graph is reached with the tenant's service
+ * principal, and the caller's identity only decides whose explicit mappings
+ * and deployment history count. Two implementations would drift, and this one
+ * carries the provenance rules that decide whether an app is ours.
+ */
+export async function scanTenantForUpdates({
+  userId,
+  tenantId,
+  supabase,
+}: {
+  userId: string;
+  tenantId: string;
+  supabase: ReturnType<typeof getServerClientOrNull>;
+}): Promise<TenantUpdateScan> {
+  // Get service principal token
+  const graphToken = await getServicePrincipalToken(tenantId);
+
+  if (!graphToken) {
+    throw new TenantUpdateScanError(`Failed to get a Graph API token for tenant ${tenantId}`);
+  }
+
+  // Fetch Win32 apps from Intune using isof filter with pagination
+  // Note: We can't use $select with derived type fields (like displayVersion) when using type filters
+  const apps: IntuneWin32App[] = [];
+  let nextUrl: string | null = `${GRAPH_API_BASE}/deviceAppManagement/mobileApps?$filter=isof('microsoft.graph.win32LobApp')&$top=100`;
+
+  while (nextUrl) {
+    const graphResponse: Response = await fetch(nextUrl, {
+      headers: {
+        Authorization: `Bearer ${graphToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!graphResponse.ok) {
+      const errorText = await graphResponse.text();
+      throw new TenantUpdateScanError(
+        `Failed to fetch apps from Intune: ${errorText}`,
+        graphResponse.status
+      );
+    }
+
+    const graphData = await graphResponse.json();
+    const pageApps: IntuneWin32App[] = graphData.value || [];
+    apps.push(...pageApps);
+
+    nextUrl = graphData['@odata.nextLink'] || null;
+  }
+
+  const liveIntuneAppIds = new Set(apps.map((a) => a.id));
+
+  // Build explicit app-id to winget-id mappings from deployment history.
+  // Deployment history is the strongest signal for "this app is ours", and
+  // it exists in both backends, so it goes through the db abstraction rather
+  // than a direct Supabase query.
+  //
+  // Read for the whole tenant, not just the signed-in user: tenants are
+  // worked by several administrators, and an app a colleague deployed is
+  // still an IntuneGet app. Scoping this to one user made every colleague's
+  // package look like a fuzzy name match. The user's access to this tenant
+  // was proved above (token tenant, or MSP resolution plus consent).
+  const uploadHistoryWingetMap = new Map<string, string>();
+  const uploadHistoryVersionMap = new Map<string, string>();
+  const tenantHistoryRows = await getDatabase().uploadHistory.getByTenantId(tenantId);
+
+  for (const row of tenantHistoryRows as UploadHistoryMappingRow[]) {
+    if (row.intune_app_id && row.winget_id) {
+      uploadHistoryWingetMap.set(row.intune_app_id, row.winget_id);
+    }
+    if (row.intune_app_id && row.version && liveIntuneAppIds.has(row.intune_app_id)) {
+      uploadHistoryVersionMap.set(row.intune_app_id, row.version);
+    }
+  }
+
+  // Build explicit user-link mappings from the Discovered Apps feature.
+  // These take precedence over fuzzy matching: if a user explicitly linked
+  // an app to a Winget package, use that link with high confidence.
+  // Claimed apps and manual mappings are Supabase-only features (see the
+  // claim and mappings routes); without them the matcher simply falls back
+  // to deployment history, the description marker and the heuristics.
+  const claimedWingetByIntuneAppId = new Map<string, string>();
+  const claimedWingetByName = new Map<string, string>();
+  const { data: claimedRows } = supabase
+    ? await supabase
+        .from('claimed_apps')
+        .select('intune_app_id, discovered_app_name, winget_package_id')
+        .eq('tenant_id', tenantId)
+    : { data: null };
+
+  if (claimedRows) {
+    for (const row of claimedRows as ClaimedAppMappingRow[]) {
+      if (!row.winget_package_id) {
+        continue;
+      }
+      if (row.intune_app_id) {
+        claimedWingetByIntuneAppId.set(row.intune_app_id, row.winget_package_id);
+      }
+      if (row.discovered_app_name) {
+        claimedWingetByName.set(
+          row.discovered_app_name.toLowerCase().trim(),
+          row.winget_package_id
+        );
+      }
+    }
+  }
+
+  // Manual mappings are keyed by lowercased display name; include tenant
+  // mappings and global (tenant_id is null) mappings.
+  const manualWingetByName = new Map<string, string>();
+  const { data: manualMappingRows } = supabase
+    ? await supabase
+        .from('manual_app_mappings')
+        .select('discovered_app_name, winget_package_id')
+        .or(`tenant_id.eq.${tenantId},tenant_id.is.null`)
+    : { data: null };
+
+  if (manualMappingRows) {
+    for (const row of manualMappingRows as ManualAppMappingRow[]) {
+      if (row.discovered_app_name && row.winget_package_id) {
+        manualWingetByName.set(
+          row.discovered_app_name.toLowerCase().trim(),
+          row.winget_package_id
+        );
+      }
+    }
+  }
+
+  // Match apps to Winget IDs
+  const updates: AppUpdateInfo[] = [];
+  const checked: CheckedResult[] = [];
+  const matchedApps: MatchedApp[] = [];
+
+  for (const app of apps) {
+    const historyWingetId = uploadHistoryWingetMap.get(app.id);
+    if (historyWingetId) {
+      matchedApps.push({
+        app,
+        wingetId: historyWingetId,
+        isManaged: true,
+      });
+      continue;
+    }
+
+    const markerWingetId = extractDeployedWingetId(app);
+    if (markerWingetId) {
+      matchedApps.push({
+        app,
+        wingetId: markerWingetId,
+        isManaged: true,
+      });
+      continue;
+    }
+
+    // Explicit user links (claimed apps and manual mappings) take
+    // precedence over fuzzy matching.
+    const normalizedDisplayName = app.displayName.toLowerCase().trim();
+    const explicitWingetId =
+      claimedWingetByIntuneAppId.get(app.id) ||
+      manualWingetByName.get(normalizedDisplayName) ||
+      claimedWingetByName.get(normalizedDisplayName);
+    if (explicitWingetId) {
+      matchedApps.push({
+        app,
+        wingetId: explicitWingetId,
+        isManaged: true,
+      });
+      continue;
+    }
+
+    let match = matchAppToWinget(app);
+
+    if (!match || match.confidence === 'low') {
+      match = await matchAppToWingetWithDatabase(app, supabase);
+    }
+
+    if (!match) {
+      checked.push({
+        app: app.displayName,
+        wingetId: null,
+        result: 'No match found',
+      });
+      continue;
+    }
+
+    if (match.confidence === 'low') {
+      checked.push({
+        app: app.displayName,
+        wingetId: match.wingetId,
+        result: 'Low confidence match - skipped',
+      });
+      continue;
+    }
+
+    matchedApps.push({
+      app,
+      wingetId: match.wingetId,
+      // Apps deployed before the package-id marker existed carry only the
+      // old product line, which names no package - so the match had to come
+      // from the heuristics, but the provenance is still explicit.
+      isManaged: hasLegacyIntuneGetMarker(app),
+    });
+  }
+
+  // Batch lookup all Winget versions from curated_apps table (single DB query)
+  const versionMap = new Map<string, string>();
+  const wingetIdsToLookup = Array.from(new Set(matchedApps.map((m) => m.wingetId)));
+
+  if (wingetIdsToLookup.length > 0) {
+    const cachedPackages = await getCatalogSource().getAppsByWingetIds(wingetIdsToLookup);
+
+    for (const pkg of cachedPackages as CuratedPackageRow[]) {
+      if (pkg.latest_version) {
+        versionMap.set(pkg.winget_id, pkg.latest_version);
+      }
+    }
+  }
+
+  // Compute the effective version for an app by taking the MAX of its
+  // displayVersion and the version recorded in upload_history. This prevents
+  // false update detection when Intune's displayVersion lags behind the
+  // actually deployed version (propagation delay) or is null/empty.
+  function getEffectiveVersion(app: IntuneWin32App): string {
+    const displayVer = normalizeVersion(app.displayVersion);
+    const historyVer = normalizeVersion(uploadHistoryVersionMap.get(app.id));
+    return compareVersions(historyVer, displayVer) > 0 ? historyVer : displayVer;
+  }
+
+  // Group by Winget ID and compare using the newest tenant app object.
+  // This prevents older Intune objects from suppressing update detection.
+  const appsByWinget = new Map<string, MatchedApp[]>();
+  for (const matched of matchedApps) {
+    if (!appsByWinget.has(matched.wingetId)) {
+      appsByWinget.set(matched.wingetId, []);
+    }
+    appsByWinget.get(matched.wingetId)!.push(matched);
+  }
+
+  for (const [wingetId, candidates] of appsByWinget.entries()) {
+    // Self-updating apps (e.g. Microsoft 365 Apps via Click-to-Run) must
+    // never be offered as updates - the installed product updates itself
+    // and the winget version only tracks the setup bootstrapper
+    if (isSelfUpdatingApp(wingetId)) {
+      for (const candidate of candidates) {
+        checked.push({
+          app: candidate.app.displayName,
+          wingetId,
+          result: 'Self-updating app, excluded from updates',
+        });
+      }
+      continue;
+    }
+
+    const latestVersion = versionMap.get(wingetId);
+
+    if (!latestVersion) {
+      for (const candidate of candidates) {
+        checked.push({
+          app: candidate.app.displayName,
+          wingetId,
+          result: 'Package not in cache',
+        });
+      }
+      continue;
+    }
+
+    const newestCandidate = candidates.reduce((currentNewest, candidate) => {
+      const currentNewestVersion = getEffectiveVersion(currentNewest.app);
+      const candidateVersion = getEffectiveVersion(candidate.app);
+      const comparison = compareVersions(candidateVersion, currentNewestVersion);
+
+      if (comparison > 0) {
+        return candidate;
+      }
+
+      if (comparison === 0) {
+        const currentModified = new Date(currentNewest.app.lastModifiedDateTime).getTime();
+        const candidateModified = new Date(candidate.app.lastModifiedDateTime).getTime();
+        if (candidateModified > currentModified) {
+          return candidate;
+        }
+      }
+
+      return currentNewest;
+    });
+
+    const currentVersion = getEffectiveVersion(newestCandidate.app);
+    const normalizedLatest = normalizeVersion(latestVersion);
+    const updateAvailable = hasUpdate(currentVersion, normalizedLatest);
+
+    // If IntuneGet has explicit provenance over ANY app object for this
+    // winget ID, treat the whole group as managed -- an unmanaged duplicate
+    // object with a higher version must not mask a package we deployed.
+    const groupIsManaged = candidates.some((candidate) => candidate.isManaged);
+
+    if (updateAvailable) {
+      updates.push({
+        intuneApp: newestCandidate.app,
+        currentVersion: currentVersion !== '0.0.0' ? currentVersion : 'Unknown',
+        latestVersion: latestVersion,
+        wingetId,
+        hasUpdate: true,
+        isManaged: groupIsManaged,
+      });
+    } else {
+      // no-op; tracked in checked entries below
+    }
+
+    for (const candidate of candidates) {
+      if (candidate.app.id === newestCandidate.app.id) {
+        checked.push({
+          app: candidate.app.displayName,
+          wingetId,
+          result: updateAvailable
+            ? `Update available (newest tenant app): ${currentVersion} -> ${normalizedLatest}`
+            : 'Up to date (newest tenant app)',
+        });
+        continue;
+      }
+
+      checked.push({
+        app: candidate.app.displayName,
+        wingetId,
+        result: `Older tenant app object (${getEffectiveVersion(candidate.app)}) - compared using newest ${currentVersion}`,
+      });
+    }
+  }
+
+  return { updates, checked, totalApps: apps.length };
+}
+

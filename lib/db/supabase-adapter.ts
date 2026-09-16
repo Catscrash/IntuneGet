@@ -12,6 +12,7 @@ import type {
   UploadHistoryRecord,
   WebhookConfigurationRecord,
   JobStats,
+  UserTenantPair,
 } from './types';
 import type { PostgrestError } from '@supabase/supabase-js';
 
@@ -79,6 +80,7 @@ interface PackagingJobsQueryBuilder {
  */
 interface UploadHistorySelectQuery {
   eq(column: string, value: string): UploadHistorySelectQuery;
+  not(column: string, operator: string, value: null): UploadHistorySelectQuery;
   order(column: string, options: { ascending: boolean }): UploadHistorySelectQuery;
   limit(count: number): UploadHistorySelectQuery;
   single(): Promise<QueryResult<UploadHistoryRecord>>;
@@ -140,6 +142,19 @@ function getUserSettingsQuery(
 function getUploadHistoryQuery(supabase: ReturnType<typeof createServerClient>): UploadHistoryQueryBuilder {
   // Type assertion is needed here due to Supabase client typing limitations
   return supabase.from('upload_history') as unknown as UploadHistoryQueryBuilder;
+}
+
+/**
+ * Collapse user/tenant rows to the distinct pairs, dropping blanks. PostgREST
+ * has no DISTINCT, and both callers below read raw rows.
+ */
+function dedupeUserTenants(rows: UserTenantPair[]): UserTenantPair[] {
+  const seen = new Map<string, UserTenantPair>();
+  for (const row of rows) {
+    if (!row.user_id || !row.tenant_id) continue;
+    seen.set(`${row.user_id}:${row.tenant_id}`, row);
+  }
+  return [...seen.values()];
 }
 
 /**
@@ -650,6 +665,28 @@ export const supabaseDb: DatabaseAdapter = {
 
       return data || [];
     },
+
+    /**
+     * Every distinct user/tenant pair that has ever deployed
+     */
+    async listUserTenants(): Promise<UserTenantPair[]> {
+      const supabase = createServerClient();
+      const query = getUploadHistoryQuery(supabase);
+
+      const { data, error } = await query
+        .select('user_id, intune_tenant_id')
+        .not('intune_tenant_id', 'is', null);
+
+      if (isError(error)) {
+        console.error('Error listing deployment user/tenant pairs:', error);
+        throw error;
+      }
+
+      return dedupeUserTenants(
+        ((data || []) as unknown as Array<{ user_id: string; intune_tenant_id: string }>)
+          .map((row) => ({ user_id: row.user_id, tenant_id: row.intune_tenant_id }))
+      );
+    },
   },
 
   userSettings: {
@@ -728,6 +765,27 @@ export const supabaseDb: DatabaseAdapter = {
       }
 
       return (data as unknown as UpdateCheckResult[]) || [];
+    },
+
+    /**
+     * Every distinct user/tenant pair that already has update rows
+     */
+    async listUserTenants(): Promise<UserTenantPair[]> {
+      const supabase = createServerClient();
+
+      const { data, error } = await supabase
+        .from('update_check_results')
+        .select('user_id, tenant_id')
+        .not('tenant_id', 'is', null);
+
+      if (isError(error)) {
+        console.error('Error listing update-result user/tenant pairs:', error);
+        throw error;
+      }
+
+      return dedupeUserTenants(
+        (data || []) as unknown as UserTenantPair[]
+      );
     },
 
     async replaceForUserAndTenant(

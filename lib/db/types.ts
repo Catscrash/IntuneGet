@@ -198,6 +198,12 @@ export interface JobStats {
  * Database adapter interface
  * Both SQLite and Supabase implementations must conform to this interface
  */
+/** A user together with a tenant they are active in. */
+export interface UserTenantPair {
+  user_id: string;
+  tenant_id: string;
+}
+
 export interface DatabaseAdapter {
   jobs: {
     /**
@@ -317,6 +323,14 @@ export interface DatabaseAdapter {
      * before calling (a row existing is not permission to read it).
      */
     getByTenantId(tenantId: string): Promise<UploadHistoryRecord[]>;
+
+    /**
+     * Every distinct user/tenant pair that has ever deployed. The scheduled
+     * refresh needs to know whose update rows to rebuild, and there is no
+     * session to ask - a deployment is what makes a user interested in a
+     * tenant's updates.
+     */
+    listUserTenants(): Promise<UserTenantPair[]>;
   };
 
   userSettings: {
@@ -351,6 +365,14 @@ export interface DatabaseAdapter {
      * hence replace rather than merge. Callers carry notified_at forward
      * themselves, since only they know whether the version changed.
      */
+    /**
+     * Every distinct user/tenant pair that already has update rows. Together
+     * with the deployment pairs this is who the scheduled refresh serves:
+     * rows exist for anyone who has ever looked, including admins who only
+     * update apps a colleague deployed.
+     */
+    listUserTenants(): Promise<UserTenantPair[]>;
+
     replaceForUserAndTenant(
       userId: string,
       tenantId: string,

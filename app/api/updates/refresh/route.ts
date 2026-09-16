@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { isCriticalUpdate } from '@/lib/version-compare';
+import { storeScanForUser } from '@/lib/updates/store-scan';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
@@ -93,55 +93,16 @@ export async function POST(request: NextRequest) {
     const liveData = (await liveResponse.json()) as LiveUpdatesResponse;
     const now = new Date().toISOString();
 
-    // Load the prior rows so the write can preserve per-user state that the
-    // live scan knows nothing about. notified_at is kept for unchanged updates
-    // but reset to null when latest_version changed - without the reset, a row
-    // already notified for an older version keeps its notified_at and the next
-    // version bump is never notified. dismissed_at is carried the same way, so
-    // dismissing an update survives a refresh but a new version resurfaces it.
-    const priorRows = await db.updateCheckResults.getByUserId(user.userId, tenantId);
-    const priorMap = new Map<
-      string,
-      { latest_version: string; notified_at: string | null; dismissed_at: string | null }
-    >();
-    priorRows.forEach((r) =>
-      priorMap.set(`${r.winget_id}:${r.intune_app_id}`, {
-        latest_version: r.latest_version,
-        notified_at: r.notified_at,
-        dismissed_at: r.dismissed_at,
-      })
-    );
-
-    const rows = liveData.updates
-      .filter((update) => Boolean(update.wingetId))
-      .filter((update) => update.currentVersion !== 'Unknown')
-      .map((update) => {
-        const prior = priorMap.get(`${update.wingetId as string}:${update.intuneApp.id}`);
-        const unchanged = Boolean(prior && prior.latest_version === update.latestVersion);
-        return {
-          user_id: user.userId,
-          tenant_id: tenantId,
-          winget_id: update.wingetId as string,
-          intune_app_id: update.intuneApp.id,
-          display_name: update.intuneApp.displayName,
-          current_version: update.currentVersion,
-          latest_version: update.latestVersion,
-          is_critical: isCriticalUpdate(update.currentVersion, update.latestVersion),
-          is_managed: update.isManaged,
-          large_icon_type: update.intuneApp.largeIcon?.type || null,
-          large_icon_value: update.intuneApp.largeIcon?.value || null,
-          notified_at: unchanged ? prior!.notified_at : null,
-          dismissed_at: unchanged ? prior!.dismissed_at : null,
-          detected_at: now,
-          updated_at: now,
-        };
-      });
-
-    // A refresh re-derives the whole picture for this tenant, so the cached
-    // set is replaced rather than merged: an update that no longer appears in
-    // the scan must disappear instead of lingering as a phantom.
+    // Per-user state that the scan cannot know (dismissals, notifications) is
+    // carried by the shared writer, which the scheduled refresh uses too.
+    let stored;
     try {
-      await db.updateCheckResults.replaceForUserAndTenant(user.userId, tenantId, rows);
+      stored = await storeScanForUser({
+        userId: user.userId,
+        tenantId,
+        updates: liveData.updates,
+        now,
+      });
     } catch (storeError) {
       const message = storeError instanceof Error ? storeError.message : 'unknown error';
       return NextResponse.json(
@@ -151,11 +112,11 @@ export async function POST(request: NextRequest) {
     }
 
     // Near-immediate notifications: if this refresh surfaced any new or changed
-    // update (notified_at reset to null above), deliver to the user's channels
-    // now instead of waiting for the daily cron. Force-send regardless of the
-    // user's email frequency, since they just ran an on-demand check. Failures
-    // here must not fail the refresh; the daily cron remains the backstop.
-    const hasPendingNotifications = rows.some((row) => row.notified_at === null);
+    // update, deliver to the user's channels now instead of waiting for the
+    // daily cron. Force-send regardless of the user's email frequency, since
+    // they just ran an on-demand check. Failures here must not fail the
+    // refresh; the daily cron remains the backstop.
+    const hasPendingNotifications = stored.pendingNotifications > 0;
     let notified: { emailsSent: number; webhooksSent: number } | undefined;
     // Webhooks reach the user without Supabase - only their storage ever
     // needed it - so this no longer waits for a Supabase client. Email and the
@@ -174,14 +135,11 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const activeKeys = new Set(rows.map((row) => `${row.winget_id}:${row.intune_app_id}`));
-    const removedCount = priorRows.filter(
-      (row) => !activeKeys.has(`${row.winget_id}:${row.intune_app_id}`)
-    ).length;
+    const removedCount = stored.removedCount;
 
     return NextResponse.json({
       success: true,
-      refreshedCount: rows.length,
+      refreshedCount: stored.refreshedCount,
       removedCount,
       ...(notified ? { notified } : {}),
       updateCount: liveData.updateCount,

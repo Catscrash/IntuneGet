@@ -13,6 +13,7 @@ import type {
   UpdatePolicyRecord,
   UploadHistoryRecord,
   WebhookConfigurationRecord,
+  UserTenantPair,
 } from './types';
 
 // Singleton database instance
@@ -746,6 +747,19 @@ export const sqliteDb: DatabaseAdapter = {
       `);
       return stmt.all(tenantId) as UploadHistoryRecord[];
     },
+
+    /**
+     * Every distinct user/tenant pair that has ever deployed
+     */
+    async listUserTenants(): Promise<UserTenantPair[]> {
+      const database = getDb();
+      const stmt = database.prepare(`
+        SELECT DISTINCT user_id, intune_tenant_id AS tenant_id
+        FROM upload_history
+        WHERE intune_tenant_id IS NOT NULL AND intune_tenant_id <> ''
+      `);
+      return stmt.all() as UserTenantPair[];
+    },
   },
 
   userSettings: {
@@ -822,6 +836,19 @@ export const sqliteDb: DatabaseAdapter = {
         tenantId ? stmt.all(userId, tenantId) : stmt.all(userId)
       ) as Record<string, unknown>[];
       return rows.map(parseUpdateCheckRow);
+    },
+
+    /**
+     * Every distinct user/tenant pair that already has update rows
+     */
+    async listUserTenants(): Promise<UserTenantPair[]> {
+      const database = getDb();
+      const stmt = database.prepare(`
+        SELECT DISTINCT user_id, tenant_id
+        FROM update_check_results
+        WHERE tenant_id IS NOT NULL AND tenant_id <> ''
+      `);
+      return stmt.all() as UserTenantPair[];
     },
 
     async replaceForUserAndTenant(

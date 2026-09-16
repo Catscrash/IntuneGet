@@ -471,6 +471,15 @@ function createTestAdapter(): TestAdapter {
         `);
         return stmt.all(tenantId) as UploadHistoryRecord[];
       },
+
+      async listUserTenants() {
+        const stmt = db.prepare(`
+          SELECT DISTINCT user_id, intune_tenant_id AS tenant_id
+          FROM upload_history
+          WHERE intune_tenant_id IS NOT NULL AND intune_tenant_id <> ''
+        `);
+        return stmt.all() as { user_id: string; tenant_id: string }[];
+      },
     },
 
     userSettings: {
@@ -513,6 +522,15 @@ function createTestAdapter(): TestAdapter {
     },
 
     updateCheckResults: {
+      async listUserTenants() {
+        const stmt = db.prepare(`
+          SELECT DISTINCT user_id, tenant_id
+          FROM update_check_results
+          WHERE tenant_id IS NOT NULL AND tenant_id <> ''
+        `);
+        return stmt.all() as { user_id: string; tenant_id: string }[];
+      },
+
       async setNotifiedAt(ids: string[], userId: string, notifiedAt: string): Promise<number> {
         if (ids.length === 0) return 0;
         const stmt = db.prepare(

@@ -48,6 +48,11 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 # Copy Supabase migrations (for reference)
 COPY --from=builder /app/supabase ./supabase
 
+# The scheduler runs from this same image (see docker-compose): a container
+# deployment has no platform cron, and a second image would be another thing to
+# pull through the proxy and keep in step.
+COPY --from=builder /app/scripts/scheduler.mjs ./scripts/scheduler.mjs
+
 USER nextjs
 
 EXPOSE 3000
