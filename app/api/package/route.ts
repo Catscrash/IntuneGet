@@ -209,6 +209,20 @@ export async function POST(request: NextRequest) {
       (item as { allowAvailableUninstall?: boolean }).allowAvailableUninstall =
         allowAvailableUninstall;
 
+      // "Deploy as new app anyway" reaches this route two ways. The cart sets
+      // the flag on the item itself; the deployment view resends a stored
+      // package_config, which cannot carry it, and passes it at request level
+      // instead. Stamp it onto the item so both arrive at the same place: the
+      // local packager reads forceCreate out of package_config and never sees
+      // the dispatch payload, so a request-level flag alone left the duplicate
+      // guard armed and the redeploy failed as a duplicate anyway.
+      //
+      // Only ever set, never cleared - the request-level flag is an override,
+      // so its absence must not disarm an item that asked for this itself.
+      if (forceCreate) {
+        (item as { forceCreate?: boolean }).forceCreate = true;
+      }
+
       // Compose the Intune description here rather than at dispatch: the local
       // packager never reaches the dispatch path, it reads this field straight
       // out of package_config.

@@ -664,6 +664,78 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(config.description).not.toContain('Winget:');
   });
 
+  it('writes a request-level forceCreate into the job, not only into the dispatch', async () => {
+    // "Deploy as new app anyway" in the deployment view resends a stored
+    // package_config, which cannot carry the flag, and passes it at request
+    // level. The local packager reads forceCreate out of package_config and
+    // never runs the dispatch path, so the duplicate guard stayed armed and
+    // the redeploy failed as a duplicate - while the same button in the cart,
+    // which sets the flag on the item, worked.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item()],
+        forceCreate: true,
+      }),
+    });
+
+    await POST(request);
+
+    const config = createMock.mock.calls[0][0].package_config as { forceCreate?: boolean };
+    expect(config.forceCreate).toBe(true);
+  });
+
+  it('keeps an item-level forceCreate from the cart', async () => {
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({ forceCreate: true })],
+      }),
+    });
+
+    await POST(request);
+
+    const config = createMock.mock.calls[0][0].package_config as { forceCreate?: boolean };
+    expect(config.forceCreate).toBe(true);
+  });
+
+  it('leaves the duplicate guard armed when nobody asked to override it', async () => {
+    // The request-level flag is an override, so its absence must not disarm
+    // an item, and must not arm one either.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item()],
+      }),
+    });
+
+    await POST(request);
+
+    const config = createMock.mock.calls[0][0].package_config as { forceCreate?: boolean };
+    expect(config.forceCreate).toBeUndefined();
+  });
+
   it('adds only the package-id marker when no signature is configured', async () => {
     isSupabaseServerConfiguredMock.mockReturnValue(false);
     getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
