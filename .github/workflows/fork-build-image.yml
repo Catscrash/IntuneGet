@@ -79,6 +79,24 @@ jobs:
           # rebuilds only the app layer rather than reinstalling npm packages.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Fixed timestamp for everything this build writes into the layers.
+          #
+          # A layer's identity is the digest of its tar, and that tar carries
+          # each file's mtime. The checkout writes fresh files every run, so
+          # public/ - ~880 MB of icons, the bulk of the image - came out with a
+          # different digest on every build even when not one icon had changed,
+          # and every deployment host re-downloaded all of it. Measured on three
+          # consecutive builds: that one layer changed each time while the base
+          # layers did not.
+          #
+          # SOURCE_DATE_EPOCH clamps timestamps newer than its value, so a
+          # checkout's "now" collapses to this constant and an unchanged
+          # directory yields a byte-identical tar and the same digest. The value
+          # has to be a constant rather than the commit time, which would vary
+          # per build and defeat the point; it only sets how the image dates
+          # itself, so the number is arbitrary (2023-11-14).
+          build-args: |
+            SOURCE_DATE_EPOCH=1700000000
           # Keep the published tag a plain image manifest: the deployment host
           # pulls it directly, and an attestation manifest list only adds
           # surface without being consumed anywhere.
