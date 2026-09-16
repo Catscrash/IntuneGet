@@ -65,7 +65,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          # rewrite-timestamp makes the exporter apply SOURCE_DATE_EPOCH to the
+          # file timestamps inside the layers. The build arg alone only dates
+          # the image config - verified by reading a published layer back: its
+          # entries still carried the checkout time.
+          outputs: type=image,push=true,rewrite-timestamp=true
           # Two tags on purpose: the branch tag is what the deployment pulls,
           # the commit tag is what a rollback names.
           # Three tags: the channel the deployment tracks, the tag that
