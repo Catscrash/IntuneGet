@@ -6,7 +6,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
-import { compareVersions } from '@/lib/version-compare';
+import { compareVersions, isCriticalUpdate } from '@/lib/version-compare';
+import { getCatalogSource } from '@/lib/catalog';
 import type { AvailableUpdate } from '@/types/update-policies';
 
 /**
@@ -40,6 +41,55 @@ export async function GET(request: NextRequest) {
         { status: 500 }
       );
     }
+
+    if (updates.length === 0) {
+      return NextResponse.json({ updates: [], count: 0, criticalCount: 0 });
+    }
+
+    // Resolve the newest catalog version here rather than trusting the copy
+    // the scan wrote into each row.
+    //
+    // update_check_results is per user, so latest_version was a snapshot of
+    // whatever the catalog said when that user last refreshed. Two admins who
+    // refreshed at different times saw different "latest" versions for the
+    // same package indefinitely - nothing rewrites another user's rows. Which
+    // version a package has is a fact about the catalog, not about the user;
+    // only current_version (what the tenant has deployed), dismissed_at and
+    // notified_at are genuinely per user, and those stay stored.
+    const catalogVersions = new Map<string, string>();
+    try {
+      const catalogRows = await getCatalogSource().getAppsByWingetIds(
+        [...new Set(updates.map((u) => u.winget_id))]
+      );
+      for (const row of catalogRows) {
+        if (row.latest_version) {
+          catalogVersions.set(row.winget_id, row.latest_version);
+        }
+      }
+    } catch {
+      // The stored value still beats failing the whole page; it is only stale,
+      // and a refresh rewrites it.
+    }
+
+    updates = updates.map((update) => {
+      const catalogVersion = catalogVersions.get(update.winget_id);
+      if (!catalogVersion || catalogVersion === update.latest_version) {
+        return update;
+      }
+
+      // The stored row describes an older version than the catalog now has.
+      // is_critical was derived from that older pair, and dismissed_at and
+      // notified_at were decided for it - carrying them over would hide a
+      // version the user never saw, which is what the refresh path avoids by
+      // resetting both when latest_version moves.
+      return {
+        ...update,
+        latest_version: catalogVersion,
+        is_critical: isCriticalUpdate(update.current_version, catalogVersion),
+        dismissed_at: null,
+        notified_at: null,
+      };
+    });
 
     if (!includeDismissed) {
       updates = updates.filter((update) => update.dismissed_at === null);

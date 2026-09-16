@@ -6,12 +6,14 @@ const {
   getUpdatesMock,
   getHistoryMock,
   getPoliciesMock,
+  getAppsByWingetIdsMock,
 } = vi.hoisted(() => ({
   parseAccessTokenMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getUpdatesMock: vi.fn(),
   getHistoryMock: vi.fn(),
   getPoliciesMock: vi.fn(),
+  getAppsByWingetIdsMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth-utils', () => ({
@@ -22,11 +24,20 @@ vi.mock('@/lib/db', () => ({
   getDatabase: getDatabaseMock,
 }));
 
+// The route resolves the newest version from the catalog at read time; without
+// this the cases below would reach whatever snapshot happens to sit on disk.
+vi.mock('@/lib/catalog', () => ({
+  getCatalogSource: () => ({ getAppsByWingetIds: getAppsByWingetIdsMock }),
+}));
+
 import { GET } from '@/app/api/updates/available/route';
 
 describe('GET /api/updates/available', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // No catalog row by default: the stored latest_version stands, which is
+    // what the pre-existing cases below assume.
+    getAppsByWingetIdsMock.mockResolvedValue([]);
     getDatabaseMock.mockReturnValue({
       updateCheckResults: { getByUserId: getUpdatesMock },
       uploadHistory: {
@@ -373,6 +384,136 @@ describe('GET /api/updates/available', () => {
     request.headers.set('Authorization', 'Bearer test-token');
 
     expect((await (await GET(request)).json()).count).toBe(0);
+  });
+
+  function putty(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'upd-putty',
+      user_id: 'admin-b',
+      tenant_id: 'tenant-a',
+      winget_id: 'PuTTY.PuTTY',
+      intune_app_id: 'app-putty',
+      display_name: 'PuTTY',
+      current_version: '0.83.0.0',
+      latest_version: '0.84.0.0',
+      is_critical: false,
+      is_managed: true,
+      detected_at: '2026-02-01T00:00:00Z',
+      notified_at: null,
+      dismissed_at: null,
+      ...overrides,
+    };
+  }
+
+  it('serves the catalog version, not the one this user last scanned', async () => {
+    // update_check_results is per user, so latest_version froze at whatever the
+    // catalog said when that user last refreshed. Two admins who refreshed at
+    // different times saw different "latest" versions for the same package for
+    // good - nothing rewrites another user's rows.
+    parseAccessTokenMock.mockResolvedValue({
+      userId: 'admin-b',
+      userEmail: 'admin-b@example.com',
+      tenantId: 'tenant-a',
+      userName: 'Admin B',
+    });
+    getUpdatesMock.mockResolvedValue([putty()]);
+    getAppsByWingetIdsMock.mockResolvedValue([
+      { winget_id: 'PuTTY.PuTTY', latest_version: '0.85.0.0' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    const body = await (await GET(request)).json();
+
+    expect(body.updates[0].latest_version).toBe('0.85.0.0');
+  });
+
+  it('resurfaces an update dismissed for an older version', async () => {
+    // The refresh path resets dismissed_at when latest_version moves. Resolving
+    // the version at read time has to do the same, or a dismissal made for
+    // 0.84 would keep hiding 0.85, which the user never saw.
+    parseAccessTokenMock.mockResolvedValue({
+      userId: 'admin-b',
+      userEmail: 'admin-b@example.com',
+      tenantId: 'tenant-a',
+      userName: 'Admin B',
+    });
+    getUpdatesMock.mockResolvedValue([
+      putty({ dismissed_at: '2026-02-02T00:00:00Z' }),
+    ]);
+    getAppsByWingetIdsMock.mockResolvedValue([
+      { winget_id: 'PuTTY.PuTTY', latest_version: '0.85.0.0' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    const body = await (await GET(request)).json();
+
+    expect(body.count).toBe(1);
+    expect(body.updates[0].latest_version).toBe('0.85.0.0');
+  });
+
+  it('keeps a dismissal that still applies to the catalog version', async () => {
+    parseAccessTokenMock.mockResolvedValue({
+      userId: 'admin-b',
+      userEmail: 'admin-b@example.com',
+      tenantId: 'tenant-a',
+      userName: 'Admin B',
+    });
+    getUpdatesMock.mockResolvedValue([
+      putty({ dismissed_at: '2026-02-02T00:00:00Z' }),
+    ]);
+    getAppsByWingetIdsMock.mockResolvedValue([
+      { winget_id: 'PuTTY.PuTTY', latest_version: '0.84.0.0' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    expect((await (await GET(request)).json()).count).toBe(0);
+  });
+
+  it('re-derives critical from the resolved version', async () => {
+    // is_critical was stored against the older pair; a major-version jump that
+    // only the catalog knows about has to be recognised here.
+    parseAccessTokenMock.mockResolvedValue({
+      userId: 'admin-b',
+      userEmail: 'admin-b@example.com',
+      tenantId: 'tenant-a',
+      userName: 'Admin B',
+    });
+    getUpdatesMock.mockResolvedValue([putty()]);
+    getAppsByWingetIdsMock.mockResolvedValue([
+      { winget_id: 'PuTTY.PuTTY', latest_version: '1.0.0.0' },
+    ]);
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    const body = await (await GET(request)).json();
+
+    expect(body.updates[0].is_critical).toBe(true);
+    expect(body.criticalCount).toBe(1);
+  });
+
+  it('falls back to the stored version when the catalog cannot be read', async () => {
+    parseAccessTokenMock.mockResolvedValue({
+      userId: 'admin-b',
+      userEmail: 'admin-b@example.com',
+      tenantId: 'tenant-a',
+      userName: 'Admin B',
+    });
+    getUpdatesMock.mockResolvedValue([putty()]);
+    getAppsByWingetIdsMock.mockRejectedValue(new Error('catalog unavailable'));
+
+    const request = new NextRequest('http://localhost:3000/api/updates/available');
+    request.headers.set('Authorization', 'Bearer test-token');
+
+    const body = await (await GET(request)).json();
+
+    expect(body.updates[0].latest_version).toBe('0.84.0.0');
   });
 
   it('hides dismissed updates unless asked for them', async () => {

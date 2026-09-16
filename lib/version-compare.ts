@@ -131,6 +131,18 @@ export function hasUpdate(currentVersion: string, latestVersion: string): boolea
 }
 
 /**
+ * Whether an update crosses a major version, which the UI surfaces as
+ * critical. Lives here rather than beside one caller because it is derived
+ * from the pair of versions: anywhere that resolves a newer latest version has
+ * to re-derive it, and two copies would drift.
+ */
+export function isCriticalUpdate(currentVersion: string, latestVersion: string): boolean {
+  const current = parseVersion(currentVersion || '0.0.0');
+  const latest = parseVersion(latestVersion || '0.0.0');
+  return latest.major > current.major;
+}
+
+/**
  * Normalize a version string for comparison.
  *
  * Pads to three segments so "1.2" and "1.2.0" compare equal, and keeps every

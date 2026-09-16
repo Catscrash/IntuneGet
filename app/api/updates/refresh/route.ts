@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { parseVersion } from '@/lib/version-compare';
+import { isCriticalUpdate } from '@/lib/version-compare';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
@@ -25,12 +25,6 @@ interface LiveUpdatesResponse {
     wingetId: string | null;
     result: string;
   }>;
-}
-
-function isCriticalUpdate(currentVersion: string, latestVersion: string): boolean {
-  const current = parseVersion(currentVersion || '0.0.0');
-  const latest = parseVersion(latestVersion || '0.0.0');
-  return latest.major > current.major;
 }
 
 export async function POST(request: NextRequest) {
