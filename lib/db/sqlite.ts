@@ -14,6 +14,7 @@ import type {
   UploadHistoryRecord,
   WebhookConfigurationRecord,
   UserTenantPair,
+  ActivePackager,
 } from './types';
 
 // Singleton database instance
@@ -95,6 +96,7 @@ function initializeSchema(db: Database.Database): void {
       qa_completed_at TEXT,
       packager_id TEXT,
       packager_heartbeat_at TEXT,
+      packager_build TEXT,
       claimed_at TEXT,
       packaging_started_at TEXT,
       packaging_completed_at TEXT,
@@ -124,6 +126,7 @@ function initializeSchema(db: Database.Database): void {
     qa_candidate_id: 'TEXT',
     qa_requested_at: 'TEXT',
     qa_completed_at: 'TEXT',
+    packager_build: 'TEXT',
   };
   for (const [column, definition] of Object.entries(compatibleColumns)) {
     if (!existingColumns.has(column)) {
@@ -525,7 +528,11 @@ export const sqliteDb: DatabaseAdapter = {
     /**
      * Claim a job atomically (only if status is 'queued')
      */
-    async claim(jobId: string, packagerId: string): Promise<PackagingJob | null> {
+    async claim(
+      jobId: string,
+      packagerId: string,
+      packagerBuild?: string | null
+    ): Promise<PackagingJob | null> {
       const now = new Date().toISOString();
 
       return this.update(
@@ -536,9 +543,26 @@ export const sqliteDb: DatabaseAdapter = {
           packager_heartbeat_at: now,
           claimed_at: now,
           packaging_started_at: now,
+          // Only when reported: an older packager sends nothing, and blanking
+          // the column would lose what a previous claim recorded.
+          ...(packagerBuild ? { packager_build: packagerBuild } : {}),
         },
         { status: 'queued' }
       );
+    },
+
+    async listActivePackagers(since: Date): Promise<ActivePackager[]> {
+      const database = getDb();
+      const stmt = database.prepare(`
+        SELECT packager_id,
+               max(packager_heartbeat_at) AS last_seen_at,
+               packager_build
+        FROM packaging_jobs
+        WHERE packager_id IS NOT NULL AND packager_heartbeat_at >= ?
+        GROUP BY packager_id
+        ORDER BY last_seen_at DESC
+      `);
+      return stmt.all(since.toISOString()) as ActivePackager[];
     },
 
     /**

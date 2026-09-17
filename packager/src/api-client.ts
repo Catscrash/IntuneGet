@@ -4,6 +4,7 @@
  */
 
 import { PackagerConfig } from './config.js';
+import { formatPackagerBuild, resolvePackagerBuild } from './build-info.js';
 import { createLogger, Logger } from './logger.js';
 
 export interface PackagingJob {
@@ -137,6 +138,9 @@ export class ApiClient {
         {
           jobId,
           packagerId: this.packagerId,
+          // Recorded on the job, so a finished package still names the build
+          // that produced it after this packager has been upgraded.
+          packagerBuild: formatPackagerBuild(resolvePackagerBuild()),
         }
       );
       return {

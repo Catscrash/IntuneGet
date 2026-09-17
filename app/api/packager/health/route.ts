@@ -8,6 +8,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase, getDatabaseMode, verifyPackagerApiKey } from '@/lib/db';
 import { getFeatureFlags } from '@/lib/features';
 
+interface ActivePackagerInfo {
+  id: string;
+  /** What the packager reported at its last claim, or null if it predates this. */
+  build: string | null;
+  lastSeenAt: string;
+}
+
 interface PackagerStats {
   activePackagers: number;
   queuedJobs: number;
@@ -67,8 +74,18 @@ export async function GET(request: NextRequest) {
     // Get job statistics
     const jobStats = await db.jobs.getStats();
 
+    // A packager only ever makes itself known by working, so the jobs are the
+    // register. Anything that has claimed within the stale window is live.
+    const packagers: ActivePackagerInfo[] = (
+      await db.jobs.listActivePackagers(staleThreshold)
+    ).map((row) => ({
+      id: row.packager_id,
+      build: row.packager_build,
+      lastSeenAt: row.last_seen_at,
+    }));
+
     const stats: PackagerStats = {
-      activePackagers: 0, // Will be calculated below
+      activePackagers: packagers.length,
       queuedJobs: jobStats.queued,
       processingJobs: jobStats.packaging + jobStats.uploading,
       recentCompletedJobs: jobStats.deployed,
@@ -83,7 +100,7 @@ export async function GET(request: NextRequest) {
     let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
     const issues: string[] = [];
 
-    if (stats.queuedJobs > 0 && stats.processingJobs === 0) {
+    if (stats.queuedJobs > 0 && packagers.length === 0) {
       status = 'unhealthy';
       issues.push('No active packagers but jobs are queued');
     } else if (stats.queuedJobs > 10) {
@@ -102,6 +119,11 @@ export async function GET(request: NextRequest) {
       databaseMode: getDatabaseMode(),
       timestamp: now.toISOString(),
       stats,
+      // Which build is actually out there. The packager runs on its own
+      // machine and release cadence, so this cannot be read off the server
+      // otherwise - and it is the first thing worth knowing when a package
+      // comes out wrong.
+      packagers,
       issues: issues.length > 0 ? issues : undefined,
     });
   } catch (error) {

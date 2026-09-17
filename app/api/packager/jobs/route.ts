@@ -82,7 +82,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json();
-    const { jobId, packagerId } = body;
+    const { jobId, packagerId, packagerBuild } = body;
 
     if (!jobId || !packagerId) {
       return NextResponse.json(
@@ -93,8 +93,15 @@ export async function POST(request: NextRequest) {
 
     const db = getDatabase();
 
-    // Atomically claim the job (only if still queued)
-    const job = await db.jobs.claim(jobId, packagerId);
+    // Atomically claim the job (only if still queued). The packager's build is
+    // recorded with the claim rather than looked up later: the packager is
+    // deployed separately and may well have been upgraded by the time anyone
+    // asks which build produced a given package.
+    const job = await db.jobs.claim(
+      jobId,
+      packagerId,
+      typeof packagerBuild === 'string' ? packagerBuild.slice(0, 200) : null
+    );
 
     if (!job) {
       // Job was already claimed or doesn't exist

@@ -56,6 +56,7 @@ function createTestAdapter(): TestAdapter {
       error_message TEXT,
       packager_id TEXT,
       packager_heartbeat_at TEXT,
+      packager_build TEXT,
       claimed_at TEXT,
       packaging_started_at TEXT,
       packaging_completed_at TEXT,
@@ -298,7 +299,11 @@ function createTestAdapter(): TestAdapter {
         return this.getById(id);
       },
 
-      async claim(jobId: string, packagerId: string): Promise<PackagingJob | null> {
+      async claim(
+        jobId: string,
+        packagerId: string,
+        packagerBuild?: string | null
+      ): Promise<PackagingJob | null> {
         const now = new Date().toISOString();
 
         return this.update(
@@ -309,9 +314,27 @@ function createTestAdapter(): TestAdapter {
             packager_heartbeat_at: now,
             claimed_at: now,
             packaging_started_at: now,
+            ...(packagerBuild ? { packager_build: packagerBuild } : {}),
           },
           { status: 'queued' }
         );
+      },
+
+      async listActivePackagers(since: Date) {
+        const stmt = db.prepare(`
+          SELECT packager_id,
+                 max(packager_heartbeat_at) AS last_seen_at,
+                 packager_build
+          FROM packaging_jobs
+          WHERE packager_id IS NOT NULL AND packager_heartbeat_at >= ?
+          GROUP BY packager_id
+          ORDER BY last_seen_at DESC
+        `);
+        return stmt.all(since.toISOString()) as Array<{
+          packager_id: string;
+          packager_build: string | null;
+          last_seen_at: string;
+        }>;
       },
 
       async release(jobId: string, packagerId: string): Promise<PackagingJob | null> {
@@ -927,6 +950,54 @@ describe('SQLite Database Adapter', () => {
       const result = await adapter.jobs.claim(job.id, 'packager-1');
 
       expect(result).toBeNull();
+    });
+
+    it('should record the build the packager reported', async () => {
+      // The packager is deployed separately and may be upgraded before anyone
+      // asks which build produced a given package, so the answer has to be
+      // stored with the job rather than looked up later.
+      const job = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+
+      const claimed = await adapter.jobs.claim(job.id, 'packager-1', '1.4.0+abc1234 (git)');
+
+      expect(claimed?.packager_build).toBe('1.4.0+abc1234 (git)');
+    });
+
+    it('should leave the build empty when an older packager reports none', async () => {
+      const job = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+
+      const claimed = await adapter.jobs.claim(job.id, 'packager-1');
+
+      expect(claimed?.packager_build ?? null).toBeNull();
+    });
+  });
+
+  describe('jobs.listActivePackagers', () => {
+    it('should report each packager once, with its build and newest heartbeat', async () => {
+      const first = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+      await adapter.jobs.claim(first.id, 'packager-1', '1.4.0+aaa1111 (git)');
+      const second = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+      await adapter.jobs.claim(second.id, 'packager-1', '1.4.0+aaa1111 (git)');
+      const other = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+      await adapter.jobs.claim(other.id, 'packager-2', '1.5.0+bbb2222 (package)');
+
+      const active = await adapter.jobs.listActivePackagers(new Date(Date.now() - 60_000));
+
+      expect(active).toHaveLength(2);
+      expect(active.map((p) => p.packager_id).sort()).toEqual(['packager-1', 'packager-2']);
+      expect(active.find((p) => p.packager_id === 'packager-2')?.packager_build)
+        .toBe('1.5.0+bbb2222 (package)');
+    });
+
+    it('should leave out a packager that has not checked in recently', async () => {
+      // The health check reads this to decide whether anything is listening;
+      // a packager that stopped days ago must not keep the queue looking served.
+      const job = await adapter.jobs.create(createTestJob({ status: 'queued' }));
+      await adapter.jobs.claim(job.id, 'packager-old', '1.4.0+aaa1111 (git)');
+
+      const active = await adapter.jobs.listActivePackagers(new Date(Date.now() + 60_000));
+
+      expect(active).toEqual([]);
     });
   });
 

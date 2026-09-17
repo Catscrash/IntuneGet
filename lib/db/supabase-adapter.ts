@@ -13,6 +13,7 @@ import type {
   WebhookConfigurationRecord,
   JobStats,
   UserTenantPair,
+  ActivePackager,
 } from './types';
 import type { PostgrestError } from '@supabase/supabase-js';
 
@@ -383,7 +384,11 @@ export const supabaseDb: DatabaseAdapter = {
     /**
      * Claim a job atomically (only if status is 'queued')
      */
-    async claim(jobId: string, _packagerId: string): Promise<PackagingJob | null> {
+    async claim(
+      jobId: string,
+      _packagerId: string,
+      packagerBuild?: string | null
+    ): Promise<PackagingJob | null> {
       const now = new Date().toISOString();
 
       return this.update(
@@ -391,9 +396,48 @@ export const supabaseDb: DatabaseAdapter = {
         {
           status: 'packaging',
           packaging_started_at: now,
+          // Only when reported, so an older packager does not blank what a
+          // previous claim recorded.
+          ...(packagerBuild ? { packager_build: packagerBuild } : {}),
         },
         { status: 'queued' }
       );
+    },
+
+    async listActivePackagers(since: Date): Promise<ActivePackager[]> {
+      const supabase = createServerClient();
+
+      // PostgREST cannot group, so the rows are folded here. Bounded by the
+      // time window rather than by a page, so a busy tenant cannot hide a
+      // packager behind a page boundary.
+      const { data, error } = await supabase
+        .from('packaging_jobs')
+        .select('packager_id, packager_build, packager_heartbeat_at')
+        .not('packager_id', 'is', null)
+        .gte('packager_heartbeat_at', since.toISOString())
+        .order('packager_heartbeat_at', { ascending: false });
+
+      if (isError(error)) {
+        console.error('Error listing active packagers:', error);
+        throw error;
+      }
+
+      const newest = new Map<string, ActivePackager>();
+      for (const row of (data || []) as unknown as Array<{
+        packager_id: string;
+        packager_build: string | null;
+        packager_heartbeat_at: string;
+      }>) {
+        // Rows arrive newest first, so the first one per packager wins.
+        if (!newest.has(row.packager_id)) {
+          newest.set(row.packager_id, {
+            packager_id: row.packager_id,
+            packager_build: row.packager_build,
+            last_seen_at: row.packager_heartbeat_at,
+          });
+        }
+      }
+      return [...newest.values()];
     },
 
     /**

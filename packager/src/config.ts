@@ -3,6 +3,7 @@
  */
 
 import * as dotenv from 'dotenv';
+import { formatPackagerBuild, resolvePackagerBuild } from './build-info.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
@@ -173,6 +174,9 @@ export function validateConfig(config: PackagerConfig): string[] {
 export function printConfig(config: PackagerConfig): void {
   logger.info('Packager configuration:');
   logger.info(`  Packager ID: ${config.packagerId}`);
+  // First thing in the log, because "which build is this?" is the first
+  // question asked when a package comes out wrong.
+  logger.info(`  Build: ${formatPackagerBuild(resolvePackagerBuild())}`);
   logger.info(`  Communication Mode: ${config.mode}`);
 
   if (config.mode === 'supabase') {

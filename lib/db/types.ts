@@ -53,6 +53,8 @@ export interface PackagingJob {
   qa_completed_at: string | null;
   packager_id: string | null;
   packager_heartbeat_at: string | null;
+  /** Build identity the packager reported when it claimed the job. */
+  packager_build: string | null;
   claimed_at: string | null;
   packaging_started_at: string | null;
   packaging_completed_at: string | null;
@@ -198,6 +200,13 @@ export interface JobStats {
  * Database adapter interface
  * Both SQLite and Supabase implementations must conform to this interface
  */
+/** A packager that has recently worked, and the build it reported. */
+export interface ActivePackager {
+  packager_id: string;
+  packager_build: string | null;
+  last_seen_at: string;
+}
+
 /** A user together with a tenant they are active in. */
 export interface UserTenantPair {
   user_id: string;
@@ -259,7 +268,21 @@ export interface DatabaseAdapter {
     /**
      * Claim a job atomically (only if status is 'queued')
      */
-    claim(jobId: string, packagerId: string): Promise<PackagingJob | null>;
+    claim(
+      jobId: string,
+      packagerId: string,
+      packagerBuild?: string | null
+    ): Promise<PackagingJob | null>;
+
+    /**
+     * Packagers that have checked in since the given time, newest heartbeat
+     * first, with the build each last reported.
+     *
+     * There is no packager registry - a packager only ever makes itself known
+     * by working - so the jobs are the register. Reported so an operator can
+     * see which build is live without logging into the machine it runs on.
+     */
+    listActivePackagers(since: Date): Promise<ActivePackager[]>;
 
     /**
      * Release a job back to queued state

@@ -67,6 +67,21 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Stamp the build ref into the package
+        # The packager reports this when it claims a job, so an operator can
+        # tell which build produced a package without logging into the machine
+        # it runs on. A published package has no .git to read the commit from,
+        # so it has to be baked in here - written after the version check above
+        # so it cannot affect it.
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.buildRef = process.env.GITHUB_SHA.slice(0, 7);
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+            console.log("buildRef =", pkg.buildRef);
+          '
+
       - name: Build
         run: npm run build
 
