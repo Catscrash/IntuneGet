@@ -112,21 +112,45 @@ function getManifestPaths(wingetId: string) {
 }
 
 /**
- * Fetch available versions for a package
- * Priority: Supabase version_history -> GitHub API
+ * Fetch available versions for a package.
+ * Priority: the catalog's version history -> the WinGet repository.
+ *
+ * The catalog can name a newer version than it holds a manifest row for: the
+ * job that records latest_version and the one that writes version_history are
+ * separate, so the browse card offers a version the version list does not
+ * contain - and the package cannot be deployed at that version by anyone,
+ * because it is not selectable. Falling back only on an empty list missed
+ * exactly that case, since the list is not empty, just behind.
  */
 export async function fetchAvailableVersions(wingetId: string): Promise<string[]> {
-  // Try the catalog first
+  let catalogVersions: string[] = [];
+  let latestVersion: string | null = null;
+
   try {
-    const versions = await getCatalogSource().getVersions(wingetId);
-    if (versions.length > 0) {
-      return versions;
-    }
+    const catalog = getCatalogSource();
+    const [versions, apps] = await Promise.all([
+      catalog.getVersions(wingetId),
+      catalog.getAppsByWingetIds([wingetId]),
+    ]);
+    catalogVersions = versions;
+    latestVersion = apps[0]?.latest_version ?? null;
   } catch (error) {
-    console.warn(`Supabase version lookup failed for ${wingetId}:`, error);
+    console.warn(`Catalog version lookup failed for ${wingetId}:`, error);
   }
 
-  return fetchAvailableVersionsLive(wingetId);
+  // Only when the catalog contradicts itself, so the extra request stays on
+  // the gap rather than on every browse.
+  const missesOwnLatest =
+    Boolean(latestVersion) && !catalogVersions.includes(latestVersion as string);
+
+  if (catalogVersions.length > 0 && !missesOwnLatest) {
+    return catalogVersions;
+  }
+
+  const liveVersions = await fetchAvailableVersionsLive(wingetId);
+  // The live list is the authority when it answers; when it cannot (rate limit,
+  // no network), a behind-but-real catalog list still beats nothing.
+  return liveVersions.length > 0 ? liveVersions : catalogVersions;
 }
 
 /**
