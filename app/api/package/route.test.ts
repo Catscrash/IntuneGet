@@ -126,6 +126,8 @@ import { GET, POST } from '@/app/api/package/route';
 import { QaGateError } from '@/lib/qa/gate';
 import { InstallerPreflightError } from '@/lib/installer-preflight';
 import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
+import { acquireGraphToken } from '@/lib/graph-token';
+import { deployStoreApp } from '@/lib/store-app-deploy';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 
@@ -280,6 +282,19 @@ describe('POST /api/package (workflow dispatch)', () => {
       supersedenceType: 'replace',
     },
   ];
+
+  function makeStoreItem(overrides: Record<string, unknown> = {}) {
+    return {
+      appSource: 'store',
+      wingetId: '9WZDNCRFJ4MV',
+      packageIdentifier: '9WZDNCRFJ4MV',
+      displayName: 'Lenovo Vantage',
+      publisher: 'Lenovo',
+      version: 'latest',
+      installExperience: 'system',
+      ...overrides,
+    };
+  }
 
   function makeWin32Item(overrides: Record<string, unknown> = {}) {
     return {
@@ -734,6 +749,41 @@ describe('POST /api/package (workflow dispatch)', () => {
 
     const config = createMock.mock.calls[0][0].package_config as { forceCreate?: boolean };
     expect(config.forceCreate).toBeUndefined();
+  });
+
+  it('queues a Store app with the installer columns the table demands', async () => {
+    // packaging_jobs predates Store support and still declares installer_type
+    // and installer_url NOT NULL in both backends, so omitting them - which a
+    // Store app has no natural value for - failed the insert outright and the
+    // deployment never started.
+    isSupabaseServerConfiguredMock.mockReturnValue(false);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+    vi.mocked(acquireGraphToken).mockResolvedValue({
+      accessToken: 'graph-token',
+    } as unknown as Awaited<ReturnType<typeof acquireGraphToken>>);
+    vi.mocked(deployStoreApp).mockResolvedValue({
+      intuneAppId: 'app-1',
+      intuneAppUrl: 'https://intune.example/app-1',
+    });
+
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeStoreItem()] }),
+    });
+
+    await POST(request);
+
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        app_source: 'store',
+        installer_type: 'store',
+        installer_url: 'https://apps.microsoft.com/detail/9WZDNCRFJ4MV',
+      })
+    );
   });
 
   it('adds only the package-id marker when no signature is configured', async () => {

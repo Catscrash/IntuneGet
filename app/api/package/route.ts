@@ -84,6 +84,15 @@ interface PackagingJobRecord {
   created_at: string;
 }
 
+/**
+ * The Store listing a Store app comes from. Stands in for the installer URL a
+ * Win32 package would carry, so the column holds something true rather than a
+ * placeholder.
+ */
+function storeProductUrl(packageIdentifier: string): string {
+  return `https://apps.microsoft.com/detail/${encodeURIComponent(packageIdentifier)}`;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const user = await parseAccessToken(request.headers.get('Authorization'));
@@ -480,7 +489,16 @@ export async function POST(request: NextRequest) {
           storeItems.map(async (item) => {
             const jobId = crypto.randomUUID();
 
-            // Create job record (store apps have no installer fields)
+            // A Store app is installed by the Store, so it has none of the
+            // installer fields a Win32 package carries - but packaging_jobs
+            // predates Store support and still declares installer_type and
+            // installer_url NOT NULL in both backends, so leaving them out
+            // failed the insert outright ("NOT NULL constraint failed").
+            //
+            // Describe the source rather than invent an installer: app_source
+            // already marks the row as a Store app and the uploads view hides
+            // installer_type for those, so these only have to be true if
+            // someone reads the row directly.
             const jobRecord = await db.jobs.create({
               id: jobId,
               user_id: userId,
@@ -490,6 +508,8 @@ export async function POST(request: NextRequest) {
               version: item.version,
               display_name: item.displayName,
               publisher: item.publisher,
+              installer_type: 'store',
+              installer_url: storeProductUrl(item.packageIdentifier),
               package_config: item as unknown as import('@/types/database').Json,
               status: 'uploading',
               progress_percent: 50,
