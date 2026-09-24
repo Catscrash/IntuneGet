@@ -53,6 +53,11 @@ COPY --from=builder /app/supabase ./supabase
 # pull through the proxy and keep in step.
 COPY --from=builder /app/scripts/scheduler.mjs ./scripts/scheduler.mjs
 
+# The data directory (SQLite database, catalog snapshot) is mounted as a volume.
+# Docker creates an empty named volume with the ownership of the directory it
+# mounts over, so without this it belongs to root and the app cannot write it.
+RUN mkdir -p /data && chown nextjs:nodejs /data
+
 USER nextjs
 
 EXPOSE 3000
