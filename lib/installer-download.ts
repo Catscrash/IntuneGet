@@ -4,7 +4,7 @@ import { lookup } from 'node:dns/promises';
 import * as http from 'node:http';
 import * as https from 'node:https';
 
-const DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 240_000;
 const MAX_REDIRECTS = 5;
@@ -22,6 +22,13 @@ export interface InstallerHashResult {
   bytes: number;
   finalUrl: string;
   verificationMethod?: 'content-hash' | 'publisher-checksum';
+}
+
+export class InstallerDownloadSizeLimitError extends Error {
+  constructor(public readonly maxBytes: number, public readonly observedBytes?: number) {
+    super(`The installer is larger than the ${maxBytes} byte limit IntuneGet can verify before packaging.`);
+    this.name = 'InstallerDownloadSizeLimitError';
+  }
 }
 
 export class InstallerDownloadDeadlineError extends Error {
@@ -45,6 +52,9 @@ export async function withInstallerDownloadDeadline<T>(
   try {
     return await operation(controller.signal);
   } catch (error) {
+    if (error instanceof InstallerDownloadSizeLimitError) {
+      throw error;
+    }
     if (controller.signal.aborted) {
       throw new InstallerDownloadDeadlineError(timeoutMs);
     }
@@ -277,7 +287,7 @@ async function readRangeMetadata(
         : null;
       if (totalBytes !== null && totalBytes > maxBytes) {
         response.resume();
-        reject(new Error(`Installer exceeds the ${maxBytes}-byte preflight limit`));
+        reject(new InstallerDownloadSizeLimitError(maxBytes, totalBytes));
         return;
       }
 
@@ -697,7 +707,7 @@ async function hashUrl(
       const contentLength = Number(response.headers['content-length']);
       if (Number.isFinite(contentLength) && contentLength > maxBytes) {
         response.destroy();
-        reject(new Error(`Installer exceeds the ${maxBytes}-byte preflight limit`));
+        reject(new InstallerDownloadSizeLimitError(maxBytes, contentLength));
         return;
       }
 
@@ -706,7 +716,7 @@ async function hashUrl(
       response.on('data', (chunk: Buffer) => {
         bytes += chunk.length;
         if (bytes > maxBytes) {
-          response.destroy(new Error(`Installer exceeds the ${maxBytes}-byte preflight limit`));
+          response.destroy(new InstallerDownloadSizeLimitError(maxBytes, bytes));
           return;
         }
         hash.update(chunk);
