@@ -23,6 +23,7 @@ function fixture() {
     archived_at: null, cancelled_at: null, intune_app_id: null, is_auto_update: false,
     completed_at: '2026-10-01T10:00:00Z', qa_completed_at: '2026-10-01T10:00:00Z',
     created_at: '2026-10-01T09:00:00Z', updated_at: '2026-10-01T10:00:00Z', package_config: { description: 'Keep presentation', installerSha256: hash },
+    qa_resume_due_at: '2026-10-01T10:00:00Z',
     presentation_profile_sha256: 'C'.repeat(64), error_stage: 'validation', error_category: 'installer',
   };
   const candidate = { id: 'candidate', status: 'passed', winget_id: 'Example.App', version: '1.0', architecture: 'x64', installer_sha256: hash, package_profile_sha256: profile, finished_at: '2026-10-01T11:00:00Z' };
@@ -50,6 +51,7 @@ function database(f: ReturnType<typeof fixture>, options: { history?: boolean; d
         return b;
       },
       neq: (k: string, v: unknown) => { predicates.push(row => row[k] !== v); return b; },
+      lte: (k: string, v: string) => { predicates.push(row => String(row[k]) <= v); return b; },
       is: (k: string, v: unknown) => { predicates.push(row => row[k] === v); return b; },
       in: (k: string, v: unknown[]) => { predicates.push(row => v.includes(row[k])); return b; },
       update: (v: Record<string, unknown>) => { patch = v; return b; },
