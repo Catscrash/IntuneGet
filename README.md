@@ -52,11 +52,14 @@ Each fix is a separate branch and, where it is ready, a pull request upstream. T
 
 ### Proposed upstream
 
-| PR | Area | What it fixes |
-|----|------|---------------|
-| [#220](https://github.com/ugurkocde/IntuneGet/pull/220) | Web app | Supabase-less SQLite self-hosting |
-| [#221](https://github.com/ugurkocde/IntuneGet/pull/221) | Local packager | `HTTP(S)_PROXY` support |
-| [#222](https://github.com/ugurkocde/IntuneGet/pull/222) | Local packager | Win32 app creation payload |
+| PR | Area | What it fixes | Status |
+|----|------|---------------|--------|
+| [#220](https://github.com/ugurkocde/IntuneGet/pull/220) | Web app | Supabase-less SQLite self-hosting | Closed: overtaken by upstream's own Supabase guards and SQLite work; what remains lives in `fork-main` |
+| [#221](https://github.com/ugurkocde/IntuneGet/pull/221) | Local packager | `HTTP(S)_PROXY` support | Open |
+| [#222](https://github.com/ugurkocde/IntuneGet/pull/222) | Local packager | Win32 app creation payload | Closed: fixed upstream in [#435](https://github.com/ugurkocde/IntuneGet/pull/435) |
+| [#1112](https://github.com/ugurkocde/IntuneGet/pull/1112) | Web app | SQLite `packaging_jobs` insert | Adopted upstream as [#1426](https://github.com/ugurkocde/IntuneGet/pull/1426) |
+| [#1113](https://github.com/ugurkocde/IntuneGet/pull/1113) | Web app | `unread_count` without Supabase | Adopted upstream as [#1427](https://github.com/ugurkocde/IntuneGet/pull/1427) |
+| [#1114](https://github.com/ugurkocde/IntuneGet/pull/1114) | Web app | Per-app reasons when a deployment cannot start | Adopted upstream as [#1429](https://github.com/ugurkocde/IntuneGet/pull/1429) |
 
 **Supabase-less SQLite self-hosting.** `createServerClient()` throws when Supabase is not configured, and it was being called unconditionally on paths that either do not need Supabase at all or need it only for MSP tenant resolution — neither of which exists in a single-tenant self-hosted install. Deployment failed with a bare 500, and the dashboard, reports, update checking and the Update button were affected in the same way. Tenant resolution now falls back to the token's own tenant, and features with no SQLite equivalent report plainly (an empty list for reads, 503 for writes) instead of crashing.
 
@@ -83,7 +86,7 @@ B: 152.0.5 >= 152.0.5 -> "installed"
 
 Intune then reports both versions present on the same device, and the old object's install count never drops. With one object per version, detection has to be an identity check, so the comparison is now `equal`. The MSI product version fallback had the same problem and gets the same treatment.
 
-A second defect only shows on updates: an update reuses the previous deployment's configuration, whose detection rules still name the *previous* version — so the new app object shipped looking for its predecessor and would never report as installed anywhere. The rules are now re-targeted at the version being deployed. That re-targeting is deliberately narrow: it touches the IntuneGet marker and an MSI product version, and passes everything else through, since a file check or a script has a meaning it cannot infer.
+A second defect only shows on updates: an update reuses the previous deployment's configuration, whose detection rules still name the *previous* version — so the new app object shipped looking for its predecessor and would never report as installed anywhere. The rules are now re-targeted at the version being deployed. That re-targeting is deliberately narrow: it touches the IntuneGet marker and an MSI product version, and passes everything else through, since a file check or a script has a meaning it cannot infer. Rules an administrator wrote with upstream's custom detection editor are left exactly as written.
 
 </details>
 
@@ -122,7 +125,9 @@ Policies now go through the db abstraction like every other table, with the same
 
 Ignore and pin are enforced at the trigger, not only in the list the page offers, so a stale page or a direct API call cannot deploy a version the operator deliberately held back.
 
-Not covered: nothing *schedules* an auto-update in a self-hosted install. `AutoUpdateTrigger` is built around Supabase (`user_profiles`, `auto_update_history`, and the Vercel crons that drive it), so an `auto_update` policy records the intent and the rollout happens from the Updates page. `/api/updates/history` stays empty for the same reason — those rows are only written by the hosted trigger.
+Upstream has since added its own SQLite storage for policies and auto-update history; the fork now uses upstream's adapter for both and keeps its routes on top of it.
+
+Not covered by default: nothing *schedules* an auto-update in a self-hosted install. Upstream's `/api/cron/check-updates` can trigger `auto_update` policies in SQLite mode, but it compares deployments against the catalog only and writes the same cached update rows as the fork's live Graph scan in `/api/cron/refresh-updates`, so the bundled scheduler does not call it. Without it, an `auto_update` policy records the intent and the rollout happens from the Updates page. Add it to `SCHEDULER_JOBS` only if catalog-based detection is acceptable for that deployment.
 
 </details>
 
