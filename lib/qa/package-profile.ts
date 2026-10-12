@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { normalizeCatalogDetectionRules } from '@/lib/catalog-detection';
 import { assertPackagingContract } from '@/lib/packaging-contract';
 import { inferSavedCustomMarkerPath } from '@/lib/registry-marker';
+import { validateCustomDetectionRules } from '@/lib/custom-detection';
 import type { DetectionRule } from '@/types/intune';
 import { DEFAULT_PSADT_CONFIG, type PSADTConfig } from '@/types/psadt';
 import {
@@ -14,7 +15,7 @@ import type { PackagedWingetDependency } from '@/lib/winget-dependencies';
 
 export const QA_PSADT_TOOLCHAIN = {
   packagerRepository: 'ugurkocde/IntuneGet',
-  packagerCommit: '6dfeaea03893e63cf7aba747638d7ea1768ac6b7',
+  packagerCommit: '665d6f4ec65d457edbd455605a54b4b223392457',
   packagerScriptPath: '.github/scripts/Create-PSADTPackage.ps1',
   psadtVersion: '4.1.8',
   templateUrl:
@@ -606,12 +607,43 @@ export const QA_PACKAGER_RELEASE_HISTORY = [
   // Existing successful execution profiles keep their compatibility history.
   '9e51c9ab6cc3a28346f13266e566c9896fa4101b',
   // Product Portal gains unattended uninstall arguments in its canonical
-  // config. Unchanged execution profiles remain compatible; strict cohort
-  // reporting still requires the exact current shared pin.
+  // config. Unchanged execution profiles remain compatible. The cohort audit
+  // reports compatible-lineage evidence separately from exact-current-pin passes.
   '305b9c41a4ccbd271a9873a4fd858d2515586b76',
   // LPub3D gains managed-context uninstall arguments. Its profile changes;
   // unrelated identical execution profiles retain compatibility, not strict count credit.
   'ada1a8a5d1ad0ae9ad953306a6b528c71479a803',
+  // GreenTunnel gains its reviewed user scope. Other unchanged execution
+  // profiles retain compatibility; this does not grant exact-pin strict credit.
+  '6dfeaea03893e63cf7aba747638d7ea1768ac6b7',
+  // Zermelo's exact registry key changes only its failed identity profile.
+  // Unchanged profiles retain compatibility, never exact-pin strict count credit.
+  'bc329cb8bfafd8d2af940bdc9f8ccf044ac15146',
+  // Kiwix's exact registry identity changes only its previously failed
+  // lifecycle; compatibility never grants exact-current-pin strict count credit.
+  'cb3e4501fa7c4470330a1b6031dd5799fee8f9e4',
+  // tl;dv gains an exact NSIS key. Unchanged profiles retain compatibility,
+  // never exact-current-pin cohort credit.
+  'e79da0398e3cf3c6874e53b6304a2aef54b5770f',
+  // ZCode's exact NSIS key repairs only its failed identity. Unchanged
+  // execution profiles retain compatibility, never exact-pin cohort credit.
+  'c861e3a90f8bbf28842b86ab0070230efecaf3a9',
+  // ZWCAD 2025 changes only its failed removal profile; unchanged profiles
+  // retain compatibility, never exact-current-pin strict cohort credit.
+  '5e561aeff961e42e63eba4fee4696c15a0cbff71',
+  // ZWCAD 2026 changes only its failed removal profile. Unchanged profiles
+  // retain compatibility, never exact-current-pin strict cohort credit.
+  'e7410e97df040bd38f11842ccf259abd9bc757f7',
+  // Bandizip's /S adapter changes only its failing removal profile.
+  // Preserve approved unrelated coverage through per-profile compatibility.
+  '4b4637967c6e2b0188f5713d262dd1219a02465e',
+  // Wacom's exact registered removal gains /s. Preserve unrelated coverage;
+  // the release-aware check below requires affected Wacom profiles to retest.
+  '60395492a3d51b2ff6f14b50ed7cd0c7f558be70',
+  // Retain the Wacom release and its per-profile compatibility exclusion.
+  // The next activation still requires isolated guest qualification and
+  // reviewed exclusions for the intervening generator changes.
+  '25849ac512c211e616c135149ef1e059db367ebc',
   QA_PSADT_TOOLCHAIN.packagerCommit,
 ] as const;
 
@@ -811,6 +843,12 @@ function passingProfileCompatibilityReason(
     : [];
 
   for (const release of QA_PACKAGER_RELEASE_HISTORY.slice(priorIndex + 1, currentIndex + 1)) {
+    if (
+      release === '25849ac512c211e616c135149ef1e059db367ebc' &&
+      lowerTextValue(record(profile.app)?.wingetId) === 'wacom.wacomtabletdriver'
+    ) {
+      return 'compatible-application-adapter-changed';
+    }
     if (
       release === '7238616608f888449fa2e132fffc8d7314c26745' &&
       lowerTextValue(installer.sourceType) === 'zip' &&
@@ -1090,8 +1128,38 @@ export function validateCompatiblePassedCatalogQaProfile(
   if (canonicalQaJson(adapted) !== canonicalQaJson(typedPsadtConfig)) {
     return { valid: false, reason: 'compatible-application-adapter-changed' };
   }
+  const uninstallCommand = textValue(record(profile?.installer)?.uninstallCommand);
+  if (resolveApplicationUninstallCommand(wingetId, uninstallCommand) !== uninstallCommand) {
+    return { valid: false, reason: 'compatible-uninstall-identity-changed' };
+  }
 
   return validation;
+}
+
+/**
+ * A curated release binds the execution profile hash it was tested with. That
+ * hash includes the packager commit, so a later unrelated packager release
+ * must not strand it. The prior profile is the current one with only the
+ * packager commit swapped back; it must hash to the tested value and no
+ * intervening release may change behavior that profile exercises.
+ */
+export function compatiblePriorExecutionProfileReason(
+  currentCanonicalJson: string,
+  priorPackagerCommit: string,
+  priorExecutionProfileSha256: string
+): string | null {
+  let current: Record<string, unknown> | null = null;
+  try { current = record(JSON.parse(currentCanonicalJson)); } catch { current = null; }
+  const toolchain = record(current?.toolchain);
+  if (!current || !toolchain || textValue(toolchain.packagerCommit) !== QA_PSADT_TOOLCHAIN.packagerCommit) {
+    return 'compatible-profile-invalid';
+  }
+  const prior = { ...current, toolchain: { ...toolchain, packagerCommit: priorPackagerCommit } };
+  if (qaSha256(canonicalQaJson(prior)).toLowerCase() !== priorExecutionProfileSha256.toLowerCase()) {
+    return 'compatible-execution-profile-changed';
+  }
+  if (priorPackagerCommit === QA_PSADT_TOOLCHAIN.packagerCommit) return null;
+  return passingProfileCompatibilityReason(priorPackagerCommit, prior);
 }
 
 export function validateCompatiblePassedDeploymentQaProfile(input: {
@@ -1297,12 +1365,17 @@ export function normalizeQaWorkflowPackageInput(input: QaWorkflowPackageInput): 
     : [];
   const parsedConfig = parseJsonObject<unknown>(input.psadtConfig, {});
   const rawConfig = (record(parsedConfig) || {}) as Partial<PSADTConfig>;
+  const preserveCustomDetection = rawConfig.customDetection === true;
+  if (preserveCustomDetection) {
+    const validation = validateCustomDetectionRules(parsedDetectionRulesValue);
+    if (!validation.valid) throw new Error(validation.errors.join(' '));
+  }
   const preliminaryConfig = normalizeQaPsadtConfig(rawConfig, parsedDetectionRules);
   const installScope = resolveApplicationInstallScope(
     input.wingetId,
     input.installScope || 'machine'
   );
-  let detectionRules = normalizeCatalogDetectionRules({
+  let detectionRules = preserveCustomDetection ? parsedDetectionRules : normalizeCatalogDetectionRules({
     detectionRules: parsedDetectionRules,
     fallbackDetectionRules: rawConfig.detectionRules,
     wingetId: input.wingetId,
@@ -1311,7 +1384,7 @@ export function normalizeQaWorkflowPackageInput(input: QaWorkflowPackageInput): 
     markerPath: preliminaryConfig.registryMarkerPath,
     installerType: input.nestedInstallerType || input.installerType,
   });
-  const inferredMarkerPath = preliminaryConfig.registryMarkerPath
+  const inferredMarkerPath = preserveCustomDetection || preliminaryConfig.registryMarkerPath
     ? null
     : inferSavedCustomMarkerPath({
         detectionRules,

@@ -42,10 +42,9 @@ afterEach(() => {
 });
 
 describe('sqlite updatePolicies', () => {
-  it('creates a policy and reports it as created', async () => {
-    const { policy, created } = await adapter.updatePolicies.upsert(basePolicy());
+  it('creates a policy', async () => {
+    const policy = await adapter.updatePolicies.upsert(basePolicy());
 
-    expect(created).toBe(true);
     expect(policy.id).toBeTruthy();
     expect(policy.policy_type).toBe('notify');
     expect(policy.is_enabled).toBe(true);
@@ -61,12 +60,11 @@ describe('sqlite updatePolicies', () => {
       basePolicy({ policy_type: 'ignore' })
     );
 
-    expect(second.created).toBe(false);
-    expect(second.policy.id).toBe(first.policy.id);
-    expect(second.policy.policy_type).toBe('ignore');
-    expect(second.policy.created_at).toBe(first.policy.created_at);
+    expect(second.id).toBe(first.id);
+    expect(second.policy_type).toBe('ignore');
+    expect(second.created_at).toBe(first.created_at);
 
-    const all = await adapter.updatePolicies.getByUserId('user-1');
+    const all = await adapter.updatePolicies.list('user-1');
     expect(all).toHaveLength(1);
   });
 
@@ -75,14 +73,14 @@ describe('sqlite updatePolicies', () => {
     await adapter.updatePolicies.upsert(basePolicy({ tenant_id: 'tenant-2' }));
     await adapter.updatePolicies.upsert(basePolicy({ winget_id: 'Git.Git' }));
 
-    expect(await adapter.updatePolicies.getByUserId('user-1')).toHaveLength(3);
-    expect(await adapter.updatePolicies.getByUserId('user-1', 'tenant-2')).toHaveLength(1);
+    expect(await adapter.updatePolicies.list('user-1')).toHaveLength(3);
+    expect(await adapter.updatePolicies.list('user-1', 'tenant-2')).toHaveLength(1);
   });
 
   it('round-trips the deployment config as an object', async () => {
     // auto_update stores the whole re-deployment recipe; it must come back
     // parsed, or the trigger would try to spread a JSON string.
-    const { policy } = await adapter.updatePolicies.upsert(
+    const policy = await adapter.updatePolicies.upsert(
       basePolicy({
         policy_type: 'auto_update',
         deployment_config: { displayName: 'Firefox', detectionRules: [{ type: 'msi' }] },
@@ -94,7 +92,7 @@ describe('sqlite updatePolicies', () => {
       detectionRules: [{ type: 'msi' }],
     });
 
-    const [reloaded] = await adapter.updatePolicies.getByUserId('user-1');
+    const [reloaded] = await adapter.updatePolicies.list('user-1');
     expect(reloaded.deployment_config).toEqual(policy.deployment_config);
   });
 
@@ -122,7 +120,7 @@ describe('sqlite updatePolicies', () => {
     // Changing the policy type must not reset what the last run deployed:
     // /api/updates/available drops an update whose version matches
     // last_auto_update_version, so wiping it re-offers what just went out.
-    const { policy } = await adapter.updatePolicies.upsert(
+    const policy = await adapter.updatePolicies.upsert(
       basePolicy({ policy_type: 'auto_update' })
     );
     await adapter.updatePolicies.update(policy.id, 'user-1', {
@@ -131,7 +129,7 @@ describe('sqlite updatePolicies', () => {
       consecutive_failures: 3,
     });
 
-    const { policy: reSet } = await adapter.updatePolicies.upsert(
+    const reSet = await adapter.updatePolicies.upsert(
       basePolicy({ policy_type: 'notify' })
     );
 
@@ -144,7 +142,7 @@ describe('sqlite updatePolicies', () => {
   it('ignores fields explicitly patched as undefined', async () => {
     // A caller that spreads an optional field must not silently re-enable a
     // disabled policy just by mentioning the key.
-    const { policy } = await adapter.updatePolicies.upsert(
+    const policy = await adapter.updatePolicies.upsert(
       basePolicy({ is_enabled: false })
     );
 
@@ -158,7 +156,7 @@ describe('sqlite updatePolicies', () => {
   });
 
   it('patches only the fields it is given', async () => {
-    const { policy } = await adapter.updatePolicies.upsert(
+    const policy = await adapter.updatePolicies.upsert(
       basePolicy({ policy_type: 'pin_version', pinned_version: '1.2.3' })
     );
 
@@ -174,21 +172,21 @@ describe('sqlite updatePolicies', () => {
   it('scopes reads, patches and deletes to the owning user', async () => {
     // The id is the only thing the client sends, so every one of these has to
     // carry the user or one tenant admin could edit another's policy by id.
-    const { policy } = await adapter.updatePolicies.upsert(basePolicy());
+    const policy = await adapter.updatePolicies.upsert(basePolicy());
 
     expect(await adapter.updatePolicies.getById(policy.id, 'user-2')).toBeNull();
     expect(await adapter.updatePolicies.update(policy.id, 'user-2', { is_enabled: false }))
       .toBeNull();
-    expect(await adapter.updatePolicies.deleteById(policy.id, 'user-2')).toBe(false);
+    expect(await adapter.updatePolicies.delete(policy.id, 'user-2')).toBe(false);
 
     expect(await adapter.updatePolicies.getById(policy.id, 'user-1')).not.toBeNull();
   });
 
   it('deletes a policy and reports whether there was one', async () => {
-    const { policy } = await adapter.updatePolicies.upsert(basePolicy());
+    const policy = await adapter.updatePolicies.upsert(basePolicy());
 
-    expect(await adapter.updatePolicies.deleteById(policy.id, 'user-1')).toBe(true);
-    expect(await adapter.updatePolicies.deleteById(policy.id, 'user-1')).toBe(false);
-    expect(await adapter.updatePolicies.getByUserId('user-1')).toEqual([]);
+    expect(await adapter.updatePolicies.delete(policy.id, 'user-1')).toBe(true);
+    expect(await adapter.updatePolicies.delete(policy.id, 'user-1')).toBe(false);
+    expect(await adapter.updatePolicies.list('user-1')).toEqual([]);
   });
 });

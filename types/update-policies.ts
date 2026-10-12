@@ -22,6 +22,9 @@ export type UpdateType = 'patch' | 'minor' | 'major';
  * Contains all information needed to re-deploy an app with a new version
  */
 export interface DeploymentConfig {
+  sourceType?: 'winget' | 'custom' | 'curated';
+  curatedReleaseId?: string;
+  curatedSettingsMode?: 'tested-defaults' | 'custom';
   // App information
   displayName: string;
   publisher: string;
@@ -217,7 +220,13 @@ export interface TriggerUpdateResponse {
       | 'QA_FAILED_CURRENT_VERSION'
       | 'QA_NOT_PASSED_CURRENT_VERSION'
       | 'QA_SECURITY_FLAGGED_CURRENT_VERSION'
-      | 'QA_PACKAGE_COMPATIBILITY_BLOCKED';
+      | 'QA_PACKAGE_COMPATIBILITY_BLOCKED'
+      | 'CURATED_LICENCE_NOT_ACCEPTED'
+      | 'CURATED_CONFIG_VERIFICATION_REQUIRED'
+      | 'INTUNE_APPROVAL_PENDING'
+      | 'CURATED_CONFIG_VERIFICATION_FAILED'
+      | 'RATE_LIMIT_UNVERIFIED'
+      | 'PSADT_BACKFILL_UNAVAILABLE';
     packaging_job_id?: string;
     error?: string;
   }[];
@@ -306,7 +315,7 @@ export function canAutoUpdate(policy: AppUpdatePolicy | null | undefined): boole
  * Helper to check if update should be skipped based on policy
  */
 export function shouldSkipUpdate(
-  policy: AppUpdatePolicy | null | undefined,
+  policy: Pick<AppUpdatePolicy, 'policy_type' | 'pinned_version'> | null | undefined,
   latestVersion: string
 ): boolean {
   if (!policy) return false;

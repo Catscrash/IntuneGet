@@ -1,104 +1,140 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import type { PackagingJob } from '../types';
+import { MIGRATIONS } from '../sqlite-migrations';
 
-// Against the real adapter, deliberately. sqlite.test.ts mirrors this INSERT
-// by hand, so a statement that is wrong only in lib/db/sqlite.ts passes there
-// and fails in production: the column list grew to 31 while the placeholder
-// list went to 32, and every deployment in SQLite mode died on
-// "32 values for 31 columns".
-let dir: string;
+// Adapted from Catscrash's PR #1112. sqlite.test.ts copies the adapter's SQL,
+// so it passed while the real INSERT had 32 placeholders for 31 columns.
+// Exercise the real adapter, including migrations and the persisted bindings.
+let dir: string | undefined;
+let databasePath: string;
 let adapter: typeof import('../sqlite').sqliteDb;
-let closeDb: typeof import('../sqlite').closeSqliteDb;
+let closeDb: typeof import('../sqlite').closeSqliteDb | undefined;
+const timestamp = '2026-10-08T04:00:00.000Z';
 
 beforeEach(async () => {
-  dir = mkdtempSync(path.join(tmpdir(), 'intuneget-jobs-'));
-  process.env.DATABASE_PATH = path.join(dir, 'test.db');
+  vi.resetModules();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(timestamp));
+  dir = mkdtempSync(join(tmpdir(), 'intuneget-job-create-'));
+  databasePath = join(dir, 'test.db');
+  vi.stubEnv('DATABASE_PATH', databasePath);
   const mod = await import('../sqlite');
   adapter = mod.sqliteDb;
   closeDb = mod.closeSqliteDb;
 });
 
 afterEach(() => {
-  closeDb();
-  rmSync(dir, { recursive: true, force: true });
-  delete process.env.DATABASE_PATH;
+  try {
+    closeDb?.();
+    if (dir) {
+      // Close WAL connections first, and verify the generated cleanup target.
+      const target = resolve(dir);
+      if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith('intuneget-job-create-')) {
+        throw new Error('Unexpected SQLite fixture cleanup target');
+      }
+      rmSync(target, { recursive: true, force: true });
+    }
+  } finally {
+    dir = undefined;
+    closeDb = undefined;
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  }
 });
 
-describe('sqlite jobs.create', () => {
-  it('inserts a job with only the required fields', async () => {
-    const job = await adapter.jobs.create({
-      user_id: 'user-1',
-      winget_id: 'Zoom.Zoom',
-      version: '7.1.46825',
-      display_name: 'Zoom Workplace',
-      installer_type: 'msi',
-      installer_url: 'https://example.com/zoom.msi',
-    });
+function readStoredJob(id: string): Record<string, unknown> {
+  closeDb?.();
+  const stored = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    // Version 5 adds claimed apps after the licence attestations.
+    expect(stored.pragma('user_version', { simple: true })).toBe(MIGRATIONS[MIGRATIONS.length - 1].version);
+    return stored.prepare('SELECT * FROM packaging_jobs WHERE id = ?').get(id) as Record<string, unknown>;
+  } finally {
+    stored.close();
+  }
+}
 
-    expect(job.id).toBeTruthy();
-    expect(job.winget_id).toBe('Zoom.Zoom');
-    expect(job.status).toBe('queued');
-    expect(job.progress_percent).toBe(0);
+describe('real SQLite jobs.create', () => {
+  it('persists required fields and defaults on a freshly migrated database', async () => {
+    const input = {
+      user_id: 'minimal-user',
+      winget_id: 'Example.Minimal',
+      version: '1.2.3',
+      display_name: 'Minimal fixture',
+      installer_type: 'msi',
+      installer_url: 'https://example.com/minimal.msi',
+    };
+    const job = await adapter.jobs.create(input);
+
+    expect(job.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(job).toMatchObject({ ...input, status: 'queued', progress_percent: 0, app_source: 'win32' });
+    expect(job.is_auto_update).toBeFalsy();
+    expect(readStoredJob(job.id)).toMatchObject({
+      ...input,
+      id: job.id,
+      status: 'queued',
+      progress_percent: 0,
+      app_source: 'win32',
+      user_email: null,
+      tenant_id: null,
+      detection_rules: null,
+      package_config: null,
+      is_auto_update: 0,
+      auto_update_policy_id: null,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
   });
 
-  it('round-trips every column the statement writes', async () => {
-    // Touches each of the 31 columns, so a future column added to one list
-    // and not the other fails here rather than in a deployment.
-    const job = await adapter.jobs.create({
-      user_id: 'user-1',
-      user_email: 'user@example.com',
-      tenant_id: 'tenant-1',
-      winget_id: 'Zoom.Zoom',
-      version: '7.1.46825',
-      display_name: 'Zoom Workplace',
-      publisher: 'Zoom',
+  it('round-trips every current INSERT binding through a fresh connection', async () => {
+    const input: Partial<PackagingJob> = {
+      id: 'full-job',
+      user_id: 'full-user',
+      user_email: 'fixture@example.com',
+      tenant_id: 'fixture-tenant',
+      winget_id: 'Example.Full',
+      version: '7.8.9',
+      display_name: 'Full fixture',
+      publisher: 'Fixture publisher',
       architecture: 'x64',
-      installer_type: 'msi',
-      installer_url: 'https://example.com/zoom.msi',
+      installer_type: 'exe',
+      installer_url: 'https://example.com/full.exe',
       installer_sha256: 'A'.repeat(64),
-      install_command: 'msiexec /i zoom.msi /qn',
-      uninstall_command: 'msiexec /x zoom.msi /qn',
+      install_command: 'full.exe /install /quiet',
+      uninstall_command: 'full.exe /uninstall /quiet',
       install_scope: 'machine',
-      detection_rules: [{ type: 'msi' }] as never,
-      package_config: { displayName: 'Zoom Workplace' } as never,
-      app_source: 'win32',
+      detection_rules: [{ type: 'msi', productCode: '{00000000-0000-0000-0000-000000000001}' }],
+      package_config: { displayName: 'Full configuration' },
+      app_source: 'store',
       status: 'awaiting_qa',
-      status_message: 'Running an isolated installation test',
-      progress_percent: 5,
+      status_message: 'Fixture waiting for qualification',
+      progress_percent: 7,
       error_stage: 'validation',
       error_category: 'installer',
-      error_code: 'QA_FAILED_EXECUTION_PROFILE',
+      error_code: 'FIXTURE_ERROR',
       execution_profile_sha256: 'B'.repeat(64),
       presentation_profile_sha256: 'C'.repeat(64),
-      qa_candidate_id: 'candidate-1',
-      qa_requested_at: '2026-09-09T09:00:00.000Z',
-      qa_completed_at: '2026-09-09T09:05:00.000Z',
-    });
+      qa_candidate_id: 'fixture-candidate',
+      qa_requested_at: '2026-10-08T03:00:00.000Z',
+      qa_completed_at: '2026-10-08T03:05:00.000Z',
+      is_auto_update: true,
+      auto_update_policy_id: 'fixture-policy',
+    };
+    const job = await adapter.jobs.create(input);
+    const expected = { ...input, created_at: timestamp, updated_at: timestamp };
 
-    expect(job).toMatchObject({
-      user_email: 'user@example.com',
-      tenant_id: 'tenant-1',
-      publisher: 'Zoom',
-      architecture: 'x64',
-      installer_sha256: 'A'.repeat(64),
-      install_scope: 'machine',
-      status: 'awaiting_qa',
-      status_message: 'Running an isolated installation test',
-      progress_percent: 5,
-      error_stage: 'validation',
-      error_category: 'installer',
-      error_code: 'QA_FAILED_EXECUTION_PROFILE',
-      execution_profile_sha256: 'B'.repeat(64),
-      presentation_profile_sha256: 'C'.repeat(64),
-      qa_candidate_id: 'candidate-1',
-      qa_requested_at: '2026-09-09T09:00:00.000Z',
-      qa_completed_at: '2026-09-09T09:05:00.000Z',
+    // SQLite currently returns its stored INTEGER for this field. Preserve
+    // that runtime behaviour while checking the auto-update link explicitly.
+    expect(job).toMatchObject({ ...expected, is_auto_update: 1 });
+    expect(readStoredJob(job.id)).toMatchObject({
+      ...expected,
+      detection_rules: JSON.stringify(input.detection_rules),
+      package_config: JSON.stringify(input.package_config),
+      is_auto_update: 1,
     });
-    expect(job.detection_rules).toEqual([{ type: 'msi' }]);
-    expect(job.package_config).toEqual({ displayName: 'Zoom Workplace' });
-    expect(job.created_at).toBeTruthy();
-    expect(job.updated_at).toBeTruthy();
   });
 });

@@ -1,16 +1,22 @@
 import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
 import 'server-only';
+import { orderQaQueue, qaQueueCandidateReason } from './queue-selection';
+import { loadInstallerSecurityHolds, installerSecurityReason } from './installer-security-holds';
+import { getPackageCompatibilityBlocks, packageCompatibilityKey } from '@/lib/package-eligibility';
+import { qaSourceKey, qaSourceRetryAtMany } from './source-backoff';
 
 import { createServerClient } from '@/lib/supabase';
-import { QA_LIVE_FRAME_MAX_AGE_MS } from '@/lib/qa/constants';
+import { isQaFrameFresh } from '@/lib/qa/live-frame-freshness';
 import { getQaPipelineControl, type QaPipelineControl } from '@/lib/qa/pipeline-control';
+import { projectQaLiveCurated, type QaCuratedLiveBinding, type QaCuratedLiveFrameRow, type QaCuratedLiveSessionRow } from '@/lib/qa/live-curated';
+import { loadQaLiveCuratedSnapshot } from '@/lib/qa/live-session-data';
 import type { Json } from '@/types/database';
 import type { QaArchitecture, QaLiveActivity, QaLiveLog, QaLivePhase, QaLiveResponse, QaLiveUiConfiguration, QaOutcome, QaVirusTotalStatus } from '@/types/qa';
 
 const RUNNER_STALE_MS = 10 * 60 * 1000;
 const POLL_STALE_MS = 5 * 60 * 1000;
 export const QA_LIVE_RECENT_RESULT_COLUMNS =
-  'winget_id, package_profile_sha256, tested_version, architecture, outcome, tested_at_utc, overall_duration_seconds, virustotal_status';
+  'winget_id, package_profile_sha256, tested_version, architecture, installer_sha256, outcome, tested_at_utc, overall_duration_seconds, virustotal_status';
 
 interface CandidateRow {
   id: string;
@@ -30,6 +36,10 @@ interface CandidateRow {
   live_log?: Json | null;
   log_updated_at?: string | null;
   test_config: Json;
+  installer_url: string;
+  installer_sha256: string;
+  package_profile_sha256: string | null;
+  next_retry_at: string | null;
 }
 
 interface FrameRow {
@@ -49,6 +59,7 @@ interface PollRow {
 }
 
 interface ResultRow {
+  installer_sha256?: string | null;
   winget_id: string;
   package_profile_sha256: string;
   display_name?: string | null;
@@ -72,12 +83,18 @@ export interface QaLiveSnapshotInput {
   current: CandidateRow | null;
   queuedCount: number;
   queued: CandidateRow[];
+  waiting?: Array<{ candidate: CandidateRow; nextCheckAt: string | null; sourceRetry: boolean; securityHold?: boolean; securityReason?: string }>;
   poll: PollRow | null;
   consecutivePollFailures: number;
   recent: ResultRow[];
   apps: AppRow[];
   frame: FrameRow | null;
   control?: QaPipelineControl;
+  curated?: {
+    binding: QaCuratedLiveBinding | null;
+    session: QaCuratedLiveSessionRow | null;
+    frame: QaCuratedLiveFrameRow | null;
+  };
 }
 
 const VALID_PHASES = new Set<QaLivePhase>([
@@ -320,7 +337,7 @@ export function buildQaLiveResponse(input: QaLiveSnapshotInput): QaLiveResponse 
   const frameIsCurrent = Boolean(
     input.current &&
     input.frame?.candidate_id === input.current.id &&
-    input.now.getTime() - new Date(input.frame.updated_at).getTime() <= QA_LIVE_FRAME_MAX_AGE_MS
+    isQaFrameFresh(input.frame, currentStartedAt, input.now.getTime())
   );
   const currentExpectedUi = input.current ? expectedUiConfiguration(input.current.test_config) : null;
   const currentActivity = input.current
@@ -330,7 +347,7 @@ export function buildQaLiveResponse(input: QaLiveSnapshotInput): QaLiveResponse 
     ? liveLog(input.current.live_log, input.current.log_updated_at, currentStartedAt)
     : null;
 
-  return {
+  const response: QaLiveResponse = {
     serverTime: input.now.toISOString(),
     active: Boolean(input.current),
     runner: {
@@ -346,6 +363,7 @@ export function buildQaLiveResponse(input: QaLiveSnapshotInput): QaLiveResponse 
     },
     current: input.current && currentStartedAt
       ? {
+          runKind: 'ordinary',
           wingetId: input.current.winget_id,
           displayName: currentApp?.name || input.current.winget_id,
           publisher: currentApp?.publisher || null,
@@ -374,7 +392,13 @@ export function buildQaLiveResponse(input: QaLiveSnapshotInput): QaLiveResponse 
     log: currentLog,
     queue: {
       count: input.queuedCount,
-      next: input.queued.map((candidate) => ({
+      waiting: (input.waiting || []).slice(0, 10).map(({ candidate, nextCheckAt, sourceRetry, securityHold, securityReason }) => ({
+        wingetId: candidate.winget_id, displayName: appById.get(candidate.winget_id)?.name || candidate.winget_id,
+        version: candidate.version, architecture: architecture(candidate.architecture),
+        reason: securityHold ? securityReason || 'VirusTotal refused execution for this installer hash.' : sourceRetry ? "Installer source checks are deferred; another check is scheduled." : "This application is waiting for verification before testing.",
+        next_check_at: nextCheckAt,
+      })),
+      next: input.queued.slice(0, 10).map((candidate) => ({
         wingetId: candidate.winget_id,
         displayName: appById.get(candidate.winget_id)?.name || candidate.winget_id,
         version: candidate.version,
@@ -395,6 +419,21 @@ export function buildQaLiveResponse(input: QaLiveSnapshotInput): QaLiveResponse 
       virusTotalStatus: virusTotalStatus(result.virustotal_status),
     })),
   };
+  // The existing candidate is always authoritative if both sources are present.
+  // Curated telemetry mirrors dispatch ownership and never controls that ownership.
+  if (!input.current && input.curated) {
+    const curated = projectQaLiveCurated({ now: input.now, ...input.curated });
+    if (curated) {
+      response.active = true;
+      response.current = curated.current;
+      response.runner = curated.runner;
+      response.viewer = curated.viewer;
+      response.activity = null;
+      response.log = null;
+    }
+    response.vmBusy = input.curated.binding?.status === 'dispatched' ? 'catalog_verification' : null;
+  }
+  return response;
 }
 
 export function countConsecutiveFailedPolls(
@@ -409,17 +448,18 @@ export function countConsecutiveFailedPolls(
 }
 
 export async function getQaLiveSnapshot(): Promise<QaLiveResponse> {
+  const now = new Date();
   if (isQaMaintenanceMode()) {
     return buildQaLiveResponse({
-      now: new Date(), current: null, queuedCount: 0, queued: [], poll: null,
+      now, current: null, queuedCount: 0, queued: [], poll: null,
       consecutivePollFailures: 0, recent: [], apps: [], frame: null,
     });
   }
   const supabase = createServerClient();
   const candidateColumns =
-    'id, winget_id, version, architecture, status, priority, enqueued_at, dispatched_at, started_at, phase, phase_started_at, phase_updated_at, live_activity, activity_updated_at, live_log, log_updated_at, test_config';
+    'id, winget_id, version, architecture, status, priority, enqueued_at, dispatched_at, started_at, phase, phase_started_at, phase_updated_at, live_activity, activity_updated_at, live_log, log_updated_at, test_config, installer_url, installer_sha256, package_profile_sha256, next_retry_at';
 
-  const [activeResult, queueResult, countResult, pollResult, recentResult, control] = await Promise.all([
+  const [activeResult, queueResult, countResult, pollResult, recentResult, control, curated] = await Promise.all([
     supabase
       .from('qa_candidates')
       .select(candidateColumns)
@@ -428,15 +468,12 @@ export async function getQaLiveSnapshot(): Promise<QaLiveResponse> {
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle(),
-    supabase
+    orderQaQueue(supabase
       .from('qa_candidates')
       .select(candidateColumns)
       .eq('test_level', 'psadt-package')
-      .eq('status', 'queued')
-      .order('priority', { ascending: false })
-      .order('enqueued_at', { ascending: true })
-      .order('id', { ascending: true })
-      .limit(10),
+      .eq('status', 'queued'))
+      .limit(1000),
     supabase
       .from('qa_candidates')
       .select('id', { count: 'exact', head: true })
@@ -455,6 +492,7 @@ export async function getQaLiveSnapshot(): Promise<QaLiveResponse> {
       // releases even when a bounded failure retry produced another profile.
       .limit(50),
     getQaPipelineControl(supabase),
+    loadQaLiveCuratedSnapshot(supabase),
   ]);
 
   for (const result of [activeResult, queueResult, countResult, pollResult, recentResult]) {
@@ -462,13 +500,75 @@ export async function getQaLiveSnapshot(): Promise<QaLiveResponse> {
   }
 
   const current = (activeResult.data as CandidateRow | null) || null;
-  const queued = (queueResult.data || []) as CandidateRow[];
-  const recent = (recentResult.data || []) as ResultRow[];
+  const queueRows = (queueResult.data || []) as CandidateRow[];
+  const securityHolds = await loadInstallerSecurityHolds(supabase, queueRows.map(row => row.installer_sha256));
+  const queued: CandidateRow[] = [];
+  const waiting: NonNullable<QaLiveSnapshotInput['waiting']> = [];
+  const heldErrors = await supabase.rpc('qa_installer_security_waiting_errors', {});
+  if (heldErrors.error || !Array.isArray(heldErrors.data)) throw new Error('Installer security waiting queue is unavailable');
+  for (const held of heldErrors.data as unknown as Array<{ candidate: CandidateRow; nextCheckAt: string; malicious: number }>) {
+    if (!Number.isInteger(held.malicious) || held.malicious < 1) throw new Error('Installer security waiting queue is invalid');
+    waiting.push({ ...held, sourceRetry: false, securityHold: true, securityReason: installerSecurityReason(held.malicious) });
+  }
+  const input = (candidate: CandidateRow) => ({ wingetId: candidate.winget_id, version: candidate.version, architecture: candidate.architecture, installerSha256: candidate.installer_sha256 });
+  let cursor = 0, rounds = 0, lookupsClosed = false;
+  while (cursor < queueRows.length && !(lookupsClosed && waiting.length >= 10)) {
+    const chunk: CandidateRow[] = [];
+    while (cursor < queueRows.length && chunk.length < 25 && !(lookupsClosed && waiting.length >= 10)) {
+      const candidate = queueRows[cursor++];
+      if (candidate.status !== 'queued' && !securityHolds.has(candidate.installer_sha256.toLowerCase())) continue;
+      const reason = qaQueueCandidateReason(candidate, now, securityHolds);
+      if (reason === 'installer-security-hold' && waiting.length < 10) {
+        const hold = securityHolds.get(candidate.installer_sha256.toLowerCase())!;
+        waiting.push({ candidate, nextCheckAt: hold.nextCheckAt, sourceRetry: false, securityHold: true, securityReason: hold.reason });
+      }
+      else if (reason === 'source-retry-pending' && waiting.length < 10) waiting.push({ candidate, nextCheckAt: candidate.next_retry_at, sourceRetry: true });
+      else if (!reason && !lookupsClosed && queued.length < 10) chunk.push(candidate);
+    }
+    if (!chunk.length) continue;
+    try {
+      const [blocks, retries] = await Promise.all([
+        getPackageCompatibilityBlocks(supabase, chunk.map(input)),
+        qaSourceRetryAtMany(supabase, chunk.map(qaSourceKey)),
+      ]);
+      for (const candidate of chunk) {
+        if (blocks.has(packageCompatibilityKey(input(candidate)))) {
+          // The same locked grant predicate used by dispatch preserves all holds.
+          const grant = await supabase.rpc('qa_retest_grant_eligible', { p_candidate_id: candidate.id });
+          if (grant.error) throw grant.error;
+          if (grant.data !== true) continue;
+        }
+        const retryAt = retries.get(qaSourceKey(candidate));
+        if (retryAt) { if (waiting.length < 10) waiting.push({ candidate, nextCheckAt: retryAt, sourceRetry: true }); }
+        else if (queued.length < 10) queued.push(candidate);
+      }
+      rounds++;
+      if (rounds >= 4 || queued.length >= 10) lookupsClosed = true;
+    } catch {
+      // Preserve the verified prefix: never advertise a row beyond an unknown one.
+      console.warn('[qa-live] eligibility lookup failed', { candidateIds: chunk.map(row => row.id), error: 'Eligibility batch could not be verified' });
+      lookupsClosed = true;
+    }
+  }
+  waiting.sort((a, b) => b.candidate.priority - a.candidate.priority || Date.parse(a.candidate.enqueued_at) - Date.parse(b.candidate.enqueued_at) || a.candidate.id.localeCompare(b.candidate.id));
+  let recent = (recentResult.data || []) as ResultRow[];
+  const passed = recent.filter(row => row.outcome === 'Passed');
+  if (passed.length) {
+    try {
+      const resultInput = (row: ResultRow) => ({ wingetId: row.winget_id, version: row.tested_version, architecture: row.architecture, installerSha256: row.installer_sha256 || '' });
+      const blocks = await getPackageCompatibilityBlocks(supabase, passed.map(resultInput));
+      // A diagnostic pass does not lift deployment quarantine. Keep Failed evidence.
+      recent = recent.filter(row => row.outcome !== 'Passed' || (!!row.installer_sha256 && !blocks.has(packageCompatibilityKey(resultInput(row)))));
+    } catch {
+      recent = recent.filter(row => row.outcome !== 'Passed');
+    }
+  }
   const polls = (pollResult.data || []) as PollRow[];
   const consecutivePollFailures = countConsecutiveFailedPolls(polls);
   const ids = [
     ...(current ? [current.winget_id] : []),
     ...queued.map((row) => row.winget_id),
+    ...waiting.slice(0, 10).map(({ candidate }) => candidate.winget_id),
     ...recent.map((row) => row.winget_id),
   ];
   const uniqueIds = [...new Set(ids)];
@@ -497,11 +597,13 @@ export async function getQaLiveSnapshot(): Promise<QaLiveResponse> {
     current,
     queuedCount: countResult.count || 0,
     queued,
+    waiting,
     poll: polls[0] || null,
     consecutivePollFailures,
     recent,
     apps,
     frame,
     control,
+    curated,
   });
 }

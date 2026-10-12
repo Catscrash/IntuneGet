@@ -5,12 +5,16 @@
  */
 
 import { createHmac } from 'node:crypto';
+import { CuratedCatalogError, isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
+import { authorizeCuratedWorkflow } from '@/lib/curated-catalog/server';
+import { assertCuratedLicenceAccepted } from '@/lib/curated-catalog/licence';
 
 import { applyInstallerUrlOverride } from './installer-url-overrides';
 import { reconcileCatalogInstaller } from './catalog-installer-reconciliation';
 import { enforceInstallerPreflight, InstallerPreflightError } from './installer-preflight';
 import { enforceQaGate } from './qa/gate';
 import {
+  resolveApplicationInstallScope,
   resolveApplicationInstallerSuccessCodes,
   resolveApplicationUninstallCommand,
 } from './packaging-adapters';
@@ -61,7 +65,8 @@ export interface WorkflowInputs {
   removeAssignmentsFromPreviousApp?: boolean; // Remove assignments from previous app after carry-over
   autoSupersede?: boolean; // Mark the new app as superseding the previous app
   supersedenceType?: string; // Supersedence type for auto-supersede ('update' | 'replace')
-  sourceType?: 'winget' | 'custom'; // Custom installers are outside winget-pkgs trust validation
+  sourceType?: 'winget' | 'custom' | 'curated';
+  curatedReleaseId?: string;
   packageProfileSha256?: string; // Upstream QA identity; final dispatch recalculates from effective inputs
   packageDependencies?: PackagedWingetDependency[]; // Server-resolved; caller values are never trusted
 }
@@ -132,7 +137,18 @@ export async function triggerPackagingWorkflow(
 
   let effectiveInputs = inputs;
   let trustedInstallers: NormalizedInstaller[] | undefined;
-  if (inputs.sourceType !== 'custom') {
+  if (isCuratedPackageId(inputs.wingetId) || inputs.sourceType === 'curated') {
+    if (inputs.sourceType === 'custom' || inputs.qaOverride || inputs.hashValidationMode === 'calculate') {
+      throw new CuratedCatalogError('Curated releases require their approved validation profile.');
+    }
+    const approved = await authorizeCuratedWorkflow(inputs);
+    // Every hosted dispatch (cart, QA resume, manual and automatic updates,
+    // MSP batches) passes here, so the target tenant's licence acceptance is
+    // enforced for each one regardless of how the job was created.
+    await assertCuratedLicenceAccepted(inputs.tenantId, approved.app.packageId);
+    effectiveInputs = { ...inputs, sourceType: 'curated', curatedReleaseId: approved.release.id };
+    trustedInstallers = [approved.installer];
+  } else if (inputs.sourceType !== 'custom') {
     const resolvedUninstallCommand = resolveApplicationUninstallCommand(
       inputs.wingetId,
       inputs.uninstallCommand,
@@ -141,11 +157,12 @@ export async function triggerPackagingWorkflow(
       inputs.wingetId,
       `REGISTRY_UNINSTALL:${inputs.displayName}`,
     );
-    // A display-name registry marker is the catalog fallback, not a customer
-    // override. Let live manifest reconciliation replace it with a stronger
-    // ProductCode or exact ARP key when the trusted installer now provides one.
+    // Generated catalog fallbacks are not customer overrides. Let trusted
+    // manifest reconciliation replace them with a ProductCode, exact ARP key
+    // or MSIX package identity; preserve real custom uninstall commands.
     const customerUninstallOverride = resolvedUninstallCommand.trim() &&
       resolvedUninstallCommand.trim() !== generatedDisplayUninstallCommand
+      && resolvedUninstallCommand.trim() !== 'MSIX_UNINSTALL:{PACKAGE_NAME}'
       ? resolvedUninstallCommand
       : undefined;
     try {
@@ -213,11 +230,16 @@ export async function triggerPackagingWorkflow(
     installerType: effectiveInputs.installerType,
     installScope: effectiveInputs.installScope,
     sourceType: effectiveInputs.sourceType,
+    curatedReleaseId: effectiveInputs.curatedReleaseId,
   }, trustedInstallers);
   inputs = effectiveInputs.sourceType === 'custom'
     ? effectiveInputs
     : {
         ...effectiveInputs,
+        installScope: resolveApplicationInstallScope(
+          effectiveInputs.wingetId,
+          effectiveInputs.installScope
+        ),
         installerSuccessCodes: resolveApplicationInstallerSuccessCodes(
           effectiveInputs.wingetId,
           effectiveInputs.installerSuccessCodes
@@ -281,6 +303,7 @@ export async function triggerPackagingWorkflow(
     securityOverride: inputs.securityOverride,
     maliciousThreshold: inputs.maliciousThreshold,
     sourceType: inputs.sourceType,
+    curatedReleaseId: inputs.curatedReleaseId,
   });
 
   // Record time before triggering to help find the run
@@ -459,7 +482,7 @@ export async function getWorkflowRuns(
 
 export interface CancelResult {
   success: boolean;
-  status: 'cancelled' | 'not_cancellable' | 'not_found' | 'error';
+  status: 'cancelled' | 'not_cancellable' | 'not_found' | 'not_started' | 'error';
   message: string;
 }
 
@@ -469,6 +492,10 @@ export interface CancelResult {
  * - 202: Accepted (cancellation initiated)
  * - 409: Conflict (workflow already completed or not cancellable)
  * - 404: Not found
+ *
+ * GitHub can leave a dispatched run reported as queued while refusing the
+ * normal cancel with 409 ("has not been queued yet"). The force-cancel
+ * endpoint is tried once before giving up so such runs are not left behind.
  */
 export async function cancelWorkflowRun(
   runId: number | string,
@@ -476,17 +503,21 @@ export async function cancelWorkflowRun(
 ): Promise<CancelResult> {
   const cfg = config || getGitHubActionsConfig();
   // Cancel in private workflows repository
-  const url = `https://api.github.com/repos/${cfg.owner}/${cfg.workflowsRepo}/actions/runs/${runId}/cancel`;
+  const runUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.workflowsRepo}/actions/runs/${runId}`;
+  const post = (action: 'cancel' | 'force-cancel') => fetch(`${runUrl}/${action}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: 'application/vnd.github.v3+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
 
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${cfg.token}`,
-        Accept: 'application/vnd.github.v3+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
+    let response = await post('cancel');
+    if (response.status === 409) {
+      response = await post('force-cancel');
+    }
 
     if (response.status === 202) {
       return {
@@ -526,6 +557,11 @@ export async function cancelWorkflowRun(
     };
   }
 }
+
+/**
+ * GitHub run statuses that mean no runner has started executing the run.
+ */
+export const UNSTARTED_WORKFLOW_RUN_STATUSES = ['queued', 'waiting', 'pending', 'requested'];
 
 /**
  * Get a specific workflow run by ID from the private workflows repository

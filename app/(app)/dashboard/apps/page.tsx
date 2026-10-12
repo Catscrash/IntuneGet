@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { T, Var } from "gt-next";
 import { useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import {
   Package,
   Loader2,
@@ -47,9 +48,11 @@ import {
   ManifestFetchError,
 } from '@/hooks/use-packages';
 import { useDeployedPackages } from '@/hooks/use-deployed-packages';
+import { useTenantDeployments } from '@/hooks/use-tenant-deployments';
 import { useDeployedConfig } from '@/hooks/use-deployed-config';
 import { useBulkAdd } from '@/hooks/use-bulk-add';
 import { useQaStatuses } from '@/hooks/use-qa';
+import { useCuratedReleases } from '@/hooks/use-curated-releases';
 import { useCartStore } from '@/stores/cart-store';
 import type { NormalizedPackage } from '@/types/winget';
 import { getCategoryLabel } from '@/lib/category-utils';
@@ -235,6 +238,7 @@ export default function AppCatalogPage() {
     fetchNextPage,
   } = useInfinitePackages(20, selectedCategory, sortBy, !hasSearched);
   const { deployedSet } = useDeployedPackages();
+  const { tenantDeployments } = useTenantDeployments();
   const {
     data: deploymentIntentData,
     isLoading: isLoadingDeploymentIntent,
@@ -288,6 +292,15 @@ export default function AppCatalogPage() {
 
   const showSearchResults = hasSearched;
   const { data: qaStatusesData } = useQaStatuses(visibleQaIds);
+  const curatedReleases = useCuratedReleases();
+  const curatedAppIds = new Map(
+    !curatedReleases.isError && curatedReleases.data?.expiresAt && Date.parse(curatedReleases.data.expiresAt) > Date.now()
+      ? curatedReleases.data.entries.flatMap(entry =>
+        entry.status === 'approved' && entry.release && entry.app.wingetId
+          ? [[entry.app.wingetId.toLowerCase(), entry.app.id] as const]
+          : [])
+      : []
+  );
   const showCategoryResults = !hasSearched && selectedCategory !== null;
   const activeSortLabel = SORT_OPTIONS.find((option) => option.key === sortBy)?.label || 'Popular';
 
@@ -608,9 +621,11 @@ export default function AppCatalogPage() {
       renderItem={pkg => {
         const Item = viewMode === 'grid' ? AppCard : AppListItem;
         return <Item package={pkg} onSelect={handleSelectPackage}
-          isDeployed={deployedSet.has(pkg.id)} isBulkSelectMode={isBulkSelectMode}
+          isDeployed={deployedSet.has(pkg.id)}
+          tenantDeployedBy={tenantDeployments.get(pkg.id)} isBulkSelectMode={isBulkSelectMode}
           isBulkSelected={selectedPackageIds.has(pkg.id)} onBulkToggle={handleBulkToggle}
-          qaStatus={qaStatusesData?.statuses[pkg.id] ?? null} />;
+          qaStatus={qaStatusesData?.statuses[pkg.id] ?? null}
+          curatedAppId={curatedAppIds.get(pkg.id.toLowerCase())} />;
       }}
     />
   );
@@ -625,10 +640,13 @@ export default function AppCatalogPage() {
           <div className="relative">
             <h1 className="text-display-sm text-text-primary"><T>App Catalog</T></h1>
             <p className="text-text-secondary mt-2 max-w-2xl">
-              <T>Curated Winget packages optimized for quick Intune deployment and predictable packaging workflows.</T>
+              <T>Browse Winget applications or choose reviewed releases from the IntuneGet Curated Catalog.</T>
             </p>
 
             <div className="mt-5 flex flex-wrap items-center gap-2">
+              <Link href="/dashboard/apps/curated" className="inline-flex items-center gap-2 rounded-full border border-accent-cyan/30 bg-accent-cyan/10 px-3 py-1.5 text-sm font-medium text-accent-cyan hover:bg-accent-cyan/20">
+                <Sparkles className="h-4 w-4" /><T>Curated Catalog</T>
+              </Link>
               <span className="inline-flex items-center gap-2 rounded-full border border-overlay/10 bg-bg-surface px-3 py-1.5 text-sm text-text-secondary">
                 <Package className="w-4 h-4 text-accent-cyan" />
                 <span className="font-medium text-text-primary">{categoriesData?.totalApps?.toLocaleString() || '...'}</span>
@@ -919,6 +937,7 @@ export default function AppCatalogPage() {
                         onSelect={handleSelectPackage}
                         isLoading={isLoadingFeatured}
                         deployedSet={deployedSet}
+                        tenantDeployments={tenantDeployments}
                       />
                     </div>
 
@@ -930,6 +949,7 @@ export default function AppCatalogPage() {
                           onSelect={handleSelectPackage}
                           onSeeAll={handleSeeAll}
                           deployedSet={deployedSet}
+                        tenantDeployments={tenantDeployments}
                         />
                       ))}
                     </div>

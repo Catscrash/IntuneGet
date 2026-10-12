@@ -1,4 +1,6 @@
 import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
+import { insertQaCandidate } from '@/lib/qa/candidate-insert';
+import { getPackageCompatibilityBlock } from '@/lib/package-eligibility';
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import {
@@ -46,6 +48,7 @@ import {
 } from '@/lib/winget-sync-resolution.mjs';
 import { shouldReactivateSupersededCandidate } from '@/lib/qa/candidate-reactivation';
 import { isAuthorizedCronRequest } from '@/lib/cron-auth';
+import { QA_PRIORITY_DEMAND } from '@/lib/qa/constants';
 
 const BATCH_SIZE = 3;
 const POLL_STATE_ID = 'microsoft/winget-pkgs';
@@ -53,7 +56,8 @@ const INITIAL_LOOKBACK_MINUTES = 30;
 const MAX_RECORDED_ERRORS = 100;
 const MAX_ERROR_LENGTH = 1_000;
 const TOOLCHAIN_BACKFILL_BATCH_SIZE = 3;
-const TOOLCHAIN_BACKFILL_PAGE_SIZE = 1_000;
+const TOOLCHAIN_BACKFILL_PAGE_SIZE = 100;
+const TOOLCHAIN_BACKFILL_MAX_PAGES = 2;
 // Reconciliation is metadata-only until an immutable installer payload is
 // found without a prior pass. Keep VM execution serialized, but scan enough
 // deployed-app demand per poll to avoid spending hours reclassifying known
@@ -182,6 +186,24 @@ function hasInteractiveCatalogQaProfile(testConfig: unknown): boolean {
 async function findToolchainBackfillIds(
   supabase: ReturnType<typeof createServerClient>
 ): Promise<{ ids: string[]; pagesScanned: number }> {
+  const stateId = `toolchain-backfill:${QA_PSADT_TOOLCHAIN.packagerCommit}`;
+  const { data: saved, error: stateError } = await supabase.from('qa_automation_state')
+    .select('value').eq('id', stateId).maybeSingle();
+  if (stateError) throw new Error(`Could not read QA backfill checkpoint: ${stateError.message}`);
+  const checkpoint = object(saved?.value);
+  let after = typeof checkpoint.after === 'string' ? checkpoint.after : '';
+  const pending = Array.isArray(checkpoint.pending)
+    ? checkpoint.pending.filter((id): id is string => typeof id === 'string') : [];
+  const finish = async (ids: string[], pagesScanned: number) => {
+    const { error } = await supabase.from('qa_automation_state').upsert({
+      id: stateId,
+      value: { after, pending: ids.slice(TOOLCHAIN_BACKFILL_BATCH_SIZE) },
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw new Error(`Could not save QA backfill checkpoint: ${error.message}`);
+    return { ids: ids.slice(0, TOOLCHAIN_BACKFILL_BATCH_SIZE), pagesScanned };
+  };
+  if (pending.length) return finish(pending, 0);
   const decidedIds = new Set<string>();
   const supportedStaleCandidates: QaToolchainBackfillCandidate[] = [];
   const retryTargets = terminalToolchainRetryTargets(QA_PSADT_TOOLCHAIN.packagerCommit);
@@ -217,29 +239,15 @@ async function findToolchainBackfillIds(
       ].map((row) => row.winget_id.trim().toLowerCase())
     );
   }
-  let cursor: { enqueuedAt: string; id: string } | null = null;
   let pagesScanned = 0;
 
-  while (true) {
-    let candidateQuery = supabase
-      .from('qa_candidates')
-      .select(
-        'id, winget_id, version, architecture, installer_sha256, enqueued_at, package_profile_sha256, test_config, status, priority, demand_source'
-      )
-      .eq('test_level', 'psadt-package')
-      .not('package_profile_sha256', 'is', null)
-      .order('enqueued_at', { ascending: false })
-      .order('id', { ascending: false })
-      .limit(TOOLCHAIN_BACKFILL_PAGE_SIZE);
-    if (cursor) {
-      candidateQuery = candidateQuery.or(
-        `enqueued_at.lt.${cursor.enqueuedAt},and(enqueued_at.eq.${cursor.enqueuedAt},id.lt.${cursor.id})`
-      );
-    }
-
-    const { data, error } = await candidateQuery;
+  while (pagesScanned < TOOLCHAIN_BACKFILL_MAX_PAGES) {
+    const { data, error } = await supabase.rpc('qa_toolchain_backfill_page', {
+      p_after: after, p_limit: TOOLCHAIN_BACKFILL_PAGE_SIZE,
+      p_terminal_retry_ids: [...terminalRetryIds],
+    });
     if (error) throw new Error(`Could not scan prior QA toolchains: ${error.message}`);
-    const rows = (data || []) as QaCandidateProfileRow[];
+    const rows = (data || []) as unknown as QaCandidateProfileRow[];
     pagesScanned++;
 
     let pageStaleRows: QaCandidateProfileRow[] = [];
@@ -381,31 +389,22 @@ async function findToolchainBackfillIds(
       }
     }
 
+    const last = rows.at(-1);
+    after = rows.length < TOOLCHAIN_BACKFILL_PAGE_SIZE ? '' : last?.winget_id || after;
     if (
       supportedStaleCandidates.length >= TOOLCHAIN_BACKFILL_BATCH_SIZE &&
       pendingTerminalRetryIds.size === 0
     ) {
-      return {
-        ids: prioritizeToolchainBackfill(supportedStaleCandidates).slice(
-          0,
-          TOOLCHAIN_BACKFILL_BATCH_SIZE
-        ),
-        pagesScanned,
-      };
+      return finish(prioritizeToolchainBackfill(supportedStaleCandidates), pagesScanned);
     }
     if (rows.length < TOOLCHAIN_BACKFILL_PAGE_SIZE) {
-      return {
-        ids: prioritizeToolchainBackfill(supportedStaleCandidates),
-        pagesScanned,
-      };
+      return finish(prioritizeToolchainBackfill(supportedStaleCandidates), pagesScanned);
     }
-
-    const last = rows.at(-1);
-    if (!last?.enqueued_at || !last.id) {
+    if (!last?.winget_id) {
       throw new Error('Could not advance the QA toolchain backfill cursor.');
     }
-    cursor = { enqueuedAt: last.enqueued_at, id: last.id };
   }
+  return finish(prioritizeToolchainBackfill(supportedStaleCandidates), pagesScanned);
 }
 
 function errorMessage(error: unknown): string {
@@ -658,10 +657,15 @@ export async function GET(request: Request) {
         `WinGet GitHub change feed paused until ${changes.rateLimitedUntil}`
       );
     }
+    // Historical reconciliation must not discard successfully discovered updates.
+    // A failed lane is retried from its checkpoint on the next poll.
     const [backfill, demandBackfillIds, catalogBackfillIds] = await Promise.all([
-      targetedRecovery ? { ids: [] as string[], pagesScanned: 0 } : findToolchainBackfillIds(supabase),
-      targetedRecovery ? [] as string[] : findDemandBackfillIds(supabase),
-      targetedRecovery ? [] as string[] : findIdleCatalogBackfillIds(supabase),
+      targetedRecovery ? { ids: [] as string[], pagesScanned: 0 } : findToolchainBackfillIds(supabase)
+        .catch((error) => { recordPollError(summary, 'toolchain-backfill', error); return { ids: [] as string[], pagesScanned: 0 }; }),
+      targetedRecovery ? [] as string[] : findDemandBackfillIds(supabase)
+        .catch((error) => { recordPollError(summary, 'demand-backfill', error); return [] as string[]; }),
+      targetedRecovery ? [] as string[] : findIdleCatalogBackfillIds(supabase)
+        .catch((error) => { recordPollError(summary, 'catalog-backfill', error); return [] as string[]; }),
     ]);
     toolchainBackfillPagesScanned = backfill.pagesScanned;
     demandBackfillRequestedCount = demandBackfillIds.length;
@@ -828,9 +832,16 @@ export async function GET(request: Request) {
       priorities.set(policy.winget_id, (priorities.get(policy.winget_id) || 0) + 1);
     }
     const demandedIds = new Set<string>(policies.map((policy) => policy.winget_id));
+    // Newly detected updates for deployed/managed apps join the urgent demand
+    // band, served oldest-first but strictly behind waiting customer uploads
+    // (QA_PRIORITY_CUSTOMER). Background backfill retains its lower priority.
+    for (const policy of policies) {
+      if (changedIds.has(policy.winget_id)) priorities.set(policy.winget_id, QA_PRIORITY_DEMAND);
+    }
     for (const deployed of deployedApps) {
       demandedIds.add(deployed.winget_id);
       if (!priorities.has(deployed.winget_id)) priorities.set(deployed.winget_id, 1);
+      if (changedIds.has(deployed.winget_id)) priorities.set(deployed.winget_id, QA_PRIORITY_DEMAND);
     }
     for (const wingetId of backfillIds) {
       if (terminalBackfillIds.has(wingetId.trim().toLowerCase())) {
@@ -1030,6 +1041,23 @@ export async function GET(request: Request) {
               });
               return;
             }
+            const compatibilityBlock = await getPackageCompatibilityBlock(supabase!, {
+              wingetId: app.winget_id,
+              version: resolution.version,
+              architecture,
+              installerSha256,
+            });
+            if (compatibilityBlock) {
+              await persistQaCatalogReconciliation(supabase!, {
+                wingetId: app.winget_id,
+                catalogVersion: app.latest_version!,
+                observedHeadSha: headSha,
+                reasonCode: 'package_compatibility_blocked',
+                observedLiveVersion: resolution.version,
+              });
+              summary.unavailable++;
+              return;
+            }
             const testConfig = buildQaCatalogTestConfig({
               app: { ...app, wingetId: app.winget_id, version: resolution.version },
               manifest,
@@ -1126,9 +1154,7 @@ export async function GET(request: Request) {
               : previousMatches
                 ? 'passed'
                 : 'queued';
-            const { data: inserted, error: insertError } = await supabase!
-              .from('qa_candidates')
-              .insert({
+            const { data: inserted, existing: conflictingCandidate, outcome, error: insertError } = await insertQaCandidate(supabase!, {
                 winget_id: app.winget_id,
                 definition_path: recipe?.definition_path || null,
                 version: resolution.version,
@@ -1161,24 +1187,14 @@ export async function GET(request: Request) {
                     ? now
                     : previous?.tested_at_utc || now,
                 updated_at: now,
-              })
-              .select('id')
-              .single();
+              });
 
-            if (insertError?.code === '23505') {
+            if (insertError) throw insertError;
+            if (!inserted) {
               summary.alreadyKnown++;
-              const { data: existing, error: existingError } = await supabase!
-                .from('qa_candidates')
-                .select('id, status, failure_summary')
-                .eq('winget_id', app.winget_id)
-                .eq('version', resolution.version)
-                .eq('architecture', architecture)
-                .eq('installer_sha256', installerSha256)
-                .eq('package_profile_sha256', packageIdentity.packageProfileSha256)
-                .maybeSingle();
-              if (existingError) {
-                throw new Error(`Could not read the existing QA candidate: ${existingError.message}`);
-              }
+              // A different active profile already owns this payload's lifecycle.
+              // Its run and configuration must remain untouched.
+              const existing = outcome === 'exact_conflict' ? conflictingCandidate : null;
               if (existing && shouldReactivateSupersededCandidate(
                 existing.status,
                 existing.failure_summary,
@@ -1214,7 +1230,7 @@ export async function GET(request: Request) {
                 const { error: priorityError } = await supabase!
                   .from('qa_candidates')
                   .update({
-                    priority: priorities.get(app.winget_id) || 0,
+                    priority: Math.max(existing.priority || 0, priorities.get(app.winget_id) || 0),
                     test_config: testConfig as never,
                     updated_at: now,
                   })
@@ -1224,7 +1240,6 @@ export async function GET(request: Request) {
               }
               return;
             }
-            if (insertError) throw insertError;
 
             summary.updatesFound++;
             if (initialStatus !== 'queued') {

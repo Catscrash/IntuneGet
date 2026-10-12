@@ -152,6 +152,9 @@ function createTestAdapter(): TestAdapter {
   const adapter: TestAdapter = {
     close: () => db.close(),
     jobs: {
+      async getApprovalFailures() {
+        throw new Error('Approval checkpoint tests use the production SQLite adapter');
+      },
       async getByStatus(status: string, limit: number = 10, ascending: boolean = true): Promise<PackagingJob[]> {
         const order = ascending ? 'ASC' : 'DESC';
         const stmt = db.prepare(`

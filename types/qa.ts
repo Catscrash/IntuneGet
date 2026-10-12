@@ -117,6 +117,28 @@ export type QaLivePhase =
   | 'verifying_removal'
   | 'publishing';
 
+export type QaCuratedLivePhase =
+  | 'restoring_vm' | 'inspecting_installer' | 'preparing_package' | 'testing_lifecycle'
+  | 'installing' | 'detecting_install' | 'uninstalling' | 'verifying_removal'
+  | 'installing_previous' | 'detecting_previous' | 'upgrading' | 'detecting_upgrade' | 'final_uninstall' | 'verifying_final_removal' | 'cleaning_up';
+
+export interface QaCuratedLiveCurrent {
+  runKind: 'curated';
+  verification: 'release' | 'custom-settings';
+  wingetId: string;
+  displayName: string;
+  publisher: string;
+  version: string;
+  catalogVersion: string;
+  architecture: QaArchitecture;
+  executionContext: 'LocalSystem';
+  phase: QaCuratedLivePhase | null;
+  phaseStartedAt: string | null;
+  startedAt: string;
+  elapsedSeconds: number;
+  upgradePlanned: boolean;
+}
+
 export interface QaLiveResponse {
   serverTime: string;
   active: boolean;
@@ -132,6 +154,8 @@ export interface QaLiveResponse {
     consecutiveFailures: number;
   };
   current: {
+    /** Optional while an older ordinary response remains in a browser cache. */
+    runKind?: 'ordinary';
     wingetId: string;
     displayName: string;
     publisher: string | null;
@@ -146,9 +170,12 @@ export interface QaLiveResponse {
     phaseStartedAt: string | null;
     startedAt: string;
     elapsedSeconds: number;
-  } | null;
+  } | QaCuratedLiveCurrent | null;
+  /** Busy without live telemetry never promises that the next candidate started. */
+  vmBusy?: 'catalog_verification' | null;
   viewer: {
     candidateId: string | null;
+    sessionId?: string | null;
     available: boolean;
     capturedAt: string | null;
     sequence: number | null;
@@ -159,6 +186,7 @@ export interface QaLiveResponse {
   log: QaLiveLog | null;
   queue: {
     count: number;
+    waiting: Array<{ wingetId: string; displayName: string; version: string; architecture: QaArchitecture; reason: string; next_check_at: string | null }>;
     next: Array<{
       wingetId: string;
       displayName: string;
@@ -196,6 +224,8 @@ export interface QaVirusTotalSummary {
 
 /** Minimal database row used for card/list status badges. */
 export interface QaStatusRow {
+  installer_sha256?: string | null;
+  deployment_blocked?: boolean;
   winget_id: string;
   outcome: QaOutcome;
   tested_version: string;
@@ -255,6 +285,7 @@ export interface QaResultRow extends QaStatusRow {
 }
 
 export interface QaStatus {
+  deploymentBlocked?: boolean;
   outcome: QaOutcome | 'Queued' | 'Running';
   testedVersion: string;
   architecture: QaArchitecture;
@@ -272,6 +303,7 @@ export interface QaStatus {
 }
 
 export type QaBadgeState =
+  | 'blocked'
   | 'passed'
   | 'failed'
   | 'stale_passed'
@@ -298,6 +330,7 @@ export interface QaClassification {
 }
 
 export interface QaDetailsResponse {
+  deploymentBlocked?: boolean;
   wingetId: string;
   displayName: string;
   publisher: string;
@@ -331,4 +364,23 @@ export interface QaDetailsResponse {
     packagerCommit: string | null;
     contentSha256: string | null;
   };
+}
+
+/** One curated catalog verification run, as shown on the public QA page. */
+export interface CuratedQaRun {
+  runId: string;
+  kind: 'release' | 'config';
+  wingetId: string;
+  displayName: string;
+  testedVersion: string;
+  architecture: string;
+  outcome: 'Passed' | 'Failed';
+  testedAtUtc: string;
+  upgradeTested: boolean | null;
+  upgradeFromVersion: string | null;
+  signatureStatus: string | null;
+  signer: string | null;
+  defenderStatus: string | null;
+  failedStep: string | null;
+  failedMessage: string | null;
 }

@@ -23,6 +23,42 @@ type GenericRelationship = {
 export interface Database {
   public: {
     Tables: {
+      qa_installer_security_holds: {
+        Row: { sha256: string; malicious_verdicts: number; reason: string; first_held_at: string; verdict_at: string; next_check_at: string; checked_at: string | null; released_at: string | null; recheck_lease: string | null; recheck_lease_expires_at: string | null };
+        Insert: { sha256: string; malicious_verdicts: number; first_held_at?: string; verdict_at?: string; next_check_at?: string; checked_at?: string | null; released_at?: string | null };
+        Update: { malicious_verdicts?: number; verdict_at?: string; next_check_at?: string; checked_at?: string | null; released_at?: string | null };
+        Relationships: GenericRelationship[];
+      };
+      qa_automation_state: {
+        Row: { id: string; value: Json; updated_at: string };
+        Insert: { id: string; value: Json; updated_at?: string };
+        Update: { value?: Json; updated_at?: string };
+        Relationships: GenericRelationship[];
+      };
+      qa_repair_requests: {
+        Row: {
+          id: string; candidate_id: string; winget_id: string; version: string; architecture: string;
+          failure_class: 'app_lifecycle' | 'security';
+          status: 'pending' | 'in_progress' | 'requeued' | 'blocked' | 'resolved';
+          prior_requeues: number; failure_summary: string | null; resolution: string | null;
+          created_at: string; updated_at: string;
+        };
+        Insert: {
+          id?: string; candidate_id: string; winget_id: string; version: string; architecture: string;
+          failure_class: 'app_lifecycle' | 'security';
+          status?: 'pending' | 'in_progress' | 'requeued' | 'blocked' | 'resolved';
+          prior_requeues?: number; failure_summary?: string | null; resolution?: string | null;
+          created_at?: string; updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['qa_repair_requests']['Insert']>;
+        Relationships: GenericRelationship[];
+      };
+      qa_source_backoff: {
+        Row: { source_key: string; failure_count: number; next_retry_at: string; last_candidate_id: string; last_attempt: number; updated_at: string };
+        Insert: { source_key: string; failure_count: number; next_retry_at: string; last_candidate_id: string; last_attempt: number; updated_at?: string };
+        Update: Partial<Database['public']['Tables']['qa_source_backoff']['Insert']>;
+        Relationships: GenericRelationship[];
+      };
       installer_health: {
         Row: {
           cache_key: string;
@@ -204,6 +240,9 @@ export interface Database {
       };
       qa_candidates: {
         Row: {
+          next_retry_at: string | null;
+          recovery_attempts: number;
+          recovery_history: Json;
           id: string;
           winget_id: string;
           definition_path: string | null;
@@ -238,6 +277,9 @@ export interface Database {
           updated_at: string;
         };
         Insert: {
+          next_retry_at?: string | null;
+          recovery_attempts?: number;
+          recovery_history?: Json;
           id?: string;
           winget_id: string;
           definition_path?: string | null;
@@ -400,6 +442,127 @@ export interface Database {
         >;
         Relationships: GenericRelationship[];
       };
+      curated_licence_attestations: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          app_id: string;
+          attestation_id: string;
+          attestation_version: string;
+          accepted_by_user_id: string;
+          accepted_by_email: string | null;
+          accepted_at: string;
+        };
+        Insert: Omit<
+          Database['public']['Tables']['curated_licence_attestations']['Row'],
+          'id' | 'accepted_at'
+        > & {
+          id?: string;
+          accepted_at?: string;
+        };
+        Update: Partial<
+          Database['public']['Tables']['curated_licence_attestations']['Insert']
+        >;
+        Relationships: GenericRelationship[];
+      };
+      curated_verification_queue: {
+        Row: {
+          id: string; verification_key: string; app_id: string; version: string;
+          kind: 'release' | 'config'; inputs: Json; priority: number;
+          status: 'queued' | 'dispatched' | 'completed' | 'superseded';
+          enqueued_at: string; dispatched_at: string | null; finished_at: string | null;
+          github_run_id: string | null; updated_at: string;
+        };
+        Insert: {
+          id?: string; verification_key: string; app_id: string; version: string;
+          kind: 'release' | 'config'; inputs: Json; priority?: number; status?: string;
+          enqueued_at?: string; dispatched_at?: string | null; finished_at?: string | null;
+          github_run_id?: string | null; updated_at?: string;
+        };
+        Update: {
+          status?: 'queued' | 'dispatched' | 'completed' | 'superseded';
+          github_run_id?: string | null; dispatched_at?: string | null;
+          finished_at?: string | null; updated_at?: string;
+        };
+        Relationships: GenericRelationship[];
+      };
+      curated_config_verifications: {
+        Row: {
+          id: string;
+          release_id: string;
+          app_id: string;
+          winget_id: string;
+          version: string;
+          psadt_config_sha256: string;
+          psadt_config: Json;
+          status: 'requested' | 'verifying' | 'passed' | 'failed';
+          github_run_id: string | null;
+          execution_profile_sha256: string | null;
+          packager_commit: string | null;
+          failure_detail: string | null;
+          tenant_id: string | null;
+          requested_by_user_id: string | null;
+          requested_at: string;
+          updated_at: string;
+          verified_at: string | null;
+        };
+        Insert: Pick<
+          Database['public']['Tables']['curated_config_verifications']['Row'],
+          'release_id' | 'app_id' | 'winget_id' | 'version' | 'psadt_config_sha256' | 'psadt_config'
+        > & Partial<Database['public']['Tables']['curated_config_verifications']['Row']>;
+        Update: Partial<
+          Database['public']['Tables']['curated_config_verifications']['Row']
+        >;
+        Relationships: GenericRelationship[];
+      };
+      curated_qa_runs: {
+        Row: {
+          github_run_id: string;
+          github_run_attempt: number;
+          kind: 'release' | 'config';
+          winget_id: string;
+          app_id: string;
+          display_name: string;
+          publisher: string;
+          tested_version: string;
+          architecture: string;
+          outcome: 'Passed' | 'Failed';
+          tested_at_utc: string;
+          candidate_id: string;
+          config_verification_id: string | null;
+          installer_type: string | null;
+          installer_url: string | null;
+          installer_sha256: string | null;
+          install_command: string | null;
+          uninstall_command: string | null;
+          silent_args: string | null;
+          detection: Json;
+          phase_results: Json;
+          psadt_config: Json | null;
+          psadt_config_sha256: string | null;
+          package_profile_sha256: string | null;
+          packager_commit: string | null;
+          upgrade_from_version: string | null;
+          upgrade_tested: boolean | null;
+          signature_status: string | null;
+          signer: string | null;
+          defender_status: string | null;
+          defender_signature_version: string | null;
+          failed_phase: string | null;
+          failed_step: string | null;
+          failed_message: string | null;
+          failed_lifecycle: string | null;
+          failed_signature: string | null;
+          failed_location: string | null;
+          workflow_commit: string | null;
+          website_commit: string | null;
+          github_run_url: string;
+          synced_at: string;
+        };
+        Insert: Omit<Database['public']['Tables']['curated_qa_runs']['Row'], 'synced_at'> & { synced_at?: string };
+        Update: Partial<Database['public']['Tables']['curated_qa_runs']['Row']>;
+        Relationships: GenericRelationship[];
+      };
       package_eligibility_blocks: {
         Row: {
           winget_id: string;
@@ -518,6 +681,32 @@ export interface Database {
         Update: Partial<Database['public']['Tables']['qa_poll_runs']['Insert']>;
         Relationships: GenericRelationship[];
       };
+      qa_live_sessions: {
+        Row: {
+          id: string; run_kind: 'curated'; queue_id: string; verification: 'release' | 'custom-settings';
+          app_id: string; version: string; architecture: string; upgrade_planned: boolean; public_frames: boolean;
+          github_run_id: number; github_run_attempt: number; state: 'active' | 'ended';
+          end_reason: 'ended' | 'superseded' | 'dispatch_inactive' | 'expired' | null;
+          phase: string | null; phase_started_at: string | null; started_at: string; heartbeat_at: string; ended_at: string | null;
+          frames_cleaned_at: string | null;
+        };
+        Insert: {
+          id?: string; run_kind?: 'curated'; queue_id: string; verification: 'release' | 'custom-settings';
+          app_id: string; version: string; architecture: string; upgrade_planned: boolean; public_frames: boolean;
+          github_run_id: number; github_run_attempt: number; state?: 'active' | 'ended';
+          end_reason?: 'ended' | 'superseded' | 'dispatch_inactive' | 'expired' | null;
+          phase?: string | null; phase_started_at?: string | null; started_at?: string; heartbeat_at?: string; ended_at?: string | null;
+          frames_cleaned_at?: string | null;
+        };
+        Update: Partial<Database['public']['Tables']['qa_live_sessions']['Insert']>;
+        Relationships: GenericRelationship[];
+      };
+      qa_live_session_frames: {
+        Row: { session_id: string; object_path: string; sequence: number; captured_at: string; width: number; height: number; byte_size: number; updated_at: string };
+        Insert: { session_id: string; object_path: string; sequence: number; captured_at: string; width: number; height: number; byte_size: number; updated_at?: string };
+        Update: Partial<Database['public']['Tables']['qa_live_session_frames']['Insert']>;
+        Relationships: GenericRelationship[];
+      };
       qa_live_frames: {
         Row: {
           candidate_id: string;
@@ -567,9 +756,6 @@ export interface Database {
           id: string;
           email: string | null;
           name: string | null;
-          microsoft_access_token: string | null;
-          microsoft_refresh_token: string | null;
-          token_expires_at: string | null;
           intune_tenant_id: string | null;
           tenant_name: string | null;
           profile_image: string | null;
@@ -580,9 +766,6 @@ export interface Database {
           id: string;
           email?: string | null;
           name?: string | null;
-          microsoft_access_token?: string | null;
-          microsoft_refresh_token?: string | null;
-          token_expires_at?: string | null;
           intune_tenant_id?: string | null;
           tenant_name?: string | null;
           profile_image?: string | null;
@@ -593,9 +776,6 @@ export interface Database {
           id?: string;
           email?: string | null;
           name?: string | null;
-          microsoft_access_token?: string | null;
-          microsoft_refresh_token?: string | null;
-          token_expires_at?: string | null;
           intune_tenant_id?: string | null;
           tenant_name?: string | null;
           profile_image?: string | null;
@@ -826,6 +1006,7 @@ export interface Database {
           presentation_profile_sha256: string | null;
           qa_candidate_id: string | null;
           qa_requested_at: string | null;
+          qa_resume_due_at: string;
           qa_completed_at: string | null;
         };
         Insert: {
@@ -878,6 +1059,7 @@ export interface Database {
           presentation_profile_sha256?: string | null;
           qa_candidate_id?: string | null;
           qa_requested_at?: string | null;
+          qa_resume_due_at?: string;
           qa_completed_at?: string | null;
         };
         Update: {
@@ -930,6 +1112,7 @@ export interface Database {
           presentation_profile_sha256?: string | null;
           qa_candidate_id?: string | null;
           qa_requested_at?: string | null;
+          qa_resume_due_at?: string;
           qa_completed_at?: string | null;
         };
         Relationships: GenericRelationship[];
@@ -1629,8 +1812,6 @@ export interface Database {
           error_message: string | null;
           started_at: string | null;
           completed_at: string | null;
-          created_at: string;
-          updated_at: string;
         };
         Insert: {
           id?: string;
@@ -1642,8 +1823,6 @@ export interface Database {
           error_message?: string | null;
           started_at?: string | null;
           completed_at?: string | null;
-          created_at?: string;
-          updated_at?: string;
         };
         Update: {
           id?: string;
@@ -1655,8 +1834,6 @@ export interface Database {
           error_message?: string | null;
           started_at?: string | null;
           completed_at?: string | null;
-          created_at?: string;
-          updated_at?: string;
         };
         Relationships: GenericRelationship[];
       };
@@ -2451,6 +2628,53 @@ export interface Database {
       };
     };
     Functions: {
+      next_qa_curated_security_eligible: { Args: Record<string, never>; Returns: Json };
+      qa_installer_security_waiting_errors: { Args: Record<string, never>; Returns: Json };
+      qa_curated_installer_security_held: { Args: { p_inputs: Json }; Returns: boolean };
+      refresh_qa_installer_security_holds: { Args: Record<string, never>; Returns: number };
+      record_qa_installer_security_refusal: { Args: { p_candidate_id: string; p_run_id: string; p_sha256: string; p_malicious: number; p_observed_at: string }; Returns: undefined };
+      claim_qa_installer_security_rechecks: { Args: { p_secret: string; p_candidate_id: string; p_limit: number }; Returns: Json };
+      complete_qa_installer_security_recheck: { Args: { p_secret: string; p_sha256: string; p_lease: string; p_malicious: number; p_suspicious: number; p_total_engines: number; p_analyzed_at: string }; Returns: boolean };
+      begin_qa_live_curated_session: {
+        Args: { p_app_id: string; p_version: string; p_architecture: string; p_upgrade_planned: boolean; p_host_custom_config: boolean; p_run_id: number | string; p_run_attempt: number };
+        Returns: Json;
+      };
+      publish_qa_live_curated_phase: {
+        Args: { p_session_id: string; p_run_id: number | string; p_run_attempt: number; p_phase: string; p_observed_at: string };
+        Returns: boolean;
+      };
+      authorize_qa_live_curated_frame: {
+        Args: { p_session_id: string; p_run_id: number | string; p_run_attempt: number; p_captured_at: string };
+        Returns: boolean;
+      };
+      publish_qa_live_curated_frame_metadata: {
+        Args: { p_session_id: string; p_run_id: number | string; p_run_attempt: number; p_object_path: string; p_sequence: number; p_captured_at: string; p_width: number; p_height: number; p_byte_size: number };
+        Returns: boolean;
+      };
+      end_qa_live_curated_session: {
+        Args: { p_session_id: string; p_run_id: number | string; p_run_attempt: number };
+        Returns: Json;
+      };
+      insert_qa_candidate_if_absent: {
+        Args: { p_candidate: Json };
+        Returns: Json;
+      };
+      claim_qa_work: {
+        Args: { p_kind: 'ordinary' | 'curated'; p_id: string; p_packager_commit: string };
+        Returns: Json;
+      };
+      qa_retest_grant_eligible: {
+        Args: { p_candidate_id: string };
+        Returns: boolean;
+      };
+      qa_toolchain_backfill_page: {
+        Args: { p_after?: string; p_limit?: number; p_terminal_retry_ids?: string[] };
+        Returns: Json;
+      };
+      record_qa_source_failure: {
+        Args: { p_source_key: string; p_candidate_id: string; p_attempt: number };
+        Returns: string;
+      };
       authorize_qa_live_frame_ingest: {
         Args: {
           p_secret: string;

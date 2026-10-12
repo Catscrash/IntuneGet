@@ -9,7 +9,7 @@ import { getDatabase } from '@/lib/db';
 import { getCatalogSource } from '@/lib/catalog';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
-import type { AppUpdatePolicyInput, AppUpdatePolicy, DeploymentConfig } from '@/types/update-policies';
+import type { AppUpdatePolicyInput, DeploymentConfig } from '@/types/update-policies';
 import type { Json } from '@/types/database';
 
 /**
@@ -33,15 +33,12 @@ export async function GET(request: NextRequest) {
     // auto-update work in Supabase-less SQLite installs too. They used to
     // answer 503 here, which left the Updates page with no way to silence or
     // hold back an app.
-    const policies = await getDatabase().updatePolicies.getByUserId(
+    const policies = await getDatabase().updatePolicies.list(
       user.userId,
-      tenantId
+      tenantId ?? undefined
     );
 
-    return NextResponse.json({
-      policies: policies as unknown as AppUpdatePolicy[],
-      count: policies.length,
-    });
+    return NextResponse.json({ policies, count: policies.length });
   } catch {
     return NextResponse.json(
       { error: 'Internal server error' },
@@ -161,21 +158,23 @@ export async function POST(request: NextRequest) {
 
     // One policy per user, tenant and app: the adapter upserts on that triple
     // so the bell-icon dropdown can set a policy without first looking one up.
-    const { policy, created } = await db.updatePolicies.upsert({
+    const existing = await db.updatePolicies.getByKey(
+      user.userId,
+      body.tenant_id,
+      body.winget_id
+    );
+    const policy = await db.updatePolicies.upsert({
       user_id: user.userId,
       tenant_id: body.tenant_id,
       winget_id: body.winget_id,
       policy_type: body.policy_type,
       pinned_version: body.policy_type === 'pin_version' ? derivedPinnedVersion : null,
-      deployment_config: (derivedDeploymentConfig || null) as Record<string, unknown> | null,
+      deployment_config: derivedDeploymentConfig || null,
       original_upload_history_id: derivedOriginalUploadHistoryId,
       is_enabled: body.is_enabled ?? true,
     });
 
-    return NextResponse.json({
-      policy: policy as unknown as AppUpdatePolicy,
-      created,
-    });
+    return NextResponse.json({ policy, created: !existing });
   } catch {
     return NextResponse.json(
       { error: 'Internal server error' },

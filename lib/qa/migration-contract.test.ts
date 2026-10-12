@@ -2,6 +2,35 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+describe('SSMS 22.10.2 exact-payload hold', () => {
+  it('holds the shared QA/customer tuple and preserves all dispatched evidence', () => {
+    const sql = readFileSync(resolve(process.cwd(),
+      'supabase/migrations/20261003115631_quarantine_ssms22_failed_managed_lifecycle.sql'), 'utf8');
+    expect(sql).toContain('insert into public.qa_package_blocks');
+    expect(sql).toContain("'Microsoft.SQLServerManagementStudio.22', '22.10.2', 'x64'");
+    expect(sql).toContain('E7B3885D3A0FEBB83B7A5CB155EFD8410A9A651A1BE16EAAA35D594C4D1D75D2');
+    expect(sql).toContain("'failed_managed_lifecycle'");
+    expect(sql).toContain('37119022165 returned 60001/1/60001/1');
+    expect(sql).toContain("and status = 'queued' and dispatched_at is null and github_run_id is null");
+    expect(sql).not.toMatch(/delete from|qa_pipeline_control|package_eligibility_blocks|status = 'passed'/i);
+  });
+});
+
+describe('OpenBVE unattended removal eligibility', () => {
+  it('blocks customer and QA eligibility while preserving dispatched and terminal evidence', () => {
+    const sql = readFileSync(resolve(process.cwd(),
+      'supabase/migrations/20260919235112_block_openbve_unsupported_managed_uninstall.sql'), 'utf8');
+    expect(sql).toContain('insert into public.package_eligibility_blocks');
+    expect(sql).toContain("'leezer3.OpenBVE'");
+    expect(sql).toContain("'unsupported_managed_uninstall'");
+    expect(sql).toContain('set is_verified = false');
+    expect(sql).toContain("and status = 'queued'");
+    expect(sql).toContain('and dispatched_at is null');
+    expect(sql).toContain('and github_run_id is null');
+    expect(sql).not.toMatch(/delete from|qa_pipeline_control|status = 'passed'/i);
+  });
+});
+
 const migrationPaths = [
   'supabase/migrations/20260807193111_qa_release_gate.sql',
   'supabase/migrations/20260807205000_qa_candidate_terminal_evidence.sql',
@@ -122,6 +151,113 @@ describe('QA failed-lifecycle fail-close migration contract', () => {
     expect(sql).toContain('insert into public.version_history');
     expect(sql).toContain("when normalized_outcome = 'retry' and attempts < 2 then 'queued'");
     expect(sql).toContain("when normalized_outcome = 'retry' then 'error'");
+  });
+});
+
+describe('QA per-application repair requests replace the global pause', () => {
+  const sql = readFileSync(
+    resolve(
+      process.cwd(),
+      'supabase/migrations/20261006094500_qa_repair_requests_without_global_pause.sql'
+    ),
+    'utf8'
+  );
+  const failureBlock = sql.slice(
+    sql.indexOf("if normalized_outcome = 'failed' then"),
+    sql.indexOf('-- Only catalog-default candidates')
+  );
+
+  it('never pauses the global dispatcher for a failed lifecycle', () => {
+    expect(failureBlock).not.toContain('qa_pipeline_control');
+    expect(sql).not.toContain("updated_by = 'qa-result-fail-close'");
+    expect(failureBlock).toContain('insert into public.qa_repair_requests');
+    expect(failureBlock).toContain('on conflict (candidate_id) do nothing');
+  });
+
+  it('blocks security verdicts and caps repairs at three re-queues per app and architecture', () => {
+    expect(failureBlock).toContain("ilike '%VirusTotal%'");
+    expect(failureBlock).toContain("earlier.status = 'requeued'");
+    expect(failureBlock).toContain('earlier.architecture = candidate.architecture');
+    expect(failureBlock).toContain(
+      "case when is_security_failure or prior_requeue_count >= 3 then 'blocked' else 'pending' end"
+    );
+  });
+
+  it('keeps the repair queue private', () => {
+    expect(sql).toContain('alter table public.qa_repair_requests enable row level security');
+    expect(sql).toContain('revoke all on table public.qa_repair_requests from public, anon, authenticated');
+  });
+
+  it('preserves the retry, promotion and credential contracts of the result function', () => {
+    expect(sql).toContain("when normalized_outcome = 'retry' and attempts < 2 then 'queued'");
+    expect(sql).toContain("when normalized_outcome = 'retry' then 'error'");
+    expect(sql).toContain('insert into public.version_history');
+    expect(sql).toContain("raise insufficient_privilege using message = 'Invalid QA synchronization credential'");
+    expect(sql).toContain('grant execute on function public.report_qa_candidate_result(text, uuid, text, text) to anon');
+  });
+});
+
+describe('QA repair requests block only with a confirmed root cause', () => {
+  const sql = readFileSync(
+    resolve(
+      process.cwd(),
+      'supabase/migrations/20261006124500_qa_repair_block_requires_confirmed_root_cause.sql'
+    ),
+    'utf8'
+  );
+
+  it('allows blocked only for security, a spent re-queue budget, or a confirmed root cause', () => {
+    expect(sql).toContain('add constraint qa_repair_requests_block_requires_root_cause check');
+    expect(sql).toContain("status <> 'blocked'");
+    expect(sql).toContain("or failure_class = 'security'");
+    expect(sql).toContain('or prior_requeues >= 3');
+    expect(sql).toContain("or coalesce(resolution, '') ~ '^Confirmed root cause: .{20,}'");
+  });
+
+  it('reopens app failures that were blocked without a confirmed root cause', () => {
+    const reopen = sql.slice(sql.indexOf('update public.qa_repair_requests'), sql.indexOf('alter table'));
+    expect(reopen).toContain("set status = 'pending'");
+    expect(reopen).toContain("failure_class = 'app_lifecycle'");
+    expect(reopen).toContain('prior_requeues < 3');
+    expect(reopen).toContain("!~ '^Confirmed root cause: '");
+    expect(sql.indexOf('update public.qa_repair_requests')).toBeLessThan(sql.indexOf('add constraint'));
+  });
+});
+
+describe('QA repair requests track retests of the same candidate', () => {
+  const sql = readFileSync(
+    resolve(
+      process.cwd(),
+      'supabase/migrations/20261006143000_qa_repair_requeue_same_candidate.sql'
+    ),
+    'utf8'
+  );
+  const failureBlock = sql.slice(
+    sql.indexOf("if normalized_outcome = 'failed' then"),
+    sql.indexOf("if normalized_outcome = 'passed' then")
+  );
+
+  it('reopens a re-queued request when its candidate fails again and spends the budget', () => {
+    expect(failureBlock).toContain('on conflict (candidate_id) do update');
+    expect(failureBlock).toContain('set prior_requeues = public.qa_repair_requests.prior_requeues + 1');
+    expect(failureBlock).toContain('or public.qa_repair_requests.prior_requeues + 1 >= 3 then \'blocked\'');
+    expect(failureBlock).toContain("where public.qa_repair_requests.status = 'requeued'");
+    expect(failureBlock).not.toContain('do nothing');
+  });
+
+  it('resolves a re-queued request when its retest passes', () => {
+    const passBlock = sql.slice(
+      sql.indexOf("if normalized_outcome = 'passed' then"),
+      sql.indexOf('-- Only catalog-default candidates')
+    );
+    expect(passBlock).toContain("set status = 'resolved'");
+    expect(passBlock).toContain("and status = 'requeued'");
+  });
+
+  it('never pauses the dispatcher and keeps the credential and grant contract', () => {
+    expect(sql).not.toContain('qa_pipeline_control');
+    expect(sql).toContain("raise insufficient_privilege using message = 'Invalid QA synchronization credential'");
+    expect(sql).toContain('grant execute on function public.report_qa_candidate_result(text, uuid, text, text) to anon');
   });
 });
 
@@ -1672,6 +1808,20 @@ describe('QA idle catalog backfill migration contract', () => {
     expect(sql).toContain('from public.qa_package_blocks as block');
     expect(sql).toContain('candidate.version = app.latest_version');
     expect(sql).toContain('poll_state.head_sha = reconciliation.observed_head_sha');
+  });
+});
+
+describe('Retry-aware idle catalog backfill migration contract', () => {
+  const sql = readFileSync(resolve(process.cwd(),
+    'supabase/migrations/20261008080541_qa_idle_catalog_backfill_due_waiting_work.sql'), 'utf8');
+  it('yields to due or active work and preserves private execution', () => {
+    expect(sql).toContain("waiting_work.status = 'queued' and waiting_work.next_retry_at <= now()");
+    expect(sql).toContain("active_work.status in ('dispatched', 'running')");
+    expect(sql).toContain('security invoker');
+    expect(sql).toContain("set search_path = ''");
+    expect(sql).toContain('from public, anon, authenticated');
+    expect(sql).toContain('to service_role');
+    expect(sql).not.toContain('alter table');
   });
 });
 

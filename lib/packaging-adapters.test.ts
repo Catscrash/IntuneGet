@@ -10,6 +10,58 @@ import {
 } from './packaging-adapters';
 
 describe('application packaging adapters', () => {
+  it('adds documented silent removal only to the exact Bandizip identity', () => {
+    for (const id of ['Bandisoft.Bandizip', ' bandisoft.bandizip ']) {
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedUninstallArguments).toEqual(['/S']);
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+      expect(resolveApplicationUninstallCommand(id, 'REGISTRY_UNINSTALL_KEY:Bandizip:Bandizip')).toBe('REGISTRY_UNINSTALL_KEY:Bandizip:Bandizip');
+    }
+    for (const id of ['Bandisoft.Bandizip.MSE', 'Other.App']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedUninstallArguments || []).toEqual([]);
+    }
+  });
+  it('adds Mozilla silent removal to the curated Firefox ESR identity only', () => {
+    expect(applyApplicationPackagingAdapter('IntuneGet.Curated.FirefoxESR', DEFAULT_PSADT_CONFIG).reviewedUninstallArguments).toEqual(['/S']);
+    for (const id of ['IntuneGet.Curated.Chrome', 'Mozilla.Firefox.ESR']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedUninstallArguments || []).toEqual([]);
+    }
+  });
+  it('adds Mozilla silent removal only to the exact curated Firefox Stable identity', () => {
+    for (const id of ['IntuneGet.Curated.Firefox', ' intuneget.curated.firefox ']) {
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedUninstallArguments).toEqual(['/S']);
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+    for (const id of ['Mozilla.Firefox', 'IntuneGet.Curated.FirefoxBeta', 'Other.Firefox']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedUninstallArguments || []).toEqual([]);
+    }
+  });
+  it('adds Mozilla silent removal only to the exact curated Thunderbird identity', () => {
+    expect(applyApplicationPackagingAdapter('IntuneGet.Curated.Thunderbird', DEFAULT_PSADT_CONFIG).reviewedUninstallArguments).toEqual(['/S']);
+    for (const id of ['Mozilla.Thunderbird', 'IntuneGet.Curated.ThunderbirdBeta']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedUninstallArguments || []).toEqual([]);
+    }
+  });
+  it('binds ZWCAD packaged removal only to the reviewed 2025 and 2026 editions', () => {
+    for (const id of ['ZWSOFT.ZWCAD.2025', ' zwsoft.zwcad.2025 ', 'ZWSOFT.ZWCAD.2026', ' zwsoft.zwcad.2026 ']) {
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedExactUninstall).toEqual({
+        executablePath: '%PackageInstaller%', arguments: ['/q', '/u'], completionTimeoutMinutes: 10,
+      });
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+    for (const id of ['ZWSOFT.ZWCAD.2027', 'ZWSOFT.ZWCAD.Personal', 'ZWSOFT.ZWCAD.Mechanical.2026', 'ZWSOFT.NetworkLicenseManager', 'Other.App']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedExactUninstall).toBeUndefined();
+    }
+  });
+  it('binds only the reviewed Kiwix Electron identity and preserves custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:149170a6-d630-5e6f-a054-8c34dd8a32a2:Wikivoyage by Kiwix';
+    expect(resolveApplicationUninstallCommand(' Kiwix.Wikivoyage.Electron ', 'REGISTRY_UNINSTALL:Wikivoyage by Kiwix Electron Edition')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Kiwix.Wikivoyage.Electron', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Kiwix.Wikivoyage.Other', 'REGISTRY_UNINSTALL:Wikivoyage by Kiwix Electron Edition')).toBe('REGISTRY_UNINSTALL:Wikivoyage by Kiwix Electron Edition');
+    expect(resolveApplicationUninstallCommand('Kiwix.Wikivoyage.Electron', 'custom.exe /remove')).toBe('custom.exe /remove');
+  });
   it('adds unattended removal only to the exact Product Portal identity', () => {
     for (const id of ['iZotope.ProductPortal', ' izotope.productportal ']) {
       const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
@@ -20,6 +72,35 @@ describe('application packaging adapters', () => {
     expect(applyApplicationPackagingAdapter('iZotope.Other', DEFAULT_PSADT_CONFIG)
       .reviewedUninstallArguments).toEqual(DEFAULT_PSADT_CONFIG.reviewedUninstallArguments);
   });
+  it('binds tl;dv to the captured exact NSIS key without changing custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:d4ef7abc-e624-5946-b915-b84166f8a4bf:tldv';
+    expect(resolveApplicationUninstallCommand(' tldx.tldv ', 'REGISTRY_UNINSTALL:tl;dv')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('tldx.tldv', 'REGISTRY_UNINSTALL_PRODUCT:{D4EF7ABC-E624-5946-B915-B84166F8A4BF}:tl;dv')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('tldx.tldv', 'REGISTRY_UNINSTALL_KEY:other:tl;dv')).toBe('REGISTRY_UNINSTALL_KEY:other:tl;dv');
+    expect(resolveApplicationUninstallCommand('tldx.tldv', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('tldx.Other', 'REGISTRY_UNINSTALL:tl;dv')).toBe('REGISTRY_UNINSTALL:tl;dv');
+    expect(resolveApplicationUninstallCommand('tldx.tldv', 'custom.exe /remove')).toBe('custom.exe /remove');
+  });
+
+  it('binds ZCode generated identities to its bare NSIS key and preserves custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:268ce9e6-a30b-5890-ad18-d4b3ebba5377:ZCode';
+    for (const source of ['REGISTRY_UNINSTALL:Z Code', 'REGISTRY_UNINSTALL_PRODUCT:{268CE9E6-A30B-5890-AD18-D4B3EBBA5377}:Z Code', expected]) {
+      expect(resolveApplicationUninstallCommand(' ZhipuAI.ZCode ', source)).toBe(expected);
+    }
+    for (const custom of ['custom.exe /remove', 'REGISTRY_UNINSTALL_PRODUCT:{00000000-0000-0000-0000-000000000000}:Z Code']) {
+      expect(resolveApplicationUninstallCommand('ZhipuAI.ZCode', custom)).toBe(custom);
+    }
+    expect(resolveApplicationUninstallCommand('ZhipuAI.Other', 'REGISTRY_UNINSTALL:Z Code')).toBe('REGISTRY_UNINSTALL:Z Code');
+  });
+
+  it('binds Zermelo to the captured exact NSIS key without changing custom commands', () => {
+    const expected = 'REGISTRY_UNINSTALL_KEY:Zermelo:Zermelo';
+    expect(resolveApplicationUninstallCommand(' ZermeloSoftwareBV.ZermeloDesktop ', 'REGISTRY_UNINSTALL:Zermelo Desktop')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('ZermeloSoftwareBV.ZermeloDesktop', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('ZermeloSoftwareBV.Other', 'REGISTRY_UNINSTALL:Zermelo Desktop')).toBe('REGISTRY_UNINSTALL:Zermelo Desktop');
+    expect(resolveApplicationUninstallCommand('ZermeloSoftwareBV.ZermeloDesktop', 'custom.exe /remove')).toBe('custom.exe /remove');
+  });
+
   it('binds RackSight to the captured exact NSIS key without changing custom commands', () => {
     const expected = 'REGISTRY_UNINSTALL_KEY:3961d0de-ceb1-54d7-a222-b94c8b534c40:RackSight';
     expect(resolveApplicationUninstallCommand(' AuthorityGate.RackSight ', 'REGISTRY_UNINSTALL:RackSight Desktop')).toBe(expected);
@@ -379,6 +460,9 @@ describe('application packaging adapters', () => {
   });
 
   it('forces reviewed per-user installers out of the LocalSystem profile', () => {
+    expect(resolveApplicationInstallScope('SadeghHayeri.GreenTunnel', 'machine')).toBe('user');
+    expect(resolveApplicationInstallScope(' sadeghhayeri.greentunnel ', undefined)).toBe('user');
+    expect(resolveApplicationInstallScope('SadeghHayeri.Unrelated', 'machine')).toBe('machine');
     expect(
       resolveApplicationInstallScope('Y-ASLant.ElegantClipboard', 'machine')
     ).toBe('user');

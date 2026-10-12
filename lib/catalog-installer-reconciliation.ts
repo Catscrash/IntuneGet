@@ -1,3 +1,5 @@
+import { isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
+import { reconcileCuratedCartItem } from '@/lib/curated-catalog/server';
 import {
   generateInstallCommand,
   generateUninstallCommand,
@@ -128,6 +130,9 @@ export function selectTrustedCatalogInstaller(
 export async function reconcileCatalogInstaller(
   item: Win32CartItem,
 ): Promise<ReconciledCatalogInstaller> {
+  if (isCuratedPackageId(item.wingetId) || item.sourceType === 'curated') {
+    return reconcileCuratedCartItem(item);
+  }
   const installScope = resolveApplicationInstallScope(item.wingetId, item.installScope);
   const installerSelectionScope = resolveApplicationInstallerSelectionScope(
     item.wingetId,
@@ -149,8 +154,7 @@ export async function reconcileCatalogInstaller(
   if (trustedInstallers.length === 0) {
     throw new InstallerPreflightError(
       'MANIFEST_UNAVAILABLE',
-      `The trusted WinGet installer manifest for ${item.wingetId} ${item.version} is unavailable`,
-      true,
+      `Version ${item.version} of ${item.displayName || item.wingetId} is no longer available from WinGet. Review the current version to update your selection.`,
     );
   }
 

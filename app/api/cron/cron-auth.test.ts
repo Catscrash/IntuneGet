@@ -80,7 +80,7 @@ function request(auth: string) {
 
 function makeQuery(result: unknown) {
   const builder: Record<string, unknown> = {};
-  for (const method of ['select', 'eq', 'in', 'lt', 'is', 'order', 'upsert', 'update', 'insert', 'delete']) {
+  for (const method of ['select', 'eq', 'in', 'lt', 'gt', 'is', 'not', 'or', 'order', 'limit', 'range', 'upsert', 'update', 'insert', 'delete']) {
     builder[method] = vi.fn(() => builder);
   }
   builder.then = (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>

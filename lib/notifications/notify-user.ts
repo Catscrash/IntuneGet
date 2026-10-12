@@ -19,6 +19,7 @@ import type {
   NotificationPayload,
   AppUpdate,
 } from '@/types/notifications';
+import { shouldSkipUpdate, type AppUpdatePolicy } from '@/types/update-policies';
 
 interface UserProfile {
   id: string;
@@ -49,7 +50,8 @@ export function shouldSendBasedOnFrequency(frequency: string): boolean {
 
 /**
  * Send email + webhook notifications for a single user's pending updates and
- * mark the delivered ones notified.
+ * mark the delivered ones notified. Updates skipped by the user's ignore or
+ * pin policy are neither sent nor marked notified.
  *
  * @param pendingUpdates Optional preloaded pending rows for the user. When
  *   omitted, the function loads update_check_results rows with notified_at and
@@ -97,6 +99,36 @@ export async function notifyUserOfPendingUpdates(
       return result;
     }
   }
+
+  if (updates.length === 0) {
+    return result;
+  }
+
+  // Respect the per-app update policies the same way the update check and
+  // auto-update paths do: an ignored app, or a pinned app whose detected
+  // version is not the pinned one, never produces a notification. The refresh
+  // route stores rows for those apps too (the Updates page shows them), so
+  // they have to be filtered here.
+  //
+  // Skipped rows are deliberately NOT marked notified. They stay pending and
+  // are skipped again on every run while the policy applies. If the admin
+  // removes the ignore policy or the detected version becomes the pinned one,
+  // the next run notifies about it instead of the update being silently
+  // swallowed. If the policies cannot be loaded, send nothing and leave every
+  // row pending so the next run retries; a late notification is better than
+  // one for an app the admin chose to ignore.
+  const policies = await loadUpdatePolicies(supabase, userId);
+  if ('error' in policies) {
+    result.errors.push(`Error fetching update policies: ${policies.error}`);
+    return result;
+  }
+  const policyByApp = new Map<string, NotificationPolicy>();
+  policies.rows.forEach((policy) => {
+    policyByApp.set(`${policy.tenant_id}:${policy.winget_id}`, policy);
+  });
+  updates = updates.filter(
+    (u) => !shouldSkipUpdate(policyByApp.get(`${u.tenant_id}:${u.winget_id}`), u.latest_version)
+  );
 
   if (updates.length === 0) {
     return result;
@@ -265,6 +297,56 @@ export async function notifyUserOfPendingUpdates(
 
   await markNotified(userId, result.notifiedUpdateIds);
   return result;
+}
+
+type NotificationPolicy = Pick<
+  AppUpdatePolicy,
+  'id' | 'tenant_id' | 'winget_id' | 'policy_type' | 'pinned_version'
+>;
+
+const POLICY_PAGE_SIZE = 1000;
+
+/**
+ * Load every update policy of the user. Paged so a user with more policies
+ * than the Supabase row limit (an MSP across many tenants) still has all of
+ * their ignore and pin policies applied. Keyset paged on the primary key and
+ * ended only by an empty page, so a server max-rows setting below
+ * POLICY_PAGE_SIZE cannot end the read early and drop policies.
+ */
+async function loadUpdatePolicies(
+  supabase: SupabaseClient | null,
+  userId: string
+): Promise<{ rows: NotificationPolicy[] } | { error: string }> {
+  if (!supabase) {
+    // Self-hosted: policies live in the local database, which has no row cap
+    // to page around.
+    try {
+      return { rows: await getDatabase().updatePolicies.list(userId) };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'unknown error' };
+    }
+  }
+  const rows: NotificationPolicy[] = [];
+  let lastId: string | null = null;
+  for (;;) {
+    let query = supabase
+      .from('app_update_policies')
+      .select('id, tenant_id, winget_id, policy_type, pinned_version')
+      .eq('user_id', userId);
+    if (lastId !== null) {
+      query = query.gt('id', lastId);
+    }
+    const { data, error } = await query.order('id', { ascending: true }).limit(POLICY_PAGE_SIZE);
+    if (error) {
+      return { error: error.message };
+    }
+    const page = (data as NotificationPolicy[] | null) || [];
+    if (page.length === 0) {
+      return { rows };
+    }
+    rows.push(...page);
+    lastId = page[page.length - 1].id;
+  }
 }
 
 async function markNotified(userId: string, ids: string[]): Promise<void> {

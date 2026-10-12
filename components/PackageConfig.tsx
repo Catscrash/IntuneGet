@@ -59,7 +59,7 @@ import type {
   CustomPrompt,
   BalloonTipConfig,
 } from '@/types/psadt';
-import type { CartItem, IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
+import type { CartItem, NewCartItem, IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
 import type { AppRelationship } from '@/types/intune';
 import type { EspProfileSelection } from '@/types/esp';
 import { DEFAULT_PSADT_CONFIG, getDefaultProcessesToClose, sanitizeProcessesToClose } from '@/types/psadt';
@@ -70,6 +70,8 @@ import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { generateDetectionRules, generateInstallCommand, generateUninstallCommand } from '@/lib/detection-rules';
 import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
 import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
+import { canUseCustomDetection, validateCustomDetectionRules } from '@/lib/custom-detection';
+import { CustomDetectionEditor, createEmptyDetectionRule } from '@/components/CustomDetectionEditor';
 
 // Strip the auto-appended trailing lines so the description editor shows only
 // the human-authored text: the "Winget: <id>" marker, the legacy product
@@ -92,6 +94,7 @@ function stripSourceMarker(value: string, sourceText?: string): string {
   return result.trimEnd();
 }
 import { useLocaleVariants, usePackageManifest } from '@/hooks/use-packages';
+import { resolveListedWingetVersion } from '@/lib/winget-version';
 import { countryCodeToFlag, cleanPackageName } from '@/lib/locale-utils';
 import { Store } from 'lucide-react';
 
@@ -100,6 +103,8 @@ interface PackageConfigProps {
   installers: NormalizedInstaller[];
   versions?: string[];
   onClose: () => void;
+  replaceCartItemId?: string;
+  onAddedToCart?: () => void;
   isDeployed?: boolean;
   deployedConfig?: CartItem | null;
   intuneAppId?: string | null;
@@ -122,16 +127,21 @@ type ConfigSection =
   | 'branding'
   | 'advanced';
 
-export function PackageConfig({ package: pkg, installers, versions = [], onClose, isDeployed = false, deployedConfig, intuneAppId, storeManifest }: PackageConfigProps) {
+export function PackageConfig({ package: pkg, installers, versions = [], onClose, replaceCartItemId, onAddedToCart, isDeployed = false, deployedConfig, intuneAppId, storeManifest }: PackageConfigProps) {
   const isStoreApp = pkg.appSource === 'store';
 
   // Store app install experience state
   const [storeInstallExperience, setStoreInstallExperience] = useState<'user' | 'system'>('user');
 
   // Selection state - pre-fill from deployed config when available
-  const [selectedVersion, setSelectedVersion] = useState(
-    deployedConfig?.version || pkg.version
-  );
+  const defaultVersion = isStoreApp
+    ? pkg.version
+    : resolveListedWingetVersion(pkg.version, versions) ?? pkg.version;
+  const [selectedVersion, setSelectedVersion] = useState(() => {
+    const requestedVersion = deployedConfig?.version || pkg.version;
+    return isStoreApp ? requestedVersion
+      : resolveListedWingetVersion(requestedVersion, versions) ?? requestedVersion;
+  });
   const [selectedArch, setSelectedArch] = useState<WingetArchitecture>(() => {
     const win32Config = deployedConfig && 'architecture' in deployedConfig ? deployedConfig : null;
     const preferred = win32Config?.architecture || 'x64';
@@ -235,6 +245,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   const [expandedSection, setExpandedSection] = useState<ConfigSection | null>(isStoreApp ? 'assignment' : 'detection');
   const [isAddingToCart, setIsAddingToCart] = useState(false);
   const [processesError, setProcessesError] = useState<string | null>(null);
+  const [customDetectionErrors, setCustomDetectionErrors] = useState<string[]>([]);
   const [addedToCartSuccess, setAddedToCartSuccess] = useState(false);
   const [configMode, setConfigMode] = useState<'quick' | 'advanced'>('quick');
 
@@ -243,7 +254,12 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   const visibleSections = configMode === 'quick' ? quickSections : null; // null = show all
 
   // Cart store
-  const addItem = useCartStore((state) => state.addItem);
+  const addItemToStore = useCartStore((state) => state.addItem);
+  const updateCartItem = useCartStore((state) => state.updateItem);
+  const addItem = (item: NewCartItem) => {
+    if (replaceCartItemId) updateCartItem(replaceCartItemId, item);
+    else addItemToStore(item);
+  };
   const isInCart = useCartStore((state) => state.isInCart);
 
   // Settings update mutation (for deployed apps with known Intune app ID)
@@ -291,17 +307,18 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   // user selects a different version we must re-fetch so the installer URL/SHA
   // (which flow straight into the cart item) match the chosen version rather than
   // silently deploying the latest binary under an older version label.
-  const isNonDefaultVersion = !isStoreApp && !!selectedVersion && selectedVersion !== pkg.version;
-  const { data: versionManifest, isFetching: isFetchingVersionInstallers } = usePackageManifest(
+  const isNonDefaultVersion = !isStoreApp && !!selectedVersion && selectedVersion !== defaultVersion;
+  const { data: versionManifest, isFetching: isFetchingVersionInstallers, error: versionInstallerError } = usePackageManifest(
     pkg.id,
     selectedVersion,
     undefined,
     !isNonDefaultVersion
   );
-  const effectiveInstallers =
-    isNonDefaultVersion && versionManifest?.installers?.length
+  const effectiveInstallers = isNonDefaultVersion
+    ? versionManifest?.manifest.version === selectedVersion && !versionInstallerError
       ? versionManifest.installers
-      : installers;
+      : []
+    : installers;
 
   // Bind installer metadata to both architecture and scope. Some manifests
   // publish separate user and machine entries with different vendor switches
@@ -318,13 +335,30 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
     architectureInstallers.some(
       (installer) => !installer.scope || installer.scope === scope
     );
+  // Customer-authored detection rules are offered only for ordinary catalog
+  // Win32 installers. Curated, MSIX/APPX (including nested) and custom-source
+  // items keep their generated detection.
+  const customDetectionSupported =
+    !isStoreApp &&
+    !!selectedInstaller &&
+    canUseCustomDetection({
+      wingetId: effectiveWingetId,
+      sourceType: deployedConfig?.sourceType ?? 'winget',
+      installerType: selectedInstaller.type,
+      nestedInstallerType: selectedInstaller.nestedInstallerType,
+    });
+  const customDetectionActive = config.customDetection === true && customDetectionSupported;
+  const lastCustomRulesRef = useRef<DetectionRule[] | null>(null);
+  useEffect(() => {
+    if (customDetectionActive) lastCustomRulesRef.current = config.detectionRules;
+  }, [customDetectionActive, config.detectionRules]);
   const availableArchitectures = [...new Set(effectiveInstallers.map((i) => i.architecture))];
   const availableVersions = versions.length > 0 ? versions : (pkg.versions ?? []);
   const hasMultipleVersions = availableVersions.length > 1;
   const inCart = isStoreApp
-    ? isInCart(pkg.packageIdentifier || pkg.id, selectedVersion, undefined, storeInstallExperience)
+    ? isInCart(pkg.packageIdentifier || pkg.id, selectedVersion, undefined, storeInstallExperience, replaceCartItemId)
     : selectedInstaller
-      ? isInCart(effectiveWingetId, selectedVersion, selectedInstaller.architecture, selectedScope)
+      ? isInCart(effectiveWingetId, selectedVersion, selectedInstaller.architecture, selectedScope, replaceCartItemId)
       : false;
 
   const modalRef = useFocusTrap<HTMLDivElement>();
@@ -397,22 +431,39 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   }, [effectiveInstallers, selectedArch]);
 
   // Generate detection rules when installer, version, locale, or marker path changes
-  // Pass effectiveWingetId so locale variant packages get correct detection markers
+  // Pass effectiveWingetId so locale variant packages get correct detection markers.
+  // Customer-authored rules stay fixed while custom detection is on; switching it
+  // off (or selecting an installer that does not support it) restores generated rules.
   useEffect(() => {
-    if (selectedInstaller) {
-      const rules = generateDetectionRules(
-        selectedInstaller,
-        pkg.name,
-        effectiveWingetId,
-        selectedVersion,
-        config.registryMarkerPath
-      );
-      setConfig((prev) => ({
-        ...prev,
-        detectionRules: rules,
-      }));
+    if (!selectedInstaller || customDetectionActive) return;
+    const rules = generateDetectionRules(
+      selectedInstaller,
+      pkg.name,
+      effectiveWingetId,
+      selectedVersion,
+      config.registryMarkerPath
+    );
+    setConfig((prev) => {
+      if (prev.customDetection !== true) return { ...prev, detectionRules: rules };
+      const { customDetection: _customDetection, ...rest } = prev;
+      return { ...rest, detectionRules: rules };
+    });
+  }, [selectedInstaller, pkg.name, effectiveWingetId, selectedVersion, config.registryMarkerPath, customDetectionActive]);
+
+  const setCustomDetection = (enabled: boolean) => {
+    setCustomDetectionErrors([]);
+    if (enabled) {
+      const rules = lastCustomRulesRef.current ?? [createEmptyDetectionRule('registry')];
+      lastCustomRulesRef.current = rules;
+      setConfig((prev) => ({ ...prev, customDetection: true, detectionRules: rules }));
+    } else {
+      lastCustomRulesRef.current = config.detectionRules;
+      setConfig((prev) => {
+        const { customDetection: _customDetection, ...rest } = prev;
+        return rest;
+      });
     }
-  }, [selectedInstaller, pkg.name, effectiveWingetId, selectedVersion, config.registryMarkerPath]);
+  };
 
   const handleAddToCart = async () => {
     if (addedToCartSuccess) return;
@@ -436,6 +487,15 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
       );
       setExpandedSection('behavior');
       return;
+    }
+
+    if (customDetectionActive) {
+      const validation = validateCustomDetectionRules(config.detectionRules);
+      if (!validation.valid) {
+        setCustomDetectionErrors(validation.errors);
+        setExpandedSection('detection');
+        return;
+      }
     }
 
     setIsAddingToCart(true);
@@ -519,6 +579,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
         });
       }
       setAddedToCartSuccess(true);
+      onAddedToCart?.();
       setTimeout(() => onClose(), 1200);
     } finally {
       setIsAddingToCart(false);
@@ -1752,6 +1813,25 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                 onToggle={() => toggleSection('detection')}
               >
                 <div className="space-y-3">
+                  {customDetectionSupported && (
+                    <ToggleOption
+                      label="Use my own detection rules"
+                      description="Your registry, file or MSI rules replace the IntuneGet version marker. They stay fixed, so edit them before you deploy a newer version."
+                      checked={customDetectionActive}
+                      onChange={setCustomDetection}
+                    />
+                  )}
+                  {customDetectionActive ? (
+                    <CustomDetectionEditor
+                      rules={config.detectionRules}
+                      onChange={(detectionRules) => {
+                        setCustomDetectionErrors([]);
+                        lastCustomRulesRef.current = detectionRules;
+                        updateConfig({ detectionRules });
+                      }}
+                      errors={customDetectionErrors}
+                    />
+                  ) : <>
                   {config.detectionRules.length === 0 ? (
                     <p className="text-text-muted text-sm italic">No detection rules configured</p>
                   ) : (
@@ -1769,6 +1849,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                   <p className="text-text-muted text-xs">
                     Detection rules are auto-generated based on installer type. They determine how Intune verifies the app is installed.
                   </p>
+                  </>}
                   <div>
                     <label className="block text-sm font-medium text-text-secondary mb-1.5">
                       Detection marker registry path
@@ -1782,6 +1863,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                     />
                     <p className="text-text-muted text-xs mt-1.5">
                       Registry key under HKLM/HKCU where the detection marker is written. Customize to track deployments under your own key, e.g. SOFTWARE\CompanyName\Apps.
+                      {customDetectionActive && ' The marker is still written during install, but Intune uses your own rules for detection.'}
                     </p>
                   </div>
                 </div>
@@ -2114,6 +2196,11 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
           </div>
         </div>
 
+        {versionInstallerError && isNonDefaultVersion && (
+          <p role="alert" className="px-6 py-3 text-sm text-status-error">
+            {versionInstallerError.message}
+          </p>
+        )}
         {/* Footer */}
         <div className="flex-shrink-0 border-t border-overlay/10 p-4 bg-bg-surface/95 space-y-2">
           {settingsSuccess && (
@@ -2213,7 +2300,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
               ) : (
                 <>
                   <Plus className="w-5 h-5 mr-2" />
-                  Add to Selection
+                  {replaceCartItemId ? 'Update Selection' : 'Add to Selection'}
                 </>
               )}
             </Button>

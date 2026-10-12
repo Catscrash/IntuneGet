@@ -14,7 +14,6 @@ export default function robots(): MetadataRoute.Robots {
           "/privacy",
           "/terms",
           "/pricing",
-          "/changelog",
           "/about",
         ],
         disallow: [
@@ -73,9 +72,9 @@ export default function robots(): MetadataRoute.Robots {
       },
     ],
     sitemap: [
-      "https://intuneget.com/sitemap/0.xml",
-      "https://intuneget.com/sitemap/1.xml",
-      "https://intuneget.com/sitemap/2.xml",
+      "https://www.intuneget.com/sitemap/0.xml",
+      "https://www.intuneget.com/sitemap/1.xml",
+      "https://www.intuneget.com/sitemap/2.xml",
     ],
   };
 }

@@ -9,8 +9,10 @@ import type { NormalizedPackage } from '@/types/winget';
 import { cleanPackageName } from '@/lib/locale-utils';
 import { useCartStore } from '@/stores/cart-store';
 import { useQuickAdd } from '@/hooks/useQuickAdd';
+import { TenantDeploymentBadge } from '@/components/TenantDeploymentBadge';
 import { QaBadge } from '@/components/qa/QaBadge';
 import type { QaStatus } from '@/types/qa';
+import { CuratedReleaseBadge } from '@/components/CuratedReleaseBadge';
 
 const installerTypeStyles: Record<string, string> = {
   msi: 'text-blue-600 bg-blue-500/10 border-blue-500/20',
@@ -41,13 +43,15 @@ interface AppListItemProps {
   package: NormalizedPackage;
   onSelect?: (pkg: NormalizedPackage) => void;
   isDeployed?: boolean;
+  tenantDeployedBy?: string | null;
   isBulkSelectMode?: boolean;
   isBulkSelected?: boolean;
   onBulkToggle?: (pkg: NormalizedPackage) => void;
   qaStatus?: QaStatus | null;
+  curatedAppId?: string;
 }
 
-function AppListItemComponent({ package: pkg, onSelect, isDeployed = false, isBulkSelectMode = false, isBulkSelected = false, onBulkToggle, qaStatus }: AppListItemProps) {
+function AppListItemComponent({ package: pkg, onSelect, isDeployed = false, tenantDeployedBy, isBulkSelectMode = false, isBulkSelected = false, onBulkToggle, qaStatus, curatedAppId }: AppListItemProps) {
   const { quickAdd, isLoading } = useQuickAdd(pkg);
 
   const inCart = useCartStore(
@@ -132,6 +136,9 @@ function AppListItemComponent({ package: pkg, onSelect, isDeployed = false, isBu
                 <span className="text-xs text-text-muted sm:hidden">v{pkg.version}</span>
               )}
             </div>
+            {curatedAppId && pkg.appSource !== 'store' && (
+              <div className="mt-1"><CuratedReleaseBadge appId={curatedAppId} /></div>
+            )}
           </div>
 
           {pkg.appSource !== 'store' && (
@@ -162,6 +169,7 @@ function AppListItemComponent({ package: pkg, onSelect, isDeployed = false, isBu
             </div>
           )}
 
+          <TenantDeploymentBadge deployedBy={tenantDeployedBy} />
           {!isBulkSelectMode && (
             isDeployed ? (
               <Button
@@ -204,8 +212,10 @@ export const AppListItem = memo(AppListItemComponent, (prevProps, nextProps) => 
   return prevProps.package.id === nextProps.package.id &&
          prevProps.package.version === nextProps.package.version &&
          prevProps.isDeployed === nextProps.isDeployed &&
+         prevProps.tenantDeployedBy === nextProps.tenantDeployedBy &&
          prevProps.isBulkSelectMode === nextProps.isBulkSelectMode &&
          prevProps.isBulkSelected === nextProps.isBulkSelected &&
+         prevProps.curatedAppId === nextProps.curatedAppId &&
          prevProps.qaStatus?.outcome === nextProps.qaStatus?.outcome &&
          prevProps.qaStatus?.testedVersion === nextProps.qaStatus?.testedVersion &&
          prevProps.qaStatus?.architecture === nextProps.qaStatus?.architecture &&

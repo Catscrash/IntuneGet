@@ -8,6 +8,9 @@ import { AutoUpdateTrigger, getLatestInstallerInfo } from '../trigger';
 import type { AppUpdatePolicy, DeploymentConfig } from '@/types/update-policies';
 import type { QaResultRow } from '@/types/qa';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
+import { CURATED_APPS } from '@/lib/curated-catalog/definitions';
+import { buildCuratedCartItem } from '@/lib/curated-catalog/package';
+import { releaseFixture, signedFixture } from '@/lib/curated-catalog/test-fixtures';
 
 const {
   getQaResultMock,
@@ -15,11 +18,17 @@ const {
   getVersionInstallerInfoMock,
   ensureQaDemandMock,
   fetchInstallerManifestMock,
+  getApprovalFailuresMock,
+  defaultApprovalFailuresMock,
+  curatedState,
 } = vi.hoisted(() => ({
+  curatedState: { envelope: {} as Record<string, unknown>, acceptances: new Set<string>() },
   getQaResultMock: vi.fn(),
   getAppForInstallerMock: vi.fn(),
   getVersionInstallerInfoMock: vi.fn(),
   ensureQaDemandMock: vi.fn(),
+  getApprovalFailuresMock: vi.fn().mockResolvedValue([]),
+  defaultApprovalFailuresMock: vi.fn().mockResolvedValue([]),
   fetchInstallerManifestMock: vi.fn(),
 }));
 
@@ -39,6 +48,25 @@ vi.mock('@/lib/catalog', () => ({
 }));
 vi.mock('@/lib/qa/demand', () => ({
   ensureQaDemand: ensureQaDemandMock,
+}));
+vi.mock('@/catalog/curated/catalog.json', async (importOriginal) => {
+  const original = await importOriginal<{ default: Record<string, unknown> }>();
+  Object.assign(curatedState.envelope, structuredClone(original.default));
+  return { default: curatedState.envelope };
+});
+vi.mock('@/lib/db', () => ({
+  getDatabase: () => ({
+    jobs: { getApprovalFailures: defaultApprovalFailuresMock },
+    curatedLicenceAttestations: {
+      get: async (tenantId: string, id: string, version: string) => curatedState.acceptances.has(`${tenantId}|${id}|${version}`)
+        ? { id: 'acceptance', tenant_id: tenantId, app_id: 'acrobat-reader', attestation_id: id, attestation_version: version,
+            accepted_by_user_id: 'admin', accepted_by_email: 'admin@contoso.test', accepted_at: '2026-10-04T00:00:00.000Z' }
+        : null,
+    },
+  }),
+}));
+vi.mock('@/lib/db/supabase-adapter', () => ({
+  supabaseDb: { jobs: { getApprovalFailures: getApprovalFailuresMock } },
 }));
 
 type SpyFn = Mock<(...args: unknown[]) => unknown>;
@@ -156,6 +184,8 @@ const UPDATE_INFO = {
   nestedInstallerPath: 'setup-2.0.0.exe',
 };
 
+beforeEach(() => getApprovalFailuresMock.mockResolvedValue([]));
+
 function makeTrigger(supabaseMock: ReturnType<typeof createSupabaseMock>): AutoUpdateTrigger {
   const trigger = new AutoUpdateTrigger('https://stub.supabase.co', 'stub-key');
   (trigger as unknown as { supabase: unknown }).supabase = supabaseMock;
@@ -163,8 +193,111 @@ function makeTrigger(supabaseMock: ReturnType<typeof createSupabaseMock>): AutoU
 }
 
 describe('AutoUpdateTrigger psadtConfig handling', () => {
+  it('holds fixed rules before any database, QA or rate limit work, including manual bypass options', async () => {
+    const supabase = createSupabaseMock({});
+    const config = zoomConfigForTrigger();
+    config.psadtConfig = { ...DEFAULT_PSADT_CONFIG, customDetection: true, detectionRules: config.detectionRules };
+    const policy = makePolicy(config);
+    policy.consecutive_failures = 0;
+    const before = JSON.stringify(policy);
+    const result = await makeTrigger(supabase).triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+    expect(result).toEqual({ success: false, skipped: true, skipReason: 'Custom detection rules are fixed. Deploy 2.0.0 from the catalog with updated rules.' });
+    expect(supabase.from).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(JSON.stringify(policy)).toBe(before);
+  });
+  it.each(['canonical', 'submitted', 'historical'])('blocks a mixed case curated approval checkpoint stored under the %s ID', async storedCase => {
+    const canonical = CURATED_APPS[0].packageId;
+    const submitted = canonical.toUpperCase();
+    expect(submitted).not.toBe(canonical);
+    const storedId = storedCase === 'canonical' ? canonical : storedCase === 'submitted' ? submitted : canonical.toLowerCase();
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({ auto_update_history: { insertSpy: insert }, packaging_jobs: { insertSpy: insert } }));
+    (trigger as unknown as { verifyTenantConsent: unknown }).verifyTenantConsent = vi.fn().mockResolvedValue(true);
+    getApprovalFailuresMock.mockImplementation(async (_tenant: string, id: string) => typeof id === 'string' && id.toLowerCase() === storedId.toLowerCase() ? [{
+      tenant_id: 'tenant-1', winget_id: storedId, status: 'failed',
+      error_code: 'INTUNE_APPROVAL_REQUIRED', error_details: null,
+    }] : []);
+    const result = await trigger.triggerAutoUpdate({ ...makePolicy({ displayName: 'App', psadtConfig: DEFAULT_PSADT_CONFIG }), consecutive_failures: 0 },
+      { ...UPDATE_INFO, wingetId: submitted, sourceType: 'curated' }, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+    expect(result).toMatchObject({ success: false, skipped: true, code: 'INTUNE_APPROVAL_PENDING' });
+    expect(getApprovalFailuresMock).toHaveBeenCalledExactlyOnceWith('tenant-1', canonical, undefined);
+    expect(defaultApprovalFailuresMock).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+  });
+
+  it('reads Supabase checkpoints even when database mode selects SQLite', async () => {
+    vi.stubEnv('DATABASE_MODE', 'sqlite');
+    try {
+      const insert = vi.fn();
+      const trigger = makeTrigger(createSupabaseMock({ packaging_jobs: { insertSpy: insert } }));
+      (trigger as unknown as { verifyTenantConsent: unknown }).verifyTenantConsent = vi.fn().mockResolvedValue(true);
+      getApprovalFailuresMock.mockResolvedValue([{ tenant_id: 'tenant-1', winget_id: 'Test.App',
+        status: 'failed', error_category: 'approval', error_details: null }]);
+      const result = await trigger.triggerAutoUpdate({ ...makePolicy({ psadtConfig: DEFAULT_PSADT_CONFIG }), consecutive_failures: 0 },
+        UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result.code).toBe('INTUNE_APPROVAL_PENDING');
+      expect(getApprovalFailuresMock).toHaveBeenCalledExactlyOnceWith('tenant-1', 'Test.App', undefined);
+      expect(defaultApprovalFailuresMock).not.toHaveBeenCalled();
+      expect(insert).not.toHaveBeenCalled();
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('checks curated rate limits before either approval ID', async () => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({ auto_update_history: { insertSpy: insert }, packaging_jobs: { insertSpy: insert } }));
+    (trigger as unknown as { checkRateLimits: unknown }).checkRateLimits = vi.fn().mockResolvedValue({
+      allowed: false, code: 'RATE_LIMIT_UNVERIFIED', reason: 'Synthetic rate count failure',
+    });
+    const result = await trigger.triggerAutoUpdate({ ...makePolicy({ displayName: 'App', psadtConfig: DEFAULT_PSADT_CONFIG }), consecutive_failures: 0 },
+      { ...UPDATE_INFO, wingetId: CURATED_APPS[0].packageId.toUpperCase() }, { skipPriorDeploymentCheck: true });
+    expect(result.code).toBe('RATE_LIMIT_UNVERIFIED');
+    expect(getApprovalFailuresMock).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('keeps approval and rate limit failures separate before writes (rate allowed %s)', async allowed => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({ auto_update_history: { insertSpy: insert }, packaging_jobs: { insertSpy: insert } }));
+    const rate = vi.fn().mockResolvedValue(allowed ? { allowed: true } : {
+      allowed: false, code: 'RATE_LIMIT_UNVERIFIED', reason: 'Synthetic rate count read failure',
+    });
+    (trigger as unknown as { checkRateLimits: unknown }).checkRateLimits = rate;
+    (trigger as unknown as { verifyTenantConsent: unknown }).verifyTenantConsent = vi.fn().mockResolvedValue(true);
+    getApprovalFailuresMock.mockResolvedValue([{ tenant_id: 'tenant-1', winget_id: 'Test.App',
+      status: 'failed', error_code: 'INTUNE_APPROVAL_REQUIRED', error_details: null }]);
+
+    const result = await trigger.triggerAutoUpdate({ ...makePolicy({ displayName: 'App', psadtConfig: DEFAULT_PSADT_CONFIG }), consecutive_failures: 0 }, UPDATE_INFO,
+      { skipPriorDeploymentCheck: true });
+
+    expect(result).toMatchObject({ success: false, skipped: true,
+      code: allowed ? 'INTUNE_APPROVAL_PENDING' : 'RATE_LIMIT_UNVERIFIED' });
+    expect(rate).toHaveBeenCalledOnce();
+    if (!allowed) expect(getApprovalFailuresMock).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+  });
+
+  it('skips unresolved approvals before history, jobs or QA demand even with manual bypass flags', async () => {
+    const insert = vi.fn();
+    const supabase = createSupabaseMock({ auto_update_history: { insertSpy: insert }, packaging_jobs: { insertSpy: insert } });
+    const trigger = makeTrigger(supabase);
+    (trigger as unknown as { verifyTenantConsent: unknown }).verifyTenantConsent = vi.fn().mockResolvedValue(true);
+    getApprovalFailuresMock.mockResolvedValue([{ tenant_id: 'tenant-1', winget_id: 'Test.App',
+      status: 'failed', error_code: 'INTUNE_APPROVAL_REQUIRED', error_details: null }]);
+    const result = await trigger.triggerAutoUpdate({ ...makePolicy({ displayName: 'App', psadtConfig: DEFAULT_PSADT_CONFIG }), consecutive_failures: 0 }, UPDATE_INFO,
+      { skipRateLimits: true, skipPriorDeploymentCheck: true });
+    expect(result).toMatchObject({ success: false, skipped: true, code: 'INTUNE_APPROVAL_PENDING' });
+    expect(getApprovalFailuresMock).toHaveBeenCalledExactlyOnceWith('tenant-1', 'Test.App', undefined);
+    expect(insert).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
+    getApprovalFailuresMock.mockResolvedValue([]);
     getQaResultMock.mockResolvedValue(null);
     getAppForInstallerMock.mockReset();
     getVersionInstallerInfoMock.mockReset();
@@ -523,7 +656,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.original_upload_history_id = 'prior-upload';
     policy.consecutive_failures = 0;
     spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
     const createHistorySpy = spyOnTriggerInternal(trigger, 'createHistoryRecord');
 
     const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true });
@@ -557,7 +690,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.consecutive_failures = 0;
 
     spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
     spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
     spyOnTriggerInternal(trigger, 'createHistoryRecord')
       .mockResolvedValue({ id: 'history-camera-hub' });
@@ -625,7 +758,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.consecutive_failures = 0;
 
     spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
     spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
     spyOnTriggerInternal(trigger, 'createHistoryRecord')
       .mockResolvedValue({ id: 'history-claude' });
@@ -681,7 +814,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.consecutive_failures = 0;
 
     spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
     spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
     spyOnTriggerInternal(trigger, 'createHistoryRecord')
       .mockResolvedValue({ id: 'history-zalo' });
@@ -730,7 +863,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     policy.consecutive_failures = 0;
 
     spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+    spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
     spyOnTriggerInternal(trigger, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined);
     spyOnTriggerInternal(trigger, 'createHistoryRecord')
       .mockResolvedValue({ id: 'history-notesnook' });
@@ -760,6 +893,119 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
   });
 
   describe('ensurePsadtConfig', () => {
+    it.each(['history error', 'job error', 'history exception'])('skips safely on %s before QA or job creation', async (failure) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const readFailure = { message: 'Synthetic database failure' };
+      const supabase = createSupabaseMock({
+        upload_history: failure === 'history exception'
+          ? { maybeSingleSpy: vi.fn().mockRejectedValue(new Error('Synthetic read failure')) }
+          : { maybeSingleResult: { data: failure === 'history error' ? null : { packaging_job_id: 'job-1' }, error: failure === 'history error' ? readFailure : null } },
+        packaging_jobs: { maybeSingleResult: { data: null, error: readFailure } },
+      });
+      const trigger = makeTrigger(supabase);
+      vi.spyOn(trigger as never, 'verifyTenantConsent').mockResolvedValue(true as never);
+      const createJob = vi.spyOn(trigger as never, 'createPackagingJob');
+      const incrementFailure = vi.spyOn(trigger as never, 'incrementFailureCount');
+      const policy = makePolicy({ displayName: 'Test App' });
+      policy.consecutive_failures = 0;
+      const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result).toMatchObject({ success: false, skipped: true, code: 'PSADT_BACKFILL_UNAVAILABLE' });
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+      expect(incrementFailure).not.toHaveBeenCalled();
+      expect(policy.consecutive_failures).toBe(0);
+      expect(warn).toHaveBeenCalled();
+      if (failure !== 'history exception') {
+        expect(warn).toHaveBeenCalledWith(
+          failure === 'history error'
+            ? 'Could not load saved deployment settings: upload history read failed.'
+            : 'Could not load saved deployment settings: packaging job read failed.'
+        );
+      }
+      warn.mockRestore();
+    });
+
+    it('continues with an empty legacy history rather than treating absence as a failed read', async () => {
+      const supabase = createSupabaseMock({ upload_history: { maybeSingleResult: { data: null, error: null } } });
+      const trigger = makeTrigger(supabase);
+      vi.spyOn(trigger as never, 'verifyTenantConsent').mockResolvedValue(true as never);
+      const policy = makePolicy({ displayName: 'Test App', architecture: 'x64' });
+      policy.consecutive_failures = 0;
+      const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result.code).not.toBe('PSADT_BACKFILL_UNAVAILABLE');
+      expect(ensureQaDemandMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['returned error', 'exception'])('keeps recovered custom rules effective and warns privately on save %s', async failure => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const updateSpy = failure === 'exception'
+        ? vi.fn(() => { throw new Error('Synthetic save failure for policy-1'); })
+        : vi.fn();
+      const supabase = createSupabaseMock({
+        upload_history: { maybeSingleResult: { data: { packaging_job_id: 'job-1' }, error: null } },
+        packaging_jobs: { maybeSingleResult: { data: { package_config: { psadtConfig: { ...DEFAULT_PSADT_CONFIG, customDetection: true } } }, error: null } },
+        app_update_policies: { updateSpy, terminalError: failure === 'returned error' ? { message: 'Synthetic save failure for policy-1' } : null },
+      });
+      const trigger = makeTrigger(supabase);
+      vi.spyOn(trigger as never, 'verifyTenantConsent').mockResolvedValue(true as never);
+      const createJob = vi.spyOn(trigger as never, 'createPackagingJob');
+      const policy = makePolicy({ displayName: 'Test App' });
+      policy.consecutive_failures = 0;
+      const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result).toEqual({ success: false, skipped: true, skipReason: 'Custom detection rules are fixed. Deploy 2.0.0 from the catalog with updated rules.' });
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+      expect(updateSpy).toHaveBeenCalled();
+      expect(policy.deployment_config.psadtConfig).toMatchObject({ customDetection: true });
+      expect(warn).toHaveBeenCalledWith('Could not save recovered deployment settings; this update uses them and a later update retries saving.');
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/policy-1|Synthetic/);
+      warn.mockRestore();
+    });
+
+    it('continues a safe update with recovered settings when saving returns an error', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const supabase = createSupabaseMock({
+        upload_history: { maybeSingleResult: { data: { packaging_job_id: 'job-1' }, error: null } },
+        packaging_jobs: { maybeSingleResult: { data: { package_config: { psadtConfig: PSADT_CONFIG } }, error: null } },
+        app_update_policies: { terminalError: { message: 'Synthetic save failure for policy-1' } },
+      });
+      const trigger = makeTrigger(supabase);
+      vi.spyOn(trigger as never, 'verifyTenantConsent').mockResolvedValue(true as never);
+      // Isolate the recovery save from the separate legacy defaults migration.
+      vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults').mockResolvedValue(undefined as never);
+      const policy = makePolicy({ displayName: 'Test App' });
+      policy.consecutive_failures = 0;
+      const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result.code).not.toBe('PSADT_BACKFILL_UNAVAILABLE');
+      expect(policy.deployment_config.psadtConfig).toEqual(PSADT_CONFIG);
+      expect(ensureQaDemandMock).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('Could not save recovered deployment settings; this update uses them and a later update retries saving.');
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/policy-1|Synthetic/);
+      warn.mockRestore();
+    });
+
+    it('holds custom rules introduced by the legacy packaging job backfill before QA or dispatch', async () => {
+      const updateSpy = vi.fn();
+      const insertSpy = vi.fn();
+      const psadtConfig = { ...DEFAULT_PSADT_CONFIG, customDetection: true };
+      const supabase = createSupabaseMock({
+        upload_history: { maybeSingleResult: { data: { packaging_job_id: 'job-1' }, error: null } },
+        packaging_jobs: { maybeSingleResult: { data: { package_config: { psadtConfig } }, error: null }, insertSpy },
+        app_update_policies: { updateSpy },
+      });
+      const trigger = makeTrigger(supabase);
+      vi.spyOn(trigger as never, 'verifyTenantConsent').mockResolvedValue(true as never);
+      const createJob = vi.spyOn(trigger as never, 'createPackagingJob');
+      const policy = makePolicy({ displayName: 'Test App' });
+      policy.consecutive_failures = 0;
+      const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true });
+      expect(result).toEqual({ success: false, skipped: true, skipReason: 'Custom detection rules are fixed. Deploy 2.0.0 from the catalog with updated rules.' });
+      expect(policy.deployment_config.psadtConfig).toEqual(psadtConfig);
+      expect(updateSpy).toHaveBeenCalledWith({ deployment_config: policy.deployment_config });
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+      expect(insertSpy).not.toHaveBeenCalled();
+      expect(createJob).not.toHaveBeenCalled();
+    });
     it('backfills psadtConfig from the most recent packaging job and persists it', async () => {
       const updateSpy = vi.fn();
       const supabase = createSupabaseMock({
@@ -778,7 +1024,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       const policy = makePolicy({ displayName: 'Test App' });
 
       await (trigger as unknown as {
-        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<void>;
+        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<boolean>;
       }).ensurePsadtConfig(policy);
 
       const config = policy.deployment_config as DeploymentConfig;
@@ -795,7 +1041,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       } as Partial<DeploymentConfig>);
 
       await (trigger as unknown as {
-        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<void>;
+        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<boolean>;
       }).ensurePsadtConfig(policy);
 
       expect(supabase.from).not.toHaveBeenCalled();
@@ -811,7 +1057,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       const policy = makePolicy({ displayName: 'Test App' });
 
       await (trigger as unknown as {
-        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<void>;
+        ensurePsadtConfig: (p: AppUpdatePolicy) => Promise<boolean>;
       }).ensurePsadtConfig(policy);
 
       expect((policy.deployment_config as DeploymentConfig).psadtConfig).toBeUndefined();
@@ -914,7 +1160,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       policy.original_upload_history_id = 'prior-upload';
       policy.consecutive_failures = 0;
       spyOnTriggerInternal(trigger, 'verifyTenantConsent').mockResolvedValue(true);
-      spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(undefined);
+      spyOnTriggerInternal(trigger, 'ensurePsadtConfig').mockResolvedValue(true);
 
       await trigger.triggerAutoUpdate(policy, {
         ...UPDATE_INFO,
@@ -1112,5 +1358,82 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       expect(jobData.package_config.autoSupersede).toBe(false);
       expect(jobData.package_config.supersedenceType).toBeUndefined();
     });
+  });
+});
+
+describe('AutoUpdateTrigger curated licence attestation', () => {
+  const acrobat = CURATED_APPS.find(app => app.id === 'acrobat-reader')!;
+  const attestation = acrobat.licenceAttestation!;
+  function setup() {
+    vi.clearAllMocks();
+    curatedState.acceptances.clear();
+    const fixture = signedFixture([releaseFixture(acrobat)]);
+    const original = { ...curatedState.envelope };
+    Object.assign(curatedState.envelope, fixture.envelope);
+    vi.stubEnv('CURATED_CATALOG_PUBLIC_KEYS', JSON.stringify(fixture.keys));
+    const item = buildCuratedCartItem(acrobat, fixture.envelope.payload.releases[0]);
+    ensureQaDemandMock.mockResolvedValue({ state: 'passed', candidateId: null,
+      identity: { executionProfileSha256: 'B'.repeat(64), presentationProfileSha256: 'D'.repeat(64) } });
+    const insertSpy = vi.fn();
+    const supabase = createSupabaseMock({ packaging_jobs: { insertSpy, singleResult: { data: { id: 'job-1' }, error: null } } });
+    const trigger = makeTrigger(supabase);
+    const policy = makePolicy({ ...item, assignments: [] } as unknown as DeploymentConfig);
+    policy.winget_id = item.wingetId;
+    policy.original_upload_history_id = 'prior-upload';
+    policy.consecutive_failures = 0;
+    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'createHistoryRecord' as never).mockResolvedValue({ id: 'history-1' } as never);
+    const run = () => trigger.triggerAutoUpdate(policy, {
+      wingetId: item.wingetId, currentVersion: '119.0.0.0', latestVersion: item.version,
+      displayName: item.displayName, installerUrl: item.installerUrl, installerSha256: item.installerSha256,
+      installerType: item.installerType, installScope: 'machine',
+    }, { skipRateLimits: true });
+    const restore = () => {
+      Object.keys(curatedState.envelope).forEach(key => delete curatedState.envelope[key]);
+      Object.assign(curatedState.envelope, original);
+      vi.unstubAllEnvs();
+    };
+    return { run, insertSpy, restore, policy };
+  }
+
+  it('skips without creating a job or QA demand until the tenant accepts the agreement', async () => {
+    const { run, insertSpy, restore } = setup();
+    try {
+      curatedState.acceptances.add(`other-tenant|${attestation.id}|${attestation.version}`);
+      curatedState.acceptances.add(`tenant-1|${attestation.id}|2025-01-01`);
+      const result = await run();
+      expect(result).toMatchObject({ success: false, skipped: true, code: 'CURATED_LICENCE_NOT_ACCEPTED' });
+      expect(result.skipReason).toContain(attestation.title);
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+      expect(insertSpy).not.toHaveBeenCalled();
+    } finally { restore(); }
+  });
+
+  it('creates the job with an audit snapshot of the current acceptance', async () => {
+    const { run, insertSpy, restore } = setup();
+    try {
+      curatedState.acceptances.add(`tenant-1|${attestation.id}|${attestation.version}`);
+      const result = await run();
+      expect(result).toMatchObject({ success: true, packagingJobId: 'job-1' });
+      expect(insertSpy).toHaveBeenCalledWith(expect.objectContaining({ tenant_id: 'tenant-1', package_config: expect.objectContaining({
+        sourceType: 'curated',
+        curatedLicenceAcceptance: expect.objectContaining({ attestationId: attestation.id, attestationVersion: attestation.version, acceptedByEmail: 'admin@contoso.test' }),
+      }) }));
+    } finally { restore(); }
+  });
+  it('uses the new release defaults for a tested-defaults policy without custom-settings QA', async () => {
+    const { run, insertSpy, restore, policy } = setup();
+    try {
+      curatedState.acceptances.add(`tenant-1|${attestation.id}|${attestation.version}`);
+      const config = policy.deployment_config as unknown as DeploymentConfig;
+      config.curatedSettingsMode = 'tested-defaults';
+      config.psadtConfig = { ...DEFAULT_PSADT_CONFIG, processesToClose: [{ name: 'old-custom', description: '' }], brandingCompanyName: 'Example Company' };
+      expect(await run()).toMatchObject({ success: true });
+      expect(insertSpy).toHaveBeenCalledWith(expect.objectContaining({ package_config: expect.objectContaining({
+        curatedSettingsMode: 'tested-defaults', psadtConfig: expect.objectContaining({ processesToClose: [], brandingCompanyName: 'Example Company' }),
+      }) }));
+    } finally { restore(); }
   });
 });

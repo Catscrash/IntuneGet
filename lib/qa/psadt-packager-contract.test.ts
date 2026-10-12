@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
@@ -11,9 +11,14 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { applyApplicationPackagingAdapter, resolveApplicationUninstallCommand } from '@/lib/packaging-adapters';
+import { APPLICATION_PACKAGING_ADAPTERS, applyApplicationPackagingAdapter, resolveApplicationUninstallCommand } from '@/lib/packaging-adapters';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 import { generateUninstallCommand } from '@/lib/detection-rules';
+import { CURATED_APPS } from '@/lib/curated-catalog/definitions';
+import { buildCuratedCartItem, curatedWorkflowInput } from '@/lib/curated-catalog/package';
+import { releaseFixture } from '@/lib/curated-catalog/test-fixtures';
+import { JobProcessor } from '@/packager/src/job-processor';
+import type { PackagingJob } from '@/packager/src/job-poller';
 
 const packager = readFileSync(
   resolve(process.cwd(), '.github/scripts/Create-PSADTPackage.ps1'),
@@ -53,6 +58,142 @@ const canRunWindowsPowerShellPackager =
     '-Command',
     '$PSVersionTable.PSVersion.ToString()',
   ]).status === 0;
+
+type ManagedWaitScenario = 'normal' | 'delayed' | 'hung' | 'exited' | 'fault';
+
+async function executeManagedWait(scenario: ManagedWaitScenario) {
+  const generated = generateRegistryUninstallPackage('exe', 'Google Updater', [], {
+    reviewedManagedInstallDirectory: '%ProgramFiles(x86)%\\Google\\GoogleUpdater',
+    reviewedManagedUninstall: {
+      executablePath: '%ProgramFiles(x86)%\\Google\\GoogleUpdater\\<VERSION>\\updater.exe',
+      arguments: ['--uninstall', '--system'], completionTimeoutMinutes: 1,
+    },
+  }, [], 'Google.GoogleUpdater');
+  const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'));
+  const start = uninstall.indexOf('    $managedInstallDirectory =');
+  const absent = uninstall.indexOf('Managed installation was already absent:', start);
+  const end = uninstall.indexOf('\n    }', absent) + '\n    }'.length;
+  if (start < 0 || absent < 0 || end <= start) throw new Error('Managed wait block missing');
+  const fixture = mkdtempSync(join(tmpdir(), 'managed-wait-PRIVATE_SENTINEL-'));
+  const target = join(fixture, 'Google', 'GoogleUpdater');
+  mkdirSync(join(target, '1.0.0'), { recursive: true });
+  writeFileSync(join(target, '1.0.0', 'updater.exe'), 'fixture');
+  writeFileSync(join(target, 'PRIVATE_SENTINEL.txt'), 'fixture');
+  const script = join(fixture, 'runtime.ps1');
+  const log = join(fixture, 'log.json');
+  const quote = (value: string) => value.replace(/'/g, "''");
+  writeFileSync(script, `$ErrorActionPreference = 'Stop'
+[Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $env:WAIT_FIXTURE_ROOT, 'Process')
+$script:ManagedWaitCapturedLogs = [Collections.Generic.List[object]]::new()
+$script:launched = $null
+function Write-ADTLogEntry { param($Message, $Severity, $Source)
+  $script:ManagedWaitCapturedLogs.Add([pscustomobject]@{message=[string]$Message; severity=[string]$Severity; at=[DateTime]::UtcNow.ToString('o')})
+}
+function Get-CimInstance { param($ClassName, $OperationTimeoutSec, $ErrorAction)
+  if ($env:WAIT_SCENARIO -eq 'fault') { throw 'fixture CIM fault' }
+  [pscustomobject]@{ExecutablePath='${quote(join(target, '1.0.0', 'updater.exe'))}'}
+  [pscustomobject]@{ExecutablePath='C:\\unrelated\\PRIVATE_SENTINEL.exe'}
+}
+function Start-ADTProcess { param($FilePath, $ArgumentList, $WindowStyle, [switch]$NoWait, [switch]$PassThru)
+  $script:launched = [pscustomobject]@{at=[DateTime]::UtcNow.ToString('o'); file=$FilePath; args=$ArgumentList; window=$WindowStyle; noWait=[bool]$NoWait; passThru=[bool]$PassThru}
+  if ($env:WAIT_SCENARIO -eq 'normal') { Remove-Item -LiteralPath '${quote(target)}' -Recurse -Force }
+  if ($env:WAIT_SCENARIO -eq 'delayed') {
+    $null = Start-Job -ArgumentList '${quote(target)}' -ScriptBlock { param($path) Start-Sleep 35; Remove-Item -LiteralPath $path -Recurse -Force }
+  }
+  if ($env:WAIT_SCENARIO -eq 'hung') { return @{Task=[Threading.Tasks.TaskCompletionSource[object]]::new().Task} }
+  if ($env:WAIT_SCENARIO -eq 'fault') {
+    $task=[Threading.Tasks.TaskCompletionSource[object]]::new(); $task.SetException([Exception]::new('fixture task fault')); return @{Task=$task.Task}
+  }
+  return @{Task=[Threading.Tasks.Task]::FromResult([pscustomobject]@{ExitCode=0})}
+}
+$failure=$null
+try {
+${uninstall.slice(start, end)}
+} catch { $failure=$_.Exception.Message }
+[pscustomobject]@{entries=$script:ManagedWaitCapturedLogs.ToArray(); launched=$script:launched; failure=$failure; finished=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath '${quote(log)}'
+if ($failure) { exit 1 }
+`);
+  try {
+    let stderr = '';
+    const status = await new Promise<number | null>((done, reject) => {
+      const child = spawn('pwsh', ['-NoProfile', '-File', script], {
+        env: { ...process.env, WAIT_FIXTURE_ROOT: fixture, WAIT_SCENARIO: scenario },
+        stdio: ['ignore', 'ignore', 'pipe'], timeout: 100_000,
+      });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      child.on('error', reject); child.on('exit', done);
+    });
+    if (!existsSync(log)) throw new Error(`Runtime fixture exited ${status} without evidence: ${stderr}`);
+    const result = JSON.parse(readFileSync(log, 'utf8')) as {
+      entries: Array<{message: string; severity: string; at: string}>;
+      launched: {at: string; args: string[]; window: string; noWait: boolean; passThru: boolean};
+      failure: string | null; finished: string;
+    };
+    return { status, result, target };
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+describe('managed uninstall bounded diagnostics', () => {
+  for (const scenario of ['normal', 'delayed', 'hung', 'exited', 'fault'] as const) {
+    it.runIf(canRunWindowsPowerShellPackager).concurrent(scenario, async () => {
+      const {status, result, target} = await executeManagedWait(scenario);
+      expect(result.launched, result.failure ?? 'launch missing').not.toBeNull();
+      const heartbeat = result.entries.filter(x => x.message.startsWith('Reviewed managed uninstall still waiting:'));
+      const diagnostics = result.entries.filter(x => x.message.startsWith('Reviewed managed uninstall deadline:'));
+      const elapsed = (Date.parse(result.finished) - Date.parse(result.launched.at)) / 1000;
+      expect(result.launched).toMatchObject({args: ['--uninstall', '--system'], window: 'Hidden', noWait: true, passThru: true});
+      if (scenario === 'normal' || scenario === 'delayed') {
+        expect(status).toBe(0); expect(result.failure).toBeNull(); expect(diagnostics).toHaveLength(0);
+        expect(result.entries.some(x => x.message === `Reviewed managed uninstall completed for [${target}].`)).toBe(true);
+        expect(heartbeat).toHaveLength(scenario === 'normal' ? 0 : 1);
+        if (scenario === 'normal') expect(elapsed).toBeLessThan(10);
+      } else {
+        expect(status).toBe(1);
+        expect(result.failure).toBe(`The reviewed managed uninstaller did not remove [${target}] before the completion deadline.`);
+        expect(elapsed).toBeGreaterThanOrEqual(60); expect(elapsed).toBeLessThan(80);
+        expect(heartbeat.length).toBeGreaterThanOrEqual(1); expect(heartbeat.length).toBeLessThanOrEqual(2);
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toContain('exe=True entries=2');
+        expect(diagnostics[0].message).toContain(scenario === 'fault' ? 'procs=unavailable' : 'procs=1');
+        expect(diagnostics[0].message).toContain(scenario === 'hung' ? 'launchedExited=False launchedExitCode=none' : scenario === 'fault' ? 'launchedExited=True launchedExitCode=unknown' : 'launchedExited=True launchedExitCode=0');
+      }
+      for (const line of heartbeat) {
+        const offset = (Date.parse(line.at) - Date.parse(result.launched.at)) / 1000;
+        expect(offset).toBeGreaterThanOrEqual(30); expect(offset).toBeLessThan(60);
+      }
+      for (const line of [...heartbeat, ...diagnostics]) {
+        expect(line.message).not.toMatch(/PRIVATE_SENTINEL|[A-Z]:\\/i);
+        expect(line.message.length).toBeLessThanOrEqual(160);
+      }
+      if (scenario === 'hung') {
+        const tail = [...heartbeat, ...diagnostics].slice(-8).map(x => `[Post-Uninstallation] :: ${x.message}`.slice(0, 180));
+        expect(tail.at(-1)).toContain('Reviewed managed uninstall deadline:');
+        console.log('managed-wait-hung-public-tail', JSON.stringify(tail));
+      }
+    }, 120_000);
+  }
+  it('keeps diagnostics intact in the public tail width', () => {
+    const messages = [...packager.matchAll(/Reviewed managed uninstall (?:still waiting|deadline):[^"'\r\n]+/g)].map(x => x[0]);
+    expect(messages).toHaveLength(2);
+    for (const message of messages) {
+      const values: Record<string, string> = {elapsedSec: '99999', remainingSec: '99999', launchedExited: 'False', launchedExitCode: '-2147483648', exe: 'unknown', entries: 'unknown', procs: 'unavailable'};
+      const worst = message.replace(/\$(\w+)/g, (_, key: string) => values[key]);
+      // Runtime interpolation uses bounded integers/booleans, never paths or names.
+      expect(worst.length).toBeLessThanOrEqual(160);
+      expect(`[Post-Uninstallation] :: ${worst}`.length).toBeLessThanOrEqual(179);
+    }
+  });
+  it('leaves five minutes below the dispatcher floor for every managed uninstall', () => {
+    const dispatch = readFileSync(resolve('lib/qa/dispatch.ts'), 'utf8');
+    const floor = Number(dispatch.match(/DEFAULT_QA_COMMAND_TIMEOUT_MINUTES = (\d+)/)?.[1]);
+    expect(floor).toBe(20);
+    for (const adapter of APPLICATION_PACKAGING_ADAPTERS) {
+      if (adapter.reviewedManagedUninstall) expect(adapter.reviewedManagedUninstall.completionTimeoutMinutes).toBeLessThanOrEqual(floor - 5);
+    }
+  });
+});
 
 function generateRegistryUninstallPackage(
   installerType: 'exe' | 'inno' | 'burn' | 'nullsoft' | 'msi' | 'zip',
@@ -282,6 +423,120 @@ describe('PSADT Inno packaging contract', () => {
 });
 
 describe('PSADT vendor argument contract', () => {
+  it.runIf(canRunWindowsPowerShellPackager).each([false, true])(
+    'does not verify an unused portable extraction path for custom commands, verifyInstall=%s',
+    (verifyInstall) => {
+      const psadtConfig = { verifyInstall, installCommand: 'cmd.exe /c echo synthetic-command' };
+      const generated = generateRegistryUninstallPackage(
+        'zip', 'Custom Portable Fixture', [], psadtConfig, [],
+        'Example.CustomPortable', 'Custom Portable Fixture', '1.0.0',
+        '', '', 'machine', 'portable', 'portable.exe'
+      );
+      const portableStart = generated.indexOf('    $portableRoot = Get-Item');
+      const portableEnd = generated.indexOf("    Write-ADTLogEntry -Message 'Verified portable installed files", portableStart);
+      const standaloneBlock = portableStart >= 0
+        ? generated.slice(portableStart, generated.indexOf('\n', portableEnd))
+        : generated.match(/    ## Verify the application actually installed[\s\S]*?Write-ADTLogEntry[^\r\n]+/)?.[0] ?? '';
+      const job = {
+        installer_type: 'zip', install_scope: 'machine', display_name: 'Custom Portable Fixture',
+        uninstall_command: '',
+        package_config: { nestedInstallerType: 'portable', nestedInstallerPath: 'portable.exe', psadtConfig },
+      } as PackagingJob;
+      const processor = JobProcessor.prototype as unknown as {
+        getPostInstallVerificationBlock(job: PackagingJob, name: string): string;
+      };
+      const results = [];
+      for (const block of [standaloneBlock, processor.getPostInstallVerificationBlock.call(processor, job, job.display_name)]) {
+        const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', `
+$ErrorActionPreference = 'Stop'
+$installPath = Join-Path $env:TEMP ('unused-custom-portable-' + [guid]::NewGuid().ToString())
+function Get-ADTApplication { throw 'Custom portable command must not invent ARP evidence' }
+function Write-ADTLogEntry { param($Message,$Source,$Severity) }
+${block}
+Write-Output 'CUSTOM_PORTABLE_PRESERVED'
+`], { encoding: 'utf8', timeout: 20_000 });
+        results.push(result);
+        expect(block).not.toContain('Get-ADTApplication');
+      }
+      expect(results.map(result => result.status), results.map(result => result.stderr).join('\n')).toEqual([0, 0]);
+      for (const result of results) expect(result.stdout).toContain('CUSTOM_PORTABLE_PRESERVED');
+    },
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager).each([false, true])(
+    'keeps nested EXE ZIP verification aligned across generators, verifyInstall=%s',
+    (verifyInstall) => {
+      const generated = generateRegistryUninstallPackage(
+        'zip', 'Nested Installer Fixture', [], { verifyInstall }, [],
+        'Example.NestedInstaller', 'Nested Installer Fixture', '1.0.0',
+        '', '/quiet', 'machine', 'exe', 'setup.exe'
+      );
+      const portableStart = generated.indexOf('    $portableRoot = Get-Item');
+      const portableEnd = generated.indexOf("    Write-ADTLogEntry -Message 'Verified portable installed files", portableStart);
+      const standaloneBlock = portableStart >= 0
+        ? generated.slice(portableStart, generated.indexOf('\n', portableEnd))
+        : generated.match(/    ## Verify the application actually installed[\s\S]*?Write-ADTLogEntry[^\r\n]+/)?.[0] ?? '';
+      const job = {
+        installer_type: 'zip', install_scope: 'machine', display_name: 'Nested Installer Fixture',
+        uninstall_command: '',
+        package_config: { nestedInstallerType: 'exe', nestedInstallerPath: 'setup.exe', psadtConfig: { verifyInstall } },
+      } as PackagingJob;
+      const processor = JobProcessor.prototype as unknown as {
+        getPostInstallVerificationBlock(job: PackagingJob, name: string): string;
+      };
+      const blocks = [standaloneBlock, processor.getPostInstallVerificationBlock.call(processor, job, job.display_name)];
+      for (const block of blocks) {
+        const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', `
+$ErrorActionPreference = 'Stop'
+$installPath = Join-Path $env:TEMP ('absent-portable-' + [guid]::NewGuid().ToString())
+function Get-ADTApplication { param($Name,$NameMatch,$ErrorAction) return @([pscustomobject]@{DisplayName='Nested Installer Fixture'}) }
+function Write-ADTLogEntry { param($Message,$Source,$Severity) }
+${block}
+Write-Output 'NESTED_INSTALLER_VERIFIED'
+`], { encoding: 'utf8', timeout: 20_000 });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toContain('NESTED_INSTALLER_VERIFIED');
+        expect(block.includes('Get-ADTApplication')).toBe(verifyInstall);
+      }
+    },
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)('adds Wacom silent removal only to its exact registered driver command', () => {
+    const generated = generateRegistryUninstallPackage(
+      'exe', 'Wacom Tablet', [1, 2], {}, [], 'Wacom.WacomTabletDriver',
+      'Wacom Tablet', '6.4.14-1',
+      'REGISTRY_UNINSTALL_KEY:Wacom Tablet Driver:Wacom Tablet', '/s'
+    );
+    const start = generated.indexOf('        $wacomRemover =');
+    const end = generated.indexOf('        $autodeskOdisInstaller =', start);
+    expect(start).toBeGreaterThan(0);
+    const adapter = generated.slice(start, end);
+    const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+function Test-Adapter($key, $path, $arguments) {
+  $registeredUninstallRegistryKey = $key
+  $registeredUninstallFile = $path
+  $registeredArgumentText = $arguments
+  $additionalUninstallArguments = @()
+  ${adapter}
+  return @($additionalUninstallArguments)
+}
+$path = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Tablet\\Wacom\\32\\Remove.exe'
+[ordered]@{
+  Exact = @(Test-Adapter 'Wacom Tablet Driver' $path '/u')
+  AlreadySilent = @(Test-Adapter 'Wacom Tablet Driver' $path '/u /s')
+  OtherKey = @(Test-Adapter 'Other Driver' $path '/u')
+  OtherPath = @(Test-Adapter 'Wacom Tablet Driver' 'C:\\Other\\Remove.exe' '/u')
+  Install = @(Test-Adapter 'Wacom Tablet Driver' $path '/s')
+  PartialSwitch = @(Test-Adapter 'Wacom Tablet Driver' $path '/update')
+} | ConvertTo-Json -Compress
+`], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      Exact: ['/s'], AlreadySilent: [], OtherKey: [], OtherPath: [], Install: [], PartialSwitch: [],
+    });
+    expect(generated).toContain('The vendor uninstall command did not remove registration');
+  });
+
   it.runIf(canRunWindowsPowerShellPackager)('generates Product Portal unattended removal with exact registration verification', () => {
     const generated = generateRegistryUninstallPackage(
       'exe', 'Product Portal', [],
@@ -641,6 +896,40 @@ describe('PSADT vendor argument contract', () => {
       expect(uninstallFunction).toContain(
         '$registeredUninstallArguments += $reviewedArgument'
       );
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'executes curated WinRAR silent removal arguments on the exact registered route',
+    () => {
+      // Official regional support: https://winrar.es/soporte/instalar/19/como-se-desinstala-winrar
+      // The install-only -s1 switch is not the documented uninstall.exe /s contract.
+      const app = CURATED_APPS.find(app => app.id === 'winrar')!;
+      const input = curatedWorkflowInput(buildCuratedCartItem(app, releaseFixture(app, '7.23')));
+      const generated = generateRegistryUninstallPackage(
+        'exe', input.displayName, [], JSON.parse(input.psadtConfig), [], input.wingetId,
+        app.registeredUninstall!.displayName, input.version, input.uninstallCommand, input.silentSwitches
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'));
+      const configLine = uninstall.split('\n').find(line => line.includes('$reviewedUninstallArguments ='));
+      const merge = uninstall.match(/foreach \(\$reviewedArgument in \$reviewedUninstallArguments\) \{[\s\S]*?\$registeredUninstallArguments \+= \$reviewedArgument\s*\}\s*\}/)?.[0];
+      expect(configLine).toBeTruthy();
+      expect(merge).toBeTruthy();
+      for (const captured of ['@()', "@('/S')"]) {
+        const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${configLine}
+$registeredUninstallArguments = ${captured}
+${merge}
+${merge}
+ConvertTo-Json -InputObject @($registeredUninstallArguments) -Compress
+`], { encoding: 'utf8' });
+        expect(result.status, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout.trim())).toEqual(captured === '@()' ? ['/s'] : ['/S']);
+      }
+      expect(uninstall).toContain("'WinRAR archiver'");
+      expect(uninstall).toContain('Get-ADTApplication -FilterScript { $_.PSChildName -eq $registeredUninstallRegistryKey }');
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
+      expect(configLine).not.toContain('-s1');
     }
   );
 
@@ -1370,6 +1659,44 @@ ${merge}
   );
 
   it.runIf(canRunWindowsPowerShellPackager)(
+    'generates ZWCAD 2025 vendor removal while retaining exact registration completion',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'exe', 'ZWCAD 2025', [],
+        applyApplicationPackagingAdapter('ZWSOFT.ZWCAD.2025', DEFAULT_PSADT_CONFIG),
+        [], 'ZWSOFT.ZWCAD.2025', 'ZWCAD 2025', '25.21.10.19929',
+        'REGISTRY_UNINSTALL_PRODUCT:{82434F95-A001-0000-A200-7E20F67BFF3C}:ZWCAD 2025',
+        '/install /quiet'
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'), generated.indexOf('function Repair-ADTDeployment'));
+      expect(uninstall).toContain("$registeredUninstallFile = Join-Path $adtSession.DirFiles 'setup.exe'");
+      expect(uninstall).toContain("$registeredUninstallArguments = @('/q', '/u')");
+      expect(uninstall).toContain('{82434F95-A001-0000-A200-7E20F67BFF3C}');
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
+      expect(uninstall).toContain('$effectiveUninstallCompletionTimeoutMinutes = if ($useReviewedExactUninstall) { 10 }');
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'generates ZWCAD 2026 vendor removal while retaining exact registration completion',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'exe', 'ZWCAD 2026', [],
+        applyApplicationPackagingAdapter('ZWSOFT.ZWCAD.2026', DEFAULT_PSADT_CONFIG),
+        [], 'ZWSOFT.ZWCAD.2026', 'ZWCAD 2026', '26.10.0.20036',
+        'REGISTRY_UNINSTALL_PRODUCT:{CBC94276-A001-0000-A200-255782FFDEE0}:ZWCAD 2026',
+        '/install /quiet'
+      );
+      const uninstall = generated.slice(generated.indexOf('function Uninstall-ADTDeployment'), generated.indexOf('function Repair-ADTDeployment'));
+      expect(uninstall).toContain("$registeredUninstallFile = Join-Path $adtSession.DirFiles 'setup.exe'");
+      expect(uninstall).toContain("$registeredUninstallArguments = @('/q', '/u')");
+      expect(uninstall).toContain('{CBC94276-A001-0000-A200-255782FFDEE0}');
+      expect(uninstall).toContain('The vendor uninstall command did not remove registration');
+      expect(uninstall).toContain('$effectiveUninstallCompletionTimeoutMinutes = if ($useReviewedExactUninstall) { 10 }');
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
     'verifies and removes a reviewed self-extracted managed directory without ARP capture',
     () => {
       const generated = generateRegistryUninstallPackage(
@@ -1865,7 +2192,7 @@ ${merge}
   });
 
   it('does not rewrite dollar signs or backticks in generic silent switches', () => {
-    expect(packager).toContain('$silentSwitchesEscaped = $effectiveSilentSwitches -replace "\'", "\'\'"');
+    expect(packager).toContain('$silentSwitchesEscaped = ConvertTo-PSSingleQuotedContent $effectiveSilentSwitches');
     const assignment = packager.match(/^\$silentSwitchesEscaped\s*=.*$/m)?.[0] ?? '';
     expect(assignment).not.toContain("-replace '`'");
     expect(assignment).not.toContain("-replace '\\$'");
@@ -2315,7 +2642,7 @@ describe('PSADT registry uninstall identity contract', () => {
 
   it('parses and persists a manifest product code for multi-entry installers', () => {
     expect(packager).toContain(
-      "^REGISTRY_UNINSTALL_PRODUCT:(\\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\\}):(.+)$"
+      "^REGISTRY_UNINSTALL_PRODUCT:(\\{[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\\}):([\\s\\S]+)\\z"
     );
     expect(packager).toContain(
       "throw 'The exact vendor uninstall identity is malformed; refusing to interpret any embedded GUID as an MSI product code.'"
@@ -2385,6 +2712,125 @@ $changedApplications = @(
 )
 ${selection}
 if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'RackSight 1.1.9') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the Kiwix NSIS key despite the observed Edge registration change',
+    () => {
+      const key = '149170a6-d630-5e6f-a054-8c34dd8a32a2';
+      const command = resolveApplicationUninstallCommand('Kiwix.Wikivoyage.Electron', 'REGISTRY_UNINSTALL:Wikivoyage by Kiwix Electron Edition');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Wikivoyage by Kiwix Electron Edition', [], {}, [],
+        'Kiwix.Wikivoyage.Electron', 'Wikivoyage by Kiwix Electron Edition', '3.8.2-E', command);
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'Wikivoyage by Kiwix 3.8.2-E'; Publisher = 'Kiwix' },
+  [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; DisplayName = 'Microsoft Edge WebView2 Runtime'; Publisher = 'Microsoft Corporation' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'Wikivoyage by Kiwix 3.8.2-E') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the tl;dv NSIS key despite the observed Edge registration change',
+    () => {
+      const key = 'd4ef7abc-e624-5946-b915-b84166f8a4bf';
+      const command = resolveApplicationUninstallCommand('tldx.tldv', 'REGISTRY_UNINSTALL_PRODUCT:{D4EF7ABC-E624-5946-B915-B84166F8A4BF}:tl;dv');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'tl;dv', [], {}, [],
+        'tldx.tldv', 'tl;dv', '3.0.264', command);
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'tldv 3.0.264'; Publisher = 'tldx Solutions UG' },
+  [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; DisplayName = 'Microsoft Edge WebView2 Runtime'; Publisher = 'Microsoft Corporation' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'tldv 3.0.264') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the ZCode bare NSIS key despite the observed Edge registration change',
+    () => {
+      const key = '268ce9e6-a30b-5890-ad18-d4b3ebba5377';
+      const command = resolveApplicationUninstallCommand('ZhipuAI.ZCode', 'REGISTRY_UNINSTALL_PRODUCT:{268CE9E6-A30B-5890-AD18-D4B3EBBA5377}:Z Code');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Z Code', [], {}, [],
+        'ZhipuAI.ZCode', 'Z Code', '3.14.0', command, '/S /allusers');
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'ZCode 3.14.0'; Publisher = 'ZCode' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne '${key}') { throw 'Wrong product selected' }
+$changedApplications = @($changedApplications[1])
+${selection}
+if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
+`], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'selects only the Zermelo NSIS key despite the observed Edge registration change',
+    () => {
+      const key = 'Zermelo';
+      const command = resolveApplicationUninstallCommand('ZermeloSoftwareBV.ZermeloDesktop', 'REGISTRY_UNINSTALL:Zermelo Desktop');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Zermelo Desktop', [], {}, [],
+        'ZermeloSoftwareBV.ZermeloDesktop', 'Zermelo Desktop', '26.09.1', command);
+      const identity = generated.split('\n').find(line => line.includes('$configuredUninstallProductCode ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.PSChildName -eq'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync('pwsh', ['-NoProfile', '-Command', `
+${identity}
+$changedApplications = @(
+  [pscustomobject]@{ PSChildName = '${key}'; DisplayName = 'Zermelo'; Publisher = 'Zermelo Software BV' },
+  [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; DisplayName = 'Microsoft Edge WebView2 Runtime'; Publisher = 'Microsoft Corporation' },
+  [pscustomobject]@{ PSChildName = 'Microsoft Edge'; DisplayName = 'Microsoft Edge'; Publisher = 'Microsoft Corporation' }
+)
+${selection}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].DisplayName -ne 'Zermelo') { throw 'Wrong product selected' }
 $changedApplications = @($changedApplications[1])
 ${selection}
 if (@($selectedApplications).Count -ne 0) { throw 'Unrelated product selected' }
@@ -2846,7 +3292,7 @@ $ambiguous = Select-Localized @('Mozilla Firefox (x64 de)', 'Mozilla Firefox (x8
     );
     expect(packager).toContain('$registryUninstallProductCode = $Matches[1]');
     expect(packager).toContain('$registryUninstallDisplayName = $DisplayName');
-    expect(packager).toContain('$registryUninstallDisplayNameEscaped = $registryUninstallDisplayName -replace');
+    expect(packager).toContain('$registryUninstallDisplayNameEscaped = ConvertTo-PSSingleQuotedContent $registryUninstallDisplayName');
   });
 
   it.runIf(canRunWindowsPowerShellPackager)('emits apostrophe-safe registry identity strings', () => {
@@ -3272,6 +3718,20 @@ if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
     );
   });
 
+  it.runIf(canRunWindowsPowerShellPackager)('generates Python with the existing packaged Burn fallback and exact registration completion', () => {
+    const app = CURATED_APPS.find(app => app.id === 'python-314')!;
+    const input = curatedWorkflowInput(buildCuratedCartItem(app, releaseFixture(app, '3.14.8')));
+    const generated = generateRegistryUninstallPackage(
+      input.installerType as 'burn', input.displayName, [], JSON.parse(input.psadtConfig!), [],
+      input.wingetId, app.name, input.version, input.uninstallCommand, input.silentSwitches,
+    );
+    expect(generated).toContain('The registered Burn uninstaller is unavailable; using the hash-verified packaged bundle');
+    expect(generated).toContain('$burnUninstaller = $bundledUninstaller');
+    expect(generated).toContain('Start-ADTProcess -FilePath $burnUninstaller');
+    expect(generated).toContain('Waiting for Burn uninstall registration [$registeredUninstallRegistryKey] to be removed.');
+    expect(generated).not.toContain('The registered vendor uninstaller was not found:');
+  }, 30_000);
+
   it.runIf(canRunWindowsPowerShellPackager)(
     'narrows an ambiguous executable-wrapper display-name match to the single top-level entry',
     () => {
@@ -3307,10 +3767,10 @@ if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
       "if ($originalInstallerType -in @('burn', 'exe'))"
     );
     expect(hostedPackager).toContain(
-      "if ($selectedApplications.Count -gt 1 -and '${registeredInstallerType}' -in @('burn', 'exe'))"
+      "if ($selectedApplications.Count -gt 1 -and '${psSingleQuotedContent(registeredInstallerType)}' -in @('burn', 'exe'))"
     );
     expect(hostedPackager).toContain(
-      "if ($installedApps.Count -gt 1 -and '${registeredInstallerType}' -in @('burn', 'exe'))"
+      "if ($installedApps.Count -gt 1 -and '${psSingleQuotedContent(registeredInstallerType)}' -in @('burn', 'exe'))"
     );
     expect(hostedPackager).toContain(
       "if (registeredInstallerType === 'burn')"
@@ -4072,9 +4532,9 @@ if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
 
   it('carries the effective nested installer engine into uninstall normalization', () => {
     expect(packager).toContain("$registeredInstallerTypeLower = if ($installerTypeLower -eq 'zip'");
-    expect(packager).toContain("`$registeredInstallerType = '$registeredInstallerTypeLower'");
+    expect(packager).toContain("`$registeredInstallerType = '$(ConvertTo-PSSingleQuotedContent $registeredInstallerTypeLower)'");
     expect(hostedPackager).toContain("const registeredInstallerType = installerType === 'zip'");
-    expect(hostedPackager).toContain("'${registeredInstallerType}' -eq 'inno'");
+    expect(hostedPackager).toContain("'${psSingleQuotedContent(registeredInstallerType)}' -eq 'inno'");
   });
 
   it('monitors exact registry removal for both quiet and fallback EXE uninstall commands', () => {
@@ -4283,7 +4743,7 @@ if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
 
   it('keeps non-MSI fallback visible, non-WindowsInstaller, and fail-closed', () => {
     expect(packager).toContain(
-      "$allowContainsFallback = '$registeredInstallerTypeLower' -notin @('msi', 'wix')"
+      "$allowContainsFallback = '$(ConvertTo-PSSingleQuotedContent $registeredInstallerTypeLower)' -notin @('msi', 'wix')"
     );
     expect(packager).toContain(
       "$systemComponentProperty = $_.PSObject.Properties[''SystemComponent'']"
@@ -4313,7 +4773,7 @@ if (@($selectedApplications).Count -le 1) { throw 'Ambiguity accepted' }
     expect(repairIndex).toBeGreaterThan(-1);
     expect(repairedRegistryBranchIndex).toBeGreaterThan(repairIndex);
     expect(unresolvedSentinelIndex).toBeGreaterThan(repairedRegistryBranchIndex);
-    expect(packager).toContain("$msixPackageName -notmatch '^[A-Za-z0-9.-]+$'");
+    expect(packager).toContain("$msixPackageName -cnotmatch '^[A-Za-z0-9.-]+\\z'");
     expect(packager).toContain("$usesAppxLifecycle = $installerTypeLower -in @('msix', 'appx') -or");
     expect(packager).toContain("$NestedInstallerType.Trim().ToLowerInvariant() -in @('msix', 'appx')");
     expect(packager).toContain('[string]::IsNullOrWhiteSpace($msixPackageName) -and');
@@ -4384,4 +4844,175 @@ describe('PSADT MSIX scope contract', () => {
     );
     expect(packager).toContain('if ($IsUserScope)');
   });
+});
+// Reads every Start-ADTProcess call in Install-ADTDeployment through the
+// PowerShell parser, so each asserted ArgumentList is the exact runtime value.
+function installProcessCalls(generated: string): Array<{ FilePath: string; ArgumentList: string }> {
+  // The packager writes a UTF-8 BOM; ParseInput expects text without it.
+  const source = generated.charCodeAt(0) === 0xfeff ? generated.slice(1) : generated;
+  const script = `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(source).toString('base64')}'))
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | ForEach-Object { $_.Message } | Out-String) }
+$install = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-ADTDeployment' }, $true)
+$calls = @($install.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Start-ADTProcess' }, $true) | ForEach-Object {
+  $elements = @($_.CommandElements)
+  $values = @{}
+  for ($index = 1; $index -lt $elements.Count - 1; $index++) {
+    if ($elements[$index] -is [System.Management.Automation.Language.CommandParameterAst]) {
+      $value = $elements[$index + 1]
+      $values[$elements[$index].ParameterName] = if ($value -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $value.Value } else { $value.Extent.Text }
+    }
+  }
+  [pscustomobject]@{ FilePath = [string]$values['FilePath']; ArgumentList = [string]$values['ArgumentList'] }
+})
+ConvertTo-Json -InputObject $calls -Compress`;
+  const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command',
+    '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'], { input: script, encoding: 'utf8', timeout: 30_000 });
+  if (result.status !== 0) {
+    throw new Error(`Could not read the generated install calls:\n${result.stdout}\n${result.stderr}`);
+  }
+  return JSON.parse(result.stdout.trim());
+}
+
+describe('PSADT install command override', () => {
+  const generateWithInstallOverride = (
+    installCommand: string,
+    installerType: 'exe' | 'inno' = 'exe'
+  ) => generateRegistryUninstallPackage(
+    installerType, 'Java 8 Update 501', [], { installCommand }, [],
+    'Oracle.JavaRuntimeEnvironment', 'Java 8 Update 501', '8.0.5010.8',
+    'REGISTRY_UNINSTALL:Java 8 Update 501', '/s REBOOT=0 SPONSORS=0 AUTO_UPDATE=0'
+  );
+
+  it('encodes overrides for PowerShell and runs other commands through cmd.exe quote preservation', () => {
+    expect(packager).toContain(
+      '$customInstallCommandEscaped = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent('
+    );
+    expect(packager).toContain("-ArgumentList '/s /c `\"$customInstallCommandEscaped`\"'");
+    expect(packager).toContain('-not $customInstallUsesPackagedInstaller');
+    expect(packager).toContain(
+      "[System.IO.Path]::GetExtension($installerFileName).ToLowerInvariant() -notin @('.msi', '.msix', '.msixbundle', '.appx', '.appxbundle', '.zip') -and"
+    );
+  });
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'runs an override of the packaged installer natively with the edited arguments',
+    () => {
+      const generated = generateWithInstallOverride(
+        '"setup.exe" /s REBOOT=0 SPONSORS=0 AUTO_UPDATE=0 REMOVEOUTOFDATEJRES=1'
+      );
+
+      expect(installProcessCalls(generated)).toEqual([{
+        FilePath: '"$($adtSession.DirFiles)\\setup.exe"',
+        ArgumentList: '/s REBOOT=0 SPONSORS=0 AUTO_UPDATE=0 REMOVEOUTOFDATEJRES=1',
+      }]);
+      expect(generated).toContain(
+        "Start-ADTProcess -FilePath \"$($adtSession.DirFiles)\\setup.exe\" -ArgumentList '/s REBOOT=0 SPONSORS=0 AUTO_UPDATE=0 REMOVEOUTOFDATEJRES=1' -WindowStyle Hidden -WaitForMsiExec -Timeout (New-TimeSpan -Minutes 15) -TimeoutAction Stop"
+      );
+      expect(generated).not.toContain('Custom install command override');
+      expect(generated).not.toContain('System32\\cmd.exe');
+    },
+    30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'keeps quoted and apostrophe arguments exact for an unquoted, case-insensitive installer name',
+    () => {
+      const generated = generateWithInstallOverride(
+        'SETUP.EXE /s INSTALLDIR="C:\\Program Files\\Contoso\'s Java"'
+      );
+
+      expect(installProcessCalls(generated)).toEqual([{
+        FilePath: '"$($adtSession.DirFiles)\\setup.exe"',
+        ArgumentList: '/s INSTALLDIR="C:\\Program Files\\Contoso\'s Java"',
+      }]);
+    },
+    30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'keeps Inno Setup handling for a native override',
+    () => {
+      const generated = generateWithInstallOverride('"setup.exe" /VERYSILENT /NORESTART', 'inno');
+
+      expect(installProcessCalls(generated)).toEqual([{
+        FilePath: '"$($adtSession.DirFiles)\\setup.exe"',
+        ArgumentList: '/VERYSILENT /NORESTART /SP-',
+      }]);
+    },
+    30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'runs any other command verbatim through cmd.exe without stripping its quotes',
+    () => {
+      const generated = generateWithInstallOverride('"other.exe" /s "C:\\Data Files\\setup.cfg"');
+
+      expect(installProcessCalls(generated)).toEqual([{
+        FilePath: '"$env:SystemRoot\\System32\\cmd.exe"',
+        ArgumentList: '/s /c ""other.exe" /s "C:\\Data Files\\setup.cfg""',
+      }]);
+      expect(installProcessCalls(generateWithInstallOverride('"setup.exe" /s && echo installed'))).toEqual([{
+        FilePath: '"$env:SystemRoot\\System32\\cmd.exe"',
+        ArgumentList: '/s /c ""setup.exe" /s && echo installed"',
+      }]);
+      expect(installProcessCalls(generateWithInstallOverride('"setup.exe" /s NAME=a^b'))).toEqual([{
+        FilePath: '"$env:SystemRoot\\System32\\cmd.exe"',
+        ArgumentList: '/s /c ""setup.exe" /s NAME=a^b"',
+      }]);
+      expect(installProcessCalls(generateWithInstallOverride('"setup.exe" /s /LOG="%CD%\\install.log"'))).toEqual([{
+        FilePath: '"$env:SystemRoot\\System32\\cmd.exe"',
+        ArgumentList: '/s /c ""setup.exe" /s /LOG="%CD%\\install.log""',
+      }]);
+    },
+    30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'encodes typographic single quotes so an override cannot leave its PowerShell string',
+    () => {
+      const leftQuote = String.fromCharCode(0x2018);
+      const rightQuote = String.fromCharCode(0x2019);
+      const override = `"setup.exe" /s NAME=${rightQuote}; Write-Host injected; ${leftQuote}`;
+      const generated = generateWithInstallOverride(override);
+
+      expect(installProcessCalls(generated)).toEqual([{
+        FilePath: '"$env:SystemRoot\\System32\\cmd.exe"',
+        ArgumentList: `/s /c "${override}"`,
+      }]);
+      expect(generated).not.toMatch(/^\s*Write-Host injected/m);
+    },
+    30_000
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'executes the cmd.exe override command line exactly as written',
+    () => {
+      const generated = generateWithInstallOverride('"probe one.cmd" "first value" second');
+      const [call] = installProcessCalls(generated);
+      const fixtureRoot = mkdtempSync(join(tmpdir(), 'intuneget-cmd-override-'));
+      try {
+        writeFileSync(join(fixtureRoot, 'probe one.cmd'), '@echo [%~1] [%~2]\r\n');
+        // Model the Intune process environment, where cmd.exe resolves commands
+        // from its working directory (the package Files directory).
+        const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command',
+          'Remove-Item Env:NoDefaultCurrentDirectoryInExePath -ErrorAction SilentlyContinue; $info = [Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\\System32\\cmd.exe", $env:OVERRIDE_ARGUMENTS); $info.WorkingDirectory = $env:OVERRIDE_DIRECTORY; $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $process = [Diagnostics.Process]::Start($info); $process.StandardOutput.ReadToEnd(); $process.WaitForExit(); exit $process.ExitCode',
+        ], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            OVERRIDE_ARGUMENTS: call.ArgumentList,
+            OVERRIDE_DIRECTORY: fixtureRoot,
+          },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout.trim()).toBe('[first value] [second]');
+      } finally {
+        rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+    30_000
+  );
 });

@@ -35,12 +35,12 @@ jobs:
       app_count: ${{ steps.select.outputs.app_count }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "26.5.0"
           cache: npm
@@ -72,15 +72,21 @@ jobs:
 
           const supabase = createClient(url, key);
           async function main() {
+            const { isScannerEligible, selectScanApps } = await import('./.github/scripts/scan-app-selection.mjs');
             let query = supabase
               .from('curated_apps')
               .select('winget_id, name, publisher, latest_version, popularity_rank')
               .not('latest_version', 'is', null);
             if (specific) query = query.in('winget_id', requested);
             else query = query.order('popularity_rank', { ascending: true, nullsFirst: false }).limit(Math.max(500, maxApps * 20));
-            const { data: candidates, error } = await query;
+            const { data, error } = await query;
             if (error) throw error;
-            if (!candidates?.length) throw new Error('No matching apps were found');
+            if (!data?.length) throw new Error('No matching apps were found');
+            const candidates = specific ? data : data.filter(isScannerEligible);
+            if (!specific && candidates.length !== data.length) {
+              console.log(`Excluded ${data.length - candidates.length} app(s) incompatible with scanner parameters`);
+            }
+            if (!candidates.length) throw new Error('No scanner-eligible apps were found');
 
             const lastScanned = new Map();
             for (let i = 0; i < candidates.length; i += 100) {
@@ -94,15 +100,7 @@ jobs:
               for (const row of data || []) if (!lastScanned.has(row.winget_id)) lastScanned.set(row.winget_id, row.scanned_at);
             }
 
-            candidates.sort((a, b) => {
-              const aTime = lastScanned.has(a.winget_id) ? Date.parse(lastScanned.get(a.winget_id)) : 0;
-              const bTime = lastScanned.has(b.winget_id) ? Date.parse(lastScanned.get(b.winget_id)) : 0;
-              return aTime - bTime || (a.popularity_rank ?? Number.MAX_SAFE_INTEGER) - (b.popularity_rank ?? Number.MAX_SAFE_INTEGER);
-            });
-            const apps = candidates.slice(0, maxApps).map(app => ({
-              winget_id: app.winget_id,
-              expected_version: app.latest_version,
-            }));
+            const apps = selectScanApps(candidates, lastScanned, maxApps);
             const matrix = JSON.stringify({ include: apps });
             fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${matrix}\napp_count=${apps.length}\n`);
             console.log(`Selected ${apps.length} app(s): ${apps.map(a => a.winget_id).join(', ')}`);
@@ -124,7 +122,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout scanner code without credentials
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -148,7 +146,7 @@ jobs:
 
       - name: Upload scan result
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scan-result-${{ matrix.winget_id }}
           path: scan-result.json
@@ -172,7 +170,7 @@ jobs:
 
       - name: Preserve WinGet diagnostics for failed installs
         if: always() && steps.scan.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scan-diagnostics-${{ matrix.winget_id }}
           path: scan-diagnostics/
@@ -194,12 +192,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "26.5.0"
           cache: npm
@@ -208,7 +206,7 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Download scan results
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: scan-result-*
           path: scan-results
@@ -236,7 +234,9 @@ jobs:
 
           const supabase = createClient(url, key);
           async function main() {
+            const { writeSnapshot } = await import('./.github/scripts/scan-snapshot-ingest.mjs');
             let uploaded = 0;
+            let preserved = 0;
             for (const result of results) {
               if (!result.winget_id || !result.version || !['completed', 'failed', 'skipped'].includes(result.status)) {
                 throw new Error(`Invalid scan result: ${JSON.stringify(result).slice(0, 300)}`);
@@ -260,9 +260,13 @@ jobs:
                 architecture: result.architecture,
                 updated_at: new Date().toISOString(),
               };
-              const { error } = await supabase.from('installation_snapshots').upsert(record, { onConflict: 'winget_id,version' });
-              if (error) throw error;
-              uploaded++;
+              const outcome = await writeSnapshot(supabase, record);
+              if (outcome === 'preserved') {
+                preserved++;
+                console.log(`Preserved completed snapshot for ${result.winget_id} ${result.version}; current attempt ${result.status}`);
+              } else {
+                uploaded++;
+              }
             }
 
             const completed = results.filter(r => r.status === 'completed').length;
@@ -275,12 +279,12 @@ jobs:
               last_run_status: status,
               items_processed: completed,
               error_message: failed || skipped ? `${failed} failed, ${skipped} skipped` : null,
-              metadata: { total: results.length, uploaded, completed, failed, skipped },
+              metadata: { total: results.length, uploaded, preserved, completed, failed, skipped },
               updated_at: new Date().toISOString(),
             });
             if (statusError) throw statusError;
 
-            fs.writeFileSync('scan-summary.json', JSON.stringify({ completed, failed, skipped, results }, null, 2));
+            fs.writeFileSync('scan-summary.json', JSON.stringify({ uploaded, preserved, completed, failed, skipped, results }, null, 2));
             if (failed > 0) process.exitCode = 1;
           }
           main().catch(error => { console.error(error); process.exit(1); });
@@ -294,5 +298,7 @@ jobs:
           echo "- **Completed:** $(jq -r .completed scan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Failed:** $(jq -r .failed scan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Skipped:** $(jq -r .skipped scan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Snapshots written:** $(jq -r .uploaded scan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Completed snapshots preserved:** $(jq -r .preserved scan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           jq -r '.results[] | "- `\(.winget_id)` — \(.status)\(if .error then ": " + .error else "" end)"' scan-summary.json >> "$GITHUB_STEP_SUMMARY"

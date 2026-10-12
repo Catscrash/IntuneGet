@@ -8,6 +8,7 @@ const {
   getDetectedUpdatesMock,
   upsertPolicyMock,
   getPoliciesByUserMock,
+  getPolicyByKeyMock,
   getCatalogSourceMock,
   getAppForInstallerMock,
 } = vi.hoisted(() => ({
@@ -18,6 +19,7 @@ const {
   getDetectedUpdatesMock: vi.fn(),
   upsertPolicyMock: vi.fn(),
   getPoliciesByUserMock: vi.fn(),
+  getPolicyByKeyMock: vi.fn(),
   getCatalogSourceMock: vi.fn(),
   getAppForInstallerMock: vi.fn(),
 }));
@@ -81,14 +83,16 @@ beforeEach(() => {
     updateCheckResults: { getByUserId: getDetectedUpdatesMock },
     updatePolicies: {
       upsert: upsertPolicyMock,
-      getByUserId: getPoliciesByUserMock,
+      list: getPoliciesByUserMock,
+      getByKey: getPolicyByKeyMock,
     },
   });
   seed({});
   getPoliciesByUserMock.mockResolvedValue([]);
+  getPolicyByKeyMock.mockResolvedValue(null);
   upsertPolicyMock.mockImplementation(async (policy: Record<string, unknown>) => ({
-    policy: { id: 'policy-new', ...policy },
-    created: true,
+    id: 'policy-new',
+    ...policy,
   }));
   parseAccessTokenMock.mockResolvedValue({
     userId: 'user-1',
@@ -348,10 +352,8 @@ describe('POST /api/update-policies', () => {
   it('reports an existing policy as replaced rather than created', async () => {
     // One policy per user, tenant and app: setting a second one from the
     // dropdown must land on the same row.
-    upsertPolicyMock.mockResolvedValue({
-      policy: { id: 'policy-1', policy_type: 'ignore' },
-      created: false,
-    });
+    getPolicyByKeyMock.mockResolvedValue({ id: 'policy-1', policy_type: 'notify' });
+    upsertPolicyMock.mockResolvedValue({ id: 'policy-1', policy_type: 'ignore' });
 
     const body = await (
       await POST(

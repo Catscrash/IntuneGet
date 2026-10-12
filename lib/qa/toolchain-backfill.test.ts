@@ -6,9 +6,91 @@ import {
 } from './toolchain-backfill';
 
 describe('QA toolchain targeted retries', () => {
+  it('adds only Wacom while carrying approved unconsumed retry targets', () => {
+    const previous = '60395492a3d51b2ff6f14b50ed7cd0c7f558be70';
+    expect(terminalToolchainRetryTargets('25849ac512c211e616c135149ef1e059db367ebc')).toEqual([
+      'Wacom.WacomTabletDriver', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(previous, { wingetId: 'Wacom.WacomTabletDriver', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate('25849ac512c211e616c135149ef1e059db367ebc', { wingetId: 'Wacom.WacomTabletDriver', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('25849ac512c211e616c135149ef1e059db367ebc', { wingetId: 'Wacom.OtherDriver', status: 'failed' })).toBe(false);
+  });
+  it('carries the preceding unconsumed retry targets without adding applications', () => {
+    const previous = terminalToolchainRetryTargets('25849ac512c211e616c135149ef1e059db367ebc');
+    expect(terminalToolchainRetryTargets(QA_PSADT_TOOLCHAIN.packagerCommit)).toEqual(previous);
+    const current = terminalToolchainRetryTargets(QA_PSADT_TOOLCHAIN.packagerCommit);
+    current.push('Unapproved.Extra');
+    expect(terminalToolchainRetryTargets(QA_PSADT_TOOLCHAIN.packagerCommit)).toEqual(previous);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, { wingetId: 'Unapproved.Extra', status: 'failed' })).toBe(false);
+  });
+  it('retries Bandizip only on the reviewed silent-removal release', () => {
+    const previous = '4b4637967c6e2b0188f5713d262dd1219a02465e';
+    expect(terminalToolchainRetryTargets('60395492a3d51b2ff6f14b50ed7cd0c7f558be70')).toEqual([
+      'Bandisoft.Bandizip', ...terminalToolchainRetryTargets(previous),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(previous, { wingetId: 'Bandisoft.Bandizip', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, { wingetId: 'Bandisoft.Bandizip', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, { wingetId: 'Bandisoft.Bandizip.MSE', status: 'failed' })).toBe(false);
+  });
+  it('adds only ZWCAD 2026 to the bounded retry targets', () => {
+    const previous = 'e7410e97df040bd38f11842ccf259abd9bc757f7';
+    expect(terminalToolchainRetryTargets('4b4637967c6e2b0188f5713d262dd1219a02465e')).toEqual([
+      'ZWSOFT.ZWCAD.2026', ...terminalToolchainRetryTargets(previous),
+    ]);
+    const candidate = { wingetId: 'ZWSOFT.ZWCAD.2026', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(previous, candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, candidate)).toBe(true);
+    for (const wingetId of ['ZWSOFT.ZWCAD.2027', 'ZWSOFT.ZWCAD.Mechanical.2026', 'ZWSOFT.NetworkLicenseManager']) {
+      expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, { wingetId, status: 'failed' })).toBe(false);
+    }
+  });
+  it('adds only ZWCAD 2025 to the bounded retry targets', () => {
+    const previous = '5e561aeff961e42e63eba4fee4696c15a0cbff71';
+    expect(terminalToolchainRetryTargets('e7410e97df040bd38f11842ccf259abd9bc757f7')).toEqual([
+      'ZWSOFT.ZWCAD.2025', ...terminalToolchainRetryTargets(previous),
+    ]);
+    const candidate = { wingetId: 'ZWSOFT.ZWCAD.2025', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(previous, candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate('e7410e97df040bd38f11842ccf259abd9bc757f7', candidate)).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('e7410e97df040bd38f11842ccf259abd9bc757f7',
+      { wingetId: 'ZWSOFT.ZWCAD.2026', status: 'failed' })).toBe(false);
+  });
+  it('adds only ZCode to the bounded retry targets', () => {
+    const previous = 'c861e3a90f8bbf28842b86ab0070230efecaf3a9';
+    expect(terminalToolchainRetryTargets('5e561aeff961e42e63eba4fee4696c15a0cbff71')).toEqual([
+      'ZhipuAI.ZCode', ...terminalToolchainRetryTargets(previous),
+    ]);
+    const candidate = { wingetId: 'ZhipuAI.ZCode', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(previous, candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate('5e561aeff961e42e63eba4fee4696c15a0cbff71', candidate)).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('5e561aeff961e42e63eba4fee4696c15a0cbff71',
+      { wingetId: 'ZhipuAI.Other', status: 'failed' })).toBe(false);
+  });
+  it('adds only the repaired tl;dv identity to the bounded retry targets', () => {
+    const previous = 'e79da0398e3cf3c6874e53b6304a2aef54b5770f';
+    expect(terminalToolchainRetryTargets('c861e3a90f8bbf28842b86ab0070230efecaf3a9')).toEqual([
+      'tldx.tldv', ...terminalToolchainRetryTargets(previous),
+    ]);
+    const candidate = { wingetId: 'tldx.tldv', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(previous, candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, candidate)).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'tldx.Other', status: 'failed' })).toBe(false);
+  });
+  it('adds only the repaired Kiwix Electron identity to the bounded retry targets', () => {
+    const previous = 'cb3e4501fa7c4470330a1b6031dd5799fee8f9e4';
+    expect(terminalToolchainRetryTargets('e79da0398e3cf3c6874e53b6304a2aef54b5770f')).toEqual([
+      'Kiwix.Wikivoyage.Electron', ...terminalToolchainRetryTargets(previous),
+    ]);
+    const candidate = { wingetId: 'Kiwix.Wikivoyage.Electron', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(previous, candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate('e79da0398e3cf3c6874e53b6304a2aef54b5770f', candidate)).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('e79da0398e3cf3c6874e53b6304a2aef54b5770f',
+      { wingetId: 'Kiwix.Other', status: 'failed' })).toBe(false);
+  });
   it('adds only LPub3D to the managed-context release retry targets', () => {
     const previous = 'ada1a8a5d1ad0ae9ad953306a6b528c71479a803';
-    const current = QA_PSADT_TOOLCHAIN.packagerCommit;
+    const current = '6dfeaea03893e63cf7aba747638d7ea1768ac6b7';
     expect(terminalToolchainRetryTargets(current)).toEqual([
       'trevorsandy.lpub3d', ...terminalToolchainRetryTargets(previous),
     ]);
@@ -342,6 +424,19 @@ describe('QA toolchain targeted retries', () => {
       QA_PSADT_TOOLCHAIN.packagerCommit,
       { wingetId: 'Unrelated.App', status: 'failed' }
     )).toBe(false);
+  });
+
+  it('retries GreenTunnel only under the repaired shared scope release', () => {
+    expect(terminalToolchainRetryTargets('bc329cb8bfafd8d2af940bdc9f8ccf044ac15146')).toEqual([
+      'SadeghHayeri.GreenTunnel',
+      ...terminalToolchainRetryTargets('6dfeaea03893e63cf7aba747638d7ea1768ac6b7'),
+    ]);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: ' sadeghhayeri.greentunnel ', status: 'failed' })).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('6dfeaea03893e63cf7aba747638d7ea1768ac6b7',
+      { wingetId: 'SadeghHayeri.GreenTunnel', status: 'failed' })).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Unrelated.App', status: 'failed' })).toBe(false);
   });
 
   it('retries Ente Photos only after activating its reviewed user scope', () => {
@@ -2048,4 +2143,16 @@ describe('QA toolchain targeted retries', () => {
       'e139e4cc222576f34ca905b7180ac47ea548cbab'
     )).not.toContain('Igneus.SimpleHydraulicCalculator');
   });
+  it('retries Zermelo only after its exact registry identity release', () => {
+    expect(terminalToolchainRetryTargets('cb3e4501fa7c4470330a1b6031dd5799fee8f9e4')).toEqual([
+      'ZermeloSoftwareBV.ZermeloDesktop',
+      ...terminalToolchainRetryTargets('bc329cb8bfafd8d2af940bdc9f8ccf044ac15146'),
+    ]);
+    const candidate = { wingetId: 'ZermeloSoftwareBV.ZermeloDesktop', status: 'failed' };
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit, candidate)).toBe(true);
+    expect(shouldRetryTerminalToolchainCandidate('bc329cb8bfafd8d2af940bdc9f8ccf044ac15146', candidate)).toBe(false);
+    expect(shouldRetryTerminalToolchainCandidate(QA_PSADT_TOOLCHAIN.packagerCommit,
+      { wingetId: 'Example.Other', status: 'failed' })).toBe(false);
+  });
+
 });

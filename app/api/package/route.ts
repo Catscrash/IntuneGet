@@ -3,6 +3,10 @@ import {
   resolveAppDescriptionSuffix,
   resolveVirusTotalMaliciousThreshold,
 } from '@/types/user-settings';
+import { CuratedCatalogError, isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
+import { reconcileCuratedCartItem } from '@/lib/curated-catalog/server';
+import { findCuratedApp } from '@/lib/curated-catalog/definitions';
+import { assertCuratedLicenceAccepted, CuratedLicenceError } from '@/lib/curated-catalog/licence';
 /**
  * Package API Route
  * Queues packaging jobs by triggering GitHub Actions workflows
@@ -10,6 +14,7 @@ import {
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { logValue } from '@/lib/server-log';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { readEffectiveSettings } from '@/lib/user-settings-store';
@@ -29,6 +34,7 @@ import { extractSilentSwitches } from '@/lib/msp/silent-switches';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { sanitizeAssignmentsForDispatch } from '@/lib/assignment-intents';
 import { acquireGraphToken } from '@/lib/graph-token';
+import { findPendingApprovalBlocks } from '@/lib/intune-approval-guard';
 import { deployStoreApp } from '@/lib/store-app-deploy';
 import {
   STALE_JOB_TIMEOUT_MINUTES,
@@ -61,6 +67,7 @@ import {
   getPackageEligibilityBlocks,
   PACKAGE_UNAVAILABLE_MESSAGE,
 } from '@/lib/package-eligibility';
+import { QA_PRIORITY_CUSTOMER } from '@/lib/qa/constants';
 
 export const maxDuration = 300;
 
@@ -175,10 +182,10 @@ export async function POST(request: NextRequest) {
     }
 
     // Parse request body
-    const body: PackageRequestBody = await request.json();
-    const { items, forceCreate } = body;
+    const body: unknown = await request.json();
+    const { items, forceCreate } = (body && typeof body === 'object' ? body : {}) as PackageRequestBody;
 
-    if (!items || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0) {
       return NextResponse.json(
         { error: 'No items provided for packaging' },
         { status: 400 }
@@ -193,8 +200,47 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Reject the entire invalid custom detection request before packaging side effects.
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return NextResponse.json({ error: 'Invalid package item' }, { status: 400 });
+      }
+      const psadtConfig = (item as unknown as { psadtConfig?: unknown }).psadtConfig;
+      if (psadtConfig !== undefined && (psadtConfig === null || typeof psadtConfig !== 'object' || Array.isArray(psadtConfig))) {
+        return NextResponse.json({ error: 'Invalid PSADT settings' }, { status: 400 });
+      }
+      const flag = (item as unknown as { psadtConfig?: { customDetection?: unknown } }).psadtConfig?.customDetection;
+      if (flag !== undefined && typeof flag !== 'boolean') {
+        return NextResponse.json({ error: 'Invalid custom detection setting' }, { status: 400 });
+      }
+      if (!isStoreCartItem(item) && item.psadtConfig?.customDetection) {
+        const validation = validateCustomDetectionRules(item.detectionRules);
+        if (!canUseCustomDetection(item) || !validation.valid) {
+          return NextResponse.json({ error: 'Invalid custom detection rules', message: validation.errors.join(' ') || 'Custom detection is supported only for ordinary catalog Win32 apps.' }, { status: 400 });
+        }
+      } else if (isStoreCartItem(item) && (item as unknown as { psadtConfig?: { customDetection?: boolean } }).psadtConfig?.customDetection) {
+        return NextResponse.json({ error: 'Custom detection is not supported for Store apps' }, { status: 400 });
+      }
+    }
+
     // Get database adapter (SQLite or Supabase)
     const db = getDatabase();
+
+    // This checkpoint precedes every Store/Win32 insert and curated QA demand.
+    // Neither request-level nor item-level forceCreate bypasses approval safety.
+    // Check the stored canonical ID and any legacy submitted casing before demand.
+    const approvalBlocks = await findPendingApprovalBlocks({ tenantId,
+      wingetIds: items.flatMap(item => {
+        const curated = typeof item.wingetId === 'string' &&
+          (isCuratedPackageId(item.wingetId) || item.sourceType === 'curated')
+          ? findCuratedApp(item.wingetId) : undefined;
+        return curated ? [curated.packageId, item.wingetId] : [item.wingetId];
+      }) }, { db });
+    if (approvalBlocks.length) {
+      const block = approvalBlocks[0];
+      return NextResponse.json({ error: 'Intune approval unresolved', code: block.code,
+        message: block.message, package: { wingetId: block.wingetId }, retryable: false }, { status: 409 });
+    }
 
     // "Allow available uninstall" is a global operator setting rather than a
     // per-cart choice, so it is stamped onto every item once here. The whole
@@ -261,11 +307,43 @@ export async function POST(request: NextRequest) {
     const win32Items: Win32CartItem[] = [];
 
     for (const item of items) {
+      if (isCuratedPackageId(item.wingetId) || item.sourceType === 'curated') {
+        try {
+          if (isStoreCartItem(item)) throw new CuratedCatalogError('Curated pilot applications require Win32 packaging.');
+          // Custom PSADT execution settings are queued for VM verification
+          // on first use and rejected until that verification passes.
+          Object.assign(item, (await reconcileCuratedCartItem(item as Win32CartItem, { tenantId, userId })).item);
+        } catch (error) {
+          if (!(error instanceof CuratedCatalogError)) throw error;
+          return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+        }
+      }
       if (isStoreCartItem(item)) {
         storeItems.push(item);
       } else {
         // Treat missing appSource as win32 for backward compatibility
         win32Items.push(item as Win32CartItem);
+      }
+    }
+
+    // Publisher licence agreements are accepted per tenant, never per cart.
+    // Record the acceptance that authorized each curated job for audit; the
+    // dispatch and local packager claim paths verify it again.
+    for (const item of win32Items) {
+      delete item.curatedLicenceAcceptance;
+      if (item.sourceType !== 'curated') continue;
+      try {
+        const acceptance = await assertCuratedLicenceAccepted(tenantId, item.wingetId, db);
+        if (acceptance) item.curatedLicenceAcceptance = acceptance;
+      } catch (error) {
+        if (!(error instanceof CuratedLicenceError)) throw error;
+        return NextResponse.json({
+          error: 'Licence agreement required',
+          message: error.message,
+          code: error.code,
+          attestation: error.attestation,
+          package: { wingetId: item.wingetId, displayName: item.displayName, version: item.version },
+        }, { status: 409 });
       }
     }
 
@@ -393,6 +471,13 @@ export async function POST(request: NextRequest) {
         const failedItem = batch[failedIndex];
         const error = failed.reason;
         if (error instanceof InstallerPreflightError) {
+          console.warn('Installer selection blocked before dispatch', {
+            requestId: request.headers.get('x-vercel-id'),
+            wingetId: failedItem.wingetId,
+            version: failedItem.version,
+            code: error.code,
+            retryable: error.retryable,
+          });
           return NextResponse.json({
             error: 'Installer validation blocked this deployment',
             message: error.message,
@@ -408,6 +493,13 @@ export async function POST(request: NextRequest) {
           }, { status: error.retryable ? 503 : 409 });
         }
         throw error;
+      }
+    }
+
+    // Trusted manifest reconciliation can change the effective installer type.
+    for (const item of win32Items) {
+      if (item.psadtConfig?.customDetection && !canUseCustomDetection(item)) {
+        return NextResponse.json({ error: 'Custom detection is not supported for this resolved installer' }, { status: 400 });
       }
     }
 
@@ -625,7 +717,7 @@ export async function POST(request: NextRequest) {
           try {
             if (item.sourceType !== 'custom') {
               const requestedPsadtConfig = item.psadtConfig || DEFAULT_PSADT_CONFIG;
-              let detectionRules = normalizeCatalogDetectionRules({
+              let detectionRules = requestedPsadtConfig.customDetection ? item.detectionRules : normalizeCatalogDetectionRules({
                 detectionRules: item.detectionRules,
                 fallbackDetectionRules: requestedPsadtConfig.detectionRules,
                 wingetId: item.wingetId,
@@ -634,7 +726,7 @@ export async function POST(request: NextRequest) {
                 markerPath: requestedPsadtConfig.registryMarkerPath,
                 installerType: item.nestedInstallerType || item.installerType,
               });
-              const inferredMarkerPath = requestedPsadtConfig.registryMarkerPath
+              const inferredMarkerPath = requestedPsadtConfig.customDetection || requestedPsadtConfig.registryMarkerPath
                 ? null
                 : inferSavedCustomMarkerPath({
                     detectionRules,
@@ -686,7 +778,7 @@ export async function POST(request: NextRequest) {
                   installScope: item.installScope,
                   psadtConfig: JSON.stringify(item.psadtConfig),
                   detectionRules: JSON.stringify(item.detectionRules || []),
-                  priority: 2000,
+                  priority: QA_PRIORITY_CUSTOMER,
                   demandSource: 'customer',
                 });
             const qaDeferred = qaDemand?.state === 'waiting' && isDeferredCustomerQaEnabled();
@@ -705,10 +797,11 @@ export async function POST(request: NextRequest) {
                   version: item.version,
                   architecture: item.architecture,
                   installerSha256,
-                  qaOverride: isQaMaintenanceMode() || item.qaOverride,
+                  qaOverride: item.sourceType === 'curated' ? false : isQaMaintenanceMode() || item.qaOverride,
                   securityOverride: item.securityOverride,
                   maliciousThreshold,
                   sourceType: item.sourceType,
+                  curatedReleaseId: item.curatedReleaseId,
                 });
               } catch (error) {
                 if (isQaGateError(error)) {
@@ -891,10 +984,11 @@ export async function POST(request: NextRequest) {
                 : undefined,
               installScope: item.installScope,
               forceCreate: item.forceCreate || forceCreate,
-              qaOverride: isQaMaintenanceMode() || item.qaOverride,
+              qaOverride: item.sourceType === 'curated' ? false : isQaMaintenanceMode() || item.qaOverride,
               securityOverride: item.securityOverride,
               maliciousThreshold,
               sourceType: item.sourceType,
+              curatedReleaseId: item.curatedReleaseId,
             };
 
             const triggerResult = await triggerPackagingWorkflow(
@@ -938,14 +1032,20 @@ export async function POST(request: NextRequest) {
             });
           } else {
             const dispatch = pendingDispatches[idx];
-            const dispatchError = result.reason instanceof Error ? result.reason.message : 'Unknown error';
+            // The final dispatch boundary re-checks QA, security and
+            // compatibility evidence. A block there is a validation outcome
+            // with its own reason, not a failure to start the workflow.
+            const qaGateError = isQaGateError(result.reason) ? result.reason : null;
+            const dispatchError = qaGateError
+              ? describeQaGateError(qaGateError)
+              : result.reason instanceof Error ? result.reason.message : 'Unknown error';
             if (dispatch) {
               await db.jobs.update(dispatch.jobId, {
                 status: 'failed',
                 progress_percent: 0,
-                error_stage: 'authenticate',
-                error_category: 'network',
-                error_code: 'WORKFLOW_DISPATCH_FAILED',
+                error_stage: qaGateError ? 'validation' : 'authenticate',
+                error_category: qaGateError ? null : 'network',
+                error_code: qaGateError ? qaGateError.code : 'WORKFLOW_DISPATCH_FAILED',
                 error_message: dispatchError,
                 completed_at: new Date().toISOString(),
               }).catch((updateError) => {
@@ -959,6 +1059,17 @@ export async function POST(request: NextRequest) {
           }
         }
       }
+    }
+
+    // Record each deployment start and failure in the server log so operators
+    // can trace actions that change Intune without opening the web UI.
+    for (const job of jobs) {
+      console.info(
+        `[Package] Deployment job ${logValue(job.id)} created for ${logValue(job.winget_id)} ${logValue(job.version)} (status: ${logValue(job.status)})`
+      );
+    }
+    for (const failure of errors) {
+      console.error(`[Package] Deployment of ${logValue(failure.wingetId)} failed: ${logValue(failure.error)}`);
     }
 
     // Return results
@@ -1145,3 +1256,4 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+import { canUseCustomDetection, validateCustomDetectionRules } from '@/lib/custom-detection';

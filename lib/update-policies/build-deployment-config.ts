@@ -9,7 +9,11 @@
 
 import { createServerClient } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
+import type { DatabaseAdapter } from '@/lib/db/types';
 import { getCatalogSource } from '@/lib/catalog';
+import { isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
+import { getApprovedCuratedRelease } from '@/lib/curated-catalog/server';
+import { buildCuratedCartItem } from '@/lib/curated-catalog/package';
 import { normalizeInstaller } from '@/lib/manifest-api';
 import { selectWingetInstaller } from '@/lib/qa/candidate';
 import {
@@ -269,6 +273,13 @@ export async function buildDefaultDeploymentConfig(
   wingetId: string,
   latestVersion: string
 ): Promise<DeploymentConfig | null> {
+  if (isCuratedPackageId(wingetId)) {
+    try {
+      const { app, release } = getApprovedCuratedRelease(wingetId, latestVersion);
+      const item = buildCuratedCartItem(app, release);
+      return { ...item, forceCreateNewApp: true };
+    } catch { return null; }
+  }
   // Get curated app info
   const curatedApp = await getCatalogSource().getAppNamePublisher(wingetId);
 
@@ -356,6 +367,61 @@ export type BuildDeploymentConfigResult =
   | { status: 'unavailable' };
 
 /**
+ * Assemble a deployment config from a stored packaging job. Shared by the
+ * Supabase and adapter-backed builders so both produce identical configs.
+ */
+function assembleDeploymentConfigFromJob(job: {
+  display_name: string;
+  publisher: string | null;
+  architecture: string | null;
+  installer_type: string | null;
+  install_command: string | null;
+  uninstall_command: string | null;
+  install_scope: string | null;
+  detection_rules: unknown;
+  package_config: unknown;
+}, latestVersion: string): DeploymentConfig {
+  const packageConfig = job.package_config;
+  const parsedAssignments = parsePackageAssignments(packageConfig);
+  const parsedCategories = parsePackageCategories(packageConfig);
+  const parsedRequirementRules = parseRequirementRules(packageConfig);
+  const parsedRelationships = parseAppRelationships(packageConfig);
+  // Explicit per-app choice only. When the packaging job stored no migration
+  // config, leave it undefined so the auto-update trigger falls back to the
+  // user's current global carryOverAssignments setting at update time.
+  const assignmentMigration = parseAssignmentMigration(packageConfig);
+  const psadtConfig = parsePsadtConfig(packageConfig);
+
+  return {
+    displayName: job.display_name,
+    sourceType: isObject(packageConfig) && packageConfig.sourceType === 'curated' ? 'curated' : undefined,
+    curatedReleaseId: isObject(packageConfig) && typeof packageConfig.curatedReleaseId === 'string' ? packageConfig.curatedReleaseId : undefined,
+    curatedSettingsMode: isObject(packageConfig) && ['tested-defaults', 'custom'].includes(String(packageConfig.curatedSettingsMode))
+      ? packageConfig.curatedSettingsMode as 'tested-defaults' | 'custom' : undefined,
+    publisher: job.publisher || 'Unknown Publisher',
+    architecture: job.architecture || 'x64',
+    installerType: job.installer_type || 'exe',
+    installCommand: job.install_command || '',
+    uninstallCommand: job.uninstall_command || '',
+    installScope: job.install_scope || 'system',
+    // The stored rules name the version the previous deployment installed;
+    // point them at the version being deployed now, or the new app object
+    // would detect its predecessor and never report as installed. Rules an
+    // administrator wrote themselves stay exactly as written.
+    detectionRules: psadtConfig?.customDetection
+      ? parseDetectionRules(job.detection_rules)
+      : retargetDetectionRulesToVersion(parseDetectionRules(job.detection_rules), latestVersion),
+    assignments: parsedAssignments,
+    categories: parsedCategories,
+    requirementRules: parsedRequirementRules,
+    relationships: parsedRelationships.length > 0 ? parsedRelationships : undefined,
+    psadtConfig,
+    forceCreateNewApp: true,
+    assignmentMigration,
+  };
+}
+
+/**
  * Orchestrator: build a deployment config for an app, replicating the
  * trigger route's "no policy yet" branch.
  */
@@ -398,40 +464,7 @@ export async function buildDeploymentConfigForApp(
       return { status: 'orphaned_job' };
     }
 
-    const packageConfig = packagingJob.package_config;
-    const parsedAssignments = parsePackageAssignments(packageConfig);
-    const parsedCategories = parsePackageCategories(packageConfig);
-    const parsedRequirementRules = parseRequirementRules(packageConfig);
-    const parsedRelationships = parseAppRelationships(packageConfig);
-    // Explicit per-app choice only. When the packaging job stored no
-    // migration config, leave it undefined so the auto-update trigger falls
-    // back to the user's current global carryOverAssignments setting at
-    // update time (baking the global value in here would freeze it).
-    const assignmentMigration = parseAssignmentMigration(packageConfig);
-
-    const deploymentConfig: DeploymentConfig = {
-      displayName: packagingJob.display_name,
-      publisher: packagingJob.publisher || 'Unknown Publisher',
-      architecture: packagingJob.architecture || 'x64',
-      installerType: packagingJob.installer_type || 'exe',
-      installCommand: packagingJob.install_command || '',
-      uninstallCommand: packagingJob.uninstall_command || '',
-      installScope: packagingJob.install_scope || 'system',
-      // The stored rules name the version the previous deployment installed;
-      // point them at the version being deployed now, or the new app object
-      // would detect its predecessor and never report as installed.
-      detectionRules: retargetDetectionRulesToVersion(
-        parseDetectionRules(packagingJob.detection_rules),
-        latestVersion
-      ),
-      assignments: parsedAssignments,
-      categories: parsedCategories,
-      requirementRules: parsedRequirementRules,
-      relationships: parsedRelationships.length > 0 ? parsedRelationships : undefined,
-      psadtConfig: parsePsadtConfig(packageConfig),
-      forceCreateNewApp: true,
-      assignmentMigration,
-    };
+    const deploymentConfig = assembleDeploymentConfigFromJob(packagingJob, latestVersion);
 
     return { status: 'ok', deploymentConfig, originalUploadHistoryId: uploadHistory.id };
   }
@@ -439,6 +472,52 @@ export async function buildDeploymentConfigForApp(
   // No prior deployment: build config from curated catalog data
   const defaultConfig = await buildDefaultDeploymentConfig(
     null,
+    wingetId,
+    latestVersion
+  );
+
+  if (!defaultConfig) {
+    return { status: 'unavailable' };
+  }
+
+  return { status: 'ok', deploymentConfig: defaultConfig, originalUploadHistoryId: null };
+}
+
+/**
+ * Adapter-backed variant of buildDeploymentConfigForApp. The self-hosted SQLite
+ * adapter has no Supabase client, so it reads the same prior deployment through
+ * the DatabaseAdapter interface and assembles an identical config.
+ */
+export async function buildDeploymentConfigFromAdapter(
+  db: DatabaseAdapter,
+  args: {
+    userId: string;
+    tenantId: string;
+    wingetId: string;
+    latestVersion: string;
+  }
+): Promise<BuildDeploymentConfigResult> {
+  const { tenantId, wingetId, latestVersion } = args;
+
+  // Tenant-wide, like buildDeploymentConfigForApp: the previous deployment's
+  // configuration belongs to the app, not to whoever deployed it.
+  const tenantHistory = await db.uploadHistory.getByTenantId(tenantId);
+  const uploadHistory = tenantHistory.find((row) => row.winget_id === wingetId) || null;
+
+  if (uploadHistory?.packaging_job_id) {
+    const packagingJob = await db.jobs.getById(uploadHistory.packaging_job_id);
+    if (!packagingJob) {
+      return { status: 'orphaned_job' };
+    }
+    return {
+      status: 'ok',
+      deploymentConfig: assembleDeploymentConfigFromJob(packagingJob, latestVersion),
+      originalUploadHistoryId: uploadHistory.id,
+    };
+  }
+
+  const defaultConfig = await buildDefaultDeploymentConfig(
+    null as unknown as ReturnType<typeof createServerClient>,
     wingetId,
     latestVersion
   );

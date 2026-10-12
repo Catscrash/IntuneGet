@@ -1,14 +1,22 @@
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   getLiveInstallersMock,
   hashRemoteInstallerMock,
   assertPublicInstallerUrlMock,
+  requestMock,
 } = vi.hoisted(() => ({
   getLiveInstallersMock: vi.fn(),
   hashRemoteInstallerMock: vi.fn(),
   assertPublicInstallerUrlMock: vi.fn(),
+  requestMock: vi.fn(),
 }));
+
+vi.mock('node:https', () => ({ request: requestMock }));
+vi.mock('node:dns/promises', () => ({ lookup: vi.fn().mockResolvedValue([{ address: '8.8.8.8', family: 4 }]) }));
 
 vi.mock('@/lib/manifest-api', () => ({
   getLiveInstallers: getLiveInstallersMock,
@@ -64,6 +72,50 @@ describe('installer dispatch preflight', () => {
     assertPublicInstallerUrlMock.mockResolvedValue(undefined);
   });
 
+  it('caches the size refusal for one day without suggesting retries or hash quarantine', async () => {
+    const initial = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(initial);
+    try {
+      const body = Buffer.from('size-limit-cache-fixture');
+      const sha256 = createHash('sha256').update(body).digest('hex').toUpperCase();
+      const sizeRequest = { ...request, installerSha256: sha256 };
+      getLiveInstallersMock.mockResolvedValue([{ architecture: 'x64', url: request.installerUrl,
+        sha256, type: 'exe', scope: 'machine' }]);
+      const downloader = await vi.importActual<typeof import('@/lib/installer-download')>('@/lib/installer-download');
+      hashRemoteInstallerMock.mockImplementation(downloader.hashRemoteInstaller);
+      let oversized = true;
+      requestMock.mockImplementation((_options, callback) => {
+        const transport = new EventEmitter() as EventEmitter & { setTimeout: () => void; end: () => void };
+        transport.setTimeout = () => {};
+        transport.end = () => queueMicrotask(() => {
+          const response = Object.assign(new PassThrough(), {
+            headers: { 'content-length': String(oversized ? 5 * 1024 ** 3 + 1 : body.length) }, statusCode: 200,
+          });
+          callback(response);
+          if (!response.destroyed) response.end(body);
+        });
+        return transport;
+      });
+      await expect(enforceInstallerPreflight(sizeRequest)).rejects.toMatchObject({ code: 'INSTALLER_TOO_LARGE', retryable: false });
+      clock.mockReturnValue(initial + 23 * 60 * 60 * 1000);
+      await expect(enforceInstallerPreflight(sizeRequest)).rejects.toMatchObject({ code: 'INSTALLER_TOO_LARGE', retryable: false });
+      expect(requestMock).toHaveBeenCalledOnce();
+      expect(hashRemoteInstallerMock).toHaveBeenCalledOnce();
+      oversized = false;
+      clock.mockReturnValue(initial + 24 * 60 * 60 * 1000 + 1);
+      await expect(enforceInstallerPreflight(sizeRequest)).resolves.toMatchObject({ status: 'healthy', source: 'live', actualSha256: sha256 });
+      expect(requestMock).toHaveBeenCalledTimes(2);
+      expect(hashRemoteInstallerMock).toHaveBeenCalledTimes(2);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['Installer download returned HTTP 403', 'Installer download returned HTTP 404', 'unable to verify the first certificate'])(
+    'keeps transport failures retryable: %s', async (message) => {
+      hashRemoteInstallerMock.mockRejectedValueOnce(new Error(message));
+      await expect(enforceInstallerPreflight(request)).rejects.toMatchObject({ code: 'PREFLIGHT_UNAVAILABLE', retryable: true });
+    },
+  );
+
   it('skips custom installers but still checks where the URL points', async () => {
     await expect(enforceInstallerPreflight({
       ...request,
@@ -95,6 +147,19 @@ describe('installer dispatch preflight', () => {
       retryable: false,
       message: 'Installer URL resolves to a private or reserved address',
     });
+  });
+
+  it('does not download or suggest retrying a removed manifest version', async () => {
+    getLiveInstallersMock.mockResolvedValue([]);
+    await expect(enforceInstallerPreflight(request)).rejects.toMatchObject({
+      code: 'MANIFEST_UNAVAILABLE', retryable: false,
+    });
+    expect(hashRemoteInstallerMock).not.toHaveBeenCalled();
+    // The claim is released into a definitive error, never left "checking".
+    await expect(enforceInstallerPreflight(request)).rejects.toMatchObject({
+      code: 'MANIFEST_UNAVAILABLE', retryable: false,
+    });
+    expect(getLiveInstallersMock).toHaveBeenCalledOnce();
   });
 
   it('checks the exact live manifest and caches a healthy tuple', async () => {

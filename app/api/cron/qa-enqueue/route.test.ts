@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
+  getPackageCompatibilityBlockMock,
   createServerClientMock,
   createManifestClientMock,
   detectWingetChangesMock,
   resolveManifestMock,
   resolveDependenciesMock,
 } = vi.hoisted(() => ({
+  getPackageCompatibilityBlockMock: vi.fn(),
   createServerClientMock: vi.fn(),
   createManifestClientMock: vi.fn(() => ({ kind: 'manifest-client' })),
   detectWingetChangesMock: vi.fn(),
@@ -15,6 +17,7 @@ const {
 }));
 
 vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock }));
+vi.mock('@/lib/package-eligibility', () => ({ getPackageCompatibilityBlock: getPackageCompatibilityBlockMock }));
 vi.mock('@/lib/qa/winget-changes', () => ({ detectWingetChanges: detectWingetChangesMock }));
 vi.mock('@/lib/winget-sync-resolution.mjs', () => ({
   createWingetManifestClient: createManifestClientMock,
@@ -79,6 +82,8 @@ function createSupabaseStub(options: {
   recipes?: Array<Record<string, unknown>>;
   candidates?: Array<Record<string, unknown>>;
   candidatePages?: Array<Array<Record<string, unknown>>>;
+  backfillCheckpoint?: { after: string; pending: string[] };
+  backfillError?: string;
   demandBackfillApps?: string[];
   catalogBackfillApps?: string[];
   deployedApps?: string[];
@@ -86,20 +91,32 @@ function createSupabaseStub(options: {
   pollState?: Record<string, unknown>;
   packageResults?: Array<Record<string, unknown>>;
   installerHealth?: Array<Record<string, unknown>>;
+  candidateInsertResult?: QueryResult;
 }) {
   const pollRunInserts: Array<Record<string, unknown>> = [];
   const pollRunUpdates: Array<Record<string, unknown>> = [];
   const cursorUpdates: Array<Record<string, unknown>> = [];
   const candidateInserts: Array<Record<string, unknown>> = [];
+  const candidateUpdates: Array<Record<string, unknown>> = [];
   const compatibilityBlocks: Array<Record<string, unknown>> = [];
   const catalogReconciliations: Array<Record<string, unknown>> = [];
   const pipelineControlUpdates: Array<Record<string, unknown>> = [];
   const rpcCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const checkpoints: Array<Record<string, unknown>> = [];
   let candidatePageIndex = 0;
 
   const client = {
     rpc: vi.fn((name: string, args: Record<string, unknown>) => {
       rpcCalls.push({ name, args });
+      if (name === 'insert_qa_candidate_if_absent') {
+        candidateInserts.push(args.p_candidate as Record<string, unknown>);
+        if (options.candidateInsertResult) return Promise.resolve(options.candidateInsertResult);
+        return Promise.resolve({ data: { outcome: 'inserted', candidate: { id: `candidate-${candidateInserts.length}` } }, error: null });
+      }
+      if (name === 'qa_toolchain_backfill_page') return Promise.resolve({
+        data: options.candidatePages ? options.candidatePages[candidatePageIndex++] || [] : options.candidates || [],
+        error: options.backfillError ? { message: options.backfillError } : null,
+      });
       if (name === 'record_qa_demand_backfill_selection') {
         return Promise.resolve({ data: null, error: null });
       }
@@ -118,6 +135,14 @@ function createSupabaseStub(options: {
       });
     }),
     from: vi.fn((table: string) => {
+      if (table === 'qa_automation_state') {
+        const builder = query({ data: { value: options.backfillCheckpoint || {} }, error: null });
+        builder.upsert = vi.fn((value: Record<string, unknown>) => {
+          checkpoints.push(value);
+          return query({ data: null, error: null });
+        });
+        return builder;
+      }
       if (table === 'qa_pipeline_control') {
         const builder = query({
           data: {
@@ -223,11 +248,10 @@ function createSupabaseStub(options: {
       }
       if (table === 'qa_candidates') {
         return {
-          insert: vi.fn((row: Record<string, unknown>) => {
-            candidateInserts.push(row);
-            return query({ data: { id: `candidate-${candidateInserts.length}` }, error: null });
+          update: vi.fn((values: Record<string, unknown>) => {
+            candidateUpdates.push(values);
+            return query({ data: null, error: null });
           }),
-          update: vi.fn(() => query({ data: null, error: null })),
           select: vi.fn(() =>
             query({
               data: options.candidatePages
@@ -247,10 +271,12 @@ function createSupabaseStub(options: {
     pollRunUpdates,
     cursorUpdates,
     candidateInserts,
+    candidateUpdates,
     compatibilityBlocks,
     catalogReconciliations,
     pipelineControlUpdates,
     rpcCalls,
+    checkpoints,
   };
 }
 
@@ -357,6 +383,7 @@ function cronRequest(query = ''): Request {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  getPackageCompatibilityBlockMock.mockReset().mockResolvedValue(null);
   vi.spyOn(console, 'log').mockImplementation(() => undefined);
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
   process.env.CRON_SECRET = 'test-cron-secret';
@@ -379,6 +406,46 @@ afterEach(() => {
 });
 
 describe('GET /api/cron/qa-enqueue', () => {
+  it('resumes a persisted cursor and stops after two bounded pages', async () => {
+    const pages = [0, 1].map(page => Array.from({ length: 100 }, (_, index) =>
+      profileCandidate({ id: `current-${page}-${index}`, wingetId: `Page${page}.App${String(index).padStart(3, '0')}`,
+        packagerCommit: CURRENT_PACKAGER_COMMIT })));
+    const { client, rpcCalls, checkpoints } = createSupabaseStub({
+      backfillCheckpoint: { after: 'Previous.App', pending: [] }, candidatePages: pages,
+    });
+    createServerClientMock.mockReturnValue(client);
+    await GET(cronRequest());
+    expect(rpcCalls.filter(call => call.name === 'qa_toolchain_backfill_page')).toEqual([
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Previous.App', p_limit: 100, p_terminal_retry_ids: expect.any(Array) }) },
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Page0.App099', p_limit: 100 }) },
+    ]);
+    expect(checkpoints.at(-1)).toMatchObject({ value: { after: 'Page1.App099', pending: [] } });
+  });
+
+  it('drains pending checkpoint IDs before scanning another page', async () => {
+    const { client, rpcCalls, checkpoints } = createSupabaseStub({
+      backfillCheckpoint: { after: 'Previous.App', pending: ['A.App', 'B.App', 'C.App', 'D.App'] },
+    });
+    createServerClientMock.mockReturnValue(client);
+    await GET(cronRequest());
+    expect(rpcCalls.some(call => call.name === 'qa_toolchain_backfill_page')).toBe(false);
+    expect(checkpoints.at(-1)).toMatchObject({ value: { after: 'Previous.App', pending: ['D.App'] } });
+  });
+
+  it('still enqueues discovered updates when the historical scan times out', async () => {
+    const { client, candidateInserts } = createSupabaseStub({
+      backfillError: 'statement timeout',
+      supportedApps: [{ winget_id: 'Example.App', name: 'Example', publisher: 'Contoso' }],
+    });
+    createServerClientMock.mockReturnValue(client);
+    detectWingetChangesMock.mockResolvedValue({ baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40),
+      changedFiles: 1, changedPackageIds: ['Example.App'], initialized: false, etag: null, rateLimitedUntil: null });
+    resolveManifestMock.mockResolvedValue(resolvedManifest());
+    const response = await GET(cronRequest());
+    expect(await response.json()).toMatchObject({ queued: 1, errorCount: 1 });
+    expect(candidateInserts).toHaveLength(1);
+  });
+
   it('keeps quarantined and packaging-ineligible superseded tuples dormant', () => {
     expect(shouldReactivateSupersededCandidate(
       'superseded',
@@ -520,6 +587,7 @@ describe('GET /api/cron/qa-enqueue', () => {
     expect(rpcCalls).toEqual([
       { name: 'qa_missing_demand_backfill_ids', args: { p_limit: 20 } },
       { name: 'qa_idle_catalog_backfill_ids', args: { p_limit: 20 } },
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: '', p_limit: 100, p_terminal_retry_ids: expect.any(Array) }) },
     ]);
     expect(pollRunUpdates).toEqual([
       expect.objectContaining({
@@ -570,6 +638,34 @@ describe('GET /api/cron/qa-enqueue', () => {
       expect.objectContaining({ github_rate_limited_until: resetAt }),
     ]);
     expect(pollRunUpdates[0]).toMatchObject({ status: 'partial', error_count: 1 });
+  });
+
+  it.each(['exact_conflict', 'active_conflict'])('retains a known candidate on %s without inserting another lifecycle', async outcome => {
+    const { client, candidateInserts, candidateUpdates } = createSupabaseStub({
+      demandBackfillApps: ['Missing.App'],
+      supportedApps: [{ winget_id: 'Missing.App', name: 'Missing', publisher: 'Contoso', latest_version: '1.0.0' }],
+      candidateInsertResult: { data: { outcome, candidate: { id: 'existing-run', status: 'running', priority: 2000 } }, error: null },
+    });
+    createServerClientMock.mockReturnValue(client);
+    resolveManifestMock.mockResolvedValue(resolvedManifest());
+    const response = await GET(cronRequest());
+    expect(await response.json()).toMatchObject({ queued: 0, alreadyKnown: 1, errorCount: 0 });
+    expect(candidateInserts).toHaveLength(1);
+    expect(candidateUpdates).toEqual([]);
+  });
+
+  it('reports an unavailable enqueue RPC and keeps the pipeline running', async () => {
+    const { client, pipelineControlUpdates } = createSupabaseStub({
+      demandBackfillApps: ['Missing.App'],
+      supportedApps: [{ winget_id: 'Missing.App', name: 'Missing', publisher: 'Contoso', latest_version: '1.0.0' }],
+      candidateInsertResult: { data: null, error: { code: 'PGRST202', message: 'Missing QA enqueue function' } },
+    });
+    createServerClientMock.mockReturnValue(client);
+    resolveManifestMock.mockResolvedValue(resolvedManifest());
+    const response = await GET(cronRequest());
+    expect(response.status).toBe(207);
+    expect(await response.json()).toMatchObject({ queued: 0, errorCount: 1 });
+    expect(pipelineControlUpdates).not.toContainEqual(expect.objectContaining({ paused: true }));
   });
 
   it('queues a demanded app missing latest-version catalog QA without a WinGet change', async () => {
@@ -711,6 +807,29 @@ describe('GET /api/cron/qa-enqueue', () => {
     expect(candidateInserts.find((row) => row.winget_id === 'Catalog.App')).toMatchObject({
       priority: 0,
       demand_source: 'catalog',
+    });
+  });
+
+  it.each([false, true])('refuses an exact held payload even for targeted requests (lookup error: %s)', async (lookupError) => {
+    const { client, candidateInserts } = createSupabaseStub({
+      supportedApps: [{ winget_id: 'Microsoft.SQLServerManagementStudio.22', name: 'SSMS', publisher: 'Microsoft', latest_version: '22.10.2' }],
+    });
+    createServerClientMock.mockReturnValue(client);
+    const manifest = resolvedManifest();
+    manifest.version = '22.10.2';
+    manifest.manifest.Installers[0].InstallerSha256 = 'E7B3885D3A0FEBB83B7A5CB155EFD8410A9A651A1BE16EAAA35D594C4D1D75D2';
+    resolveManifestMock.mockResolvedValue(manifest);
+    if (lookupError) getPackageCompatibilityBlockMock.mockRejectedValueOnce(new Error('Compatibility gate unavailable'));
+    else getPackageCompatibilityBlockMock.mockResolvedValueOnce({ code: 'failed_managed_lifecycle' });
+    const response = await GET(cronRequest('?id=Microsoft.SQLServerManagementStudio.22'));
+    const body = await response.json();
+    expect(body.queued).toBe(0);
+    expect(lookupError ? body.errorCount : body.unavailable).toBe(1);
+    expect(candidateInserts).toHaveLength(0);
+    expect(resolveDependenciesMock).not.toHaveBeenCalled();
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, {
+      wingetId: 'Microsoft.SQLServerManagementStudio.22', version: '22.10.2', architecture: 'x64',
+      installerSha256: 'E7B3885D3A0FEBB83B7A5CB155EFD8410A9A651A1BE16EAAA35D594C4D1D75D2',
     });
   });
 
@@ -1564,9 +1683,9 @@ describe('GET /api/cron/qa-enqueue', () => {
   });
 
   it('continues keyset pagination until it finds a stale catalog profile', async () => {
-    const firstPage = Array.from({ length: 1_000 }, (_, index) =>
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
       profileCandidate({
-        id: `irrelevant-${String(1_000 - index).padStart(4, '0')}`,
+        id: `irrelevant-${String(100 - index).padStart(4, '0')}`,
         wingetId: `Irrelevant.App.${index}`,
         packagerCommit: '1'.repeat(40),
         enqueuedAt: '2026-08-08T10:00:00.000Z',
@@ -1604,9 +1723,9 @@ describe('GET /api/cron/qa-enqueue', () => {
   });
 
   it('does not let unsupported stale apps consume the backfill batch', async () => {
-    const unsupportedPage = Array.from({ length: 1_000 }, (_, index) =>
+    const unsupportedPage = Array.from({ length: 100 }, (_, index) =>
       profileCandidate({
-        id: `unsupported-${String(1_000 - index).padStart(4, '0')}`,
+        id: `unsupported-${String(100 - index).padStart(4, '0')}`,
         wingetId: `Unsupported.App.${index}`,
         packagerCommit: '1'.repeat(40),
         enqueuedAt: '2026-08-08T10:00:00.000Z',

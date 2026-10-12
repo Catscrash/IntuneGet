@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { readFile, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isApplicationSpecific } from '../lib/changelog/application-specific.mjs';
 
 const API = 'https://changelog.ugurlabs.com/api/changelog';
 const entriesDirectory = '.ugurlabs/entries';
@@ -15,6 +16,8 @@ export function validateConfig(config) {
   return config;
 }
 
+export { isApplicationSpecific };
+
 export function validateEntry(entry, filename) {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*\.json$/.test(filename) || filename.length > 150 ||
       !entry || typeof entry !== 'object' || Array.isArray(entry) ||
@@ -27,6 +30,10 @@ export function validateEntry(entry, filename) {
     }
   }
   if (!['new', 'improved', 'fixed', 'maintenance'].includes(entry.type)) throw new Error('Invalid change type');
+  if (isApplicationSpecific(entry)) {
+    throw new Error(`Application-specific change is not a product update: ${filename}. ` +
+      'The changelog announces IntuneGet features and behavior shared by all users, never one catalog application. Remove the entry file.');
+  }
   if (entry.sourceUrl !== undefined) {
     // Only public project links belong in this repository's publication queue.
     if (typeof entry.sourceUrl !== 'string' || entry.sourceUrl.length > 2000 ||

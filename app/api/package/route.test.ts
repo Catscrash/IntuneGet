@@ -7,6 +7,7 @@ const {
   getByUserIdMock,
   getByIdMock,
   getUserSettingsMock,
+  getApprovalFailuresMock,
   updateMock,
   createMock,
   parseAccessTokenMock,
@@ -22,11 +23,14 @@ const {
   enforceQaGateMock,
   getPackageEligibilityBlocksMock,
   isSupabaseServerConfiguredMock,
+  curatedState,
 } = vi.hoisted(() => ({
   getUserSettingsMock: vi.fn(),
+  curatedState: { envelope: {} as Record<string, unknown> },
   getDatabaseMock: vi.fn(),
   getByUserIdMock: vi.fn(),
   getByIdMock: vi.fn(),
+  getApprovalFailuresMock: vi.fn(),
   updateMock: vi.fn(),
   createMock: vi.fn(),
   parseAccessTokenMock: vi.fn(),
@@ -44,9 +48,16 @@ const {
   isSupabaseServerConfiguredMock: vi.fn(),
 }));
 
-vi.mock('@/lib/manifest-api', () => ({
+vi.mock('@/lib/manifest-api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/manifest-api')>(),
   getLiveInstallers: getLiveInstallersMock,
 }));
+
+vi.mock('@/catalog/curated/catalog.json', async (importOriginal) => {
+  const original = await importOriginal<{ default: Record<string, unknown> }>();
+  Object.assign(curatedState.envelope, structuredClone(original.default));
+  return { default: curatedState.envelope };
+});
 
 vi.mock('@/lib/db', () => ({
   getDatabase: getDatabaseMock,
@@ -129,7 +140,14 @@ import { createServerClient, isSupabaseConfigured } from '@/lib/supabase';
 import { acquireGraphToken } from '@/lib/graph-token';
 import { deployStoreApp } from '@/lib/store-app-deploy';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
+import { QaGateNotPassedError, QaSecurityGateError } from '@/lib/qa/gate';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
+
+beforeEach(() => getApprovalFailuresMock.mockResolvedValue([]));
+import { CURATED_APPS } from '@/lib/curated-catalog/definitions';
+import { buildCuratedCartItem } from '@/lib/curated-catalog/package';
+import { releaseFixture, signedFixture } from '@/lib/curated-catalog/test-fixtures';
+import { QA_PRIORITY_CUSTOMER, QA_PRIORITY_DEMAND } from '@/lib/qa/constants';
 
 function makeJob(overrides: Partial<PackagingJob>): PackagingJob {
   const now = new Date().toISOString();
@@ -327,6 +345,7 @@ describe('POST /api/package (workflow dispatch)', () => {
       jobs: {
         create: createMock,
         update: updateMock,
+        getApprovalFailures: getApprovalFailuresMock,
       },
       userSettings: { get: getUserSettingsMock },
     });
@@ -840,10 +859,101 @@ describe('POST /api/package (workflow dispatch)', () => {
   });
 
   it.each([
+    ['null body', null],
+    ['string items', { items: 'abc' }],
+    ['object items', { items: {} }],
+    ['null item', { items: [null] }],
+    ['number item', { items: [5] }],
+    ['array item', { items: [[]] }],
+    ...['x', [], null, 7].map(psadtConfig => [
+      `invalid settings ${JSON.stringify(psadtConfig)}`,
+      { items: [makeWin32Item({ psadtConfig })] },
+    ]),
+    ['mixed batch', { items: [makeWin32Item(), makeWin32Item({ psadtConfig: 'x' })] }],
+  ])('rejects malformed package requests before side effects: %s', async (_name, body) => {
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }));
+    expect(response.status).toBe(400);
+    expect(getDatabaseMock).not.toHaveBeenCalled();
+    expect(getApprovalFailuresMock).not.toHaveBeenCalled();
+    expect(enforceInstallerPreflightMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('blocks approval checkpoints before creating or dispatching a forced job (%s)', async forceCreate => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const item = { ...makeWin32Item(), forceCreate };
+    getApprovalFailuresMock.mockResolvedValue([{ tenant_id: 'tenant-1', winget_id: item.wingetId,
+      user_id: 'another-user', version: 'older', status: 'failed', error_category: 'approval', error_details: null,
+      archived_at: new Date().toISOString() }]);
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [item], forceCreate }),
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'INTUNE_APPROVAL_PENDING', retryable: false });
+    expect(createMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(infoSpy.mock.calls.some(([message]) => String(message).startsWith('[Package] Deployment job'))).toBe(false);
+    infoSpy.mockRestore();
+  });
+
+  it.each([[], [{type:'script',scriptContent:'exit 0'}], [{type:'file',path:'',fileOrFolderName:'app.exe',detectionType:'exists'}],
+    [{type:'file',path:'C:\\Example',fileOrFolderName:'app.exe',detectionType:'dateModified',operator:'equal',detectionValue:'2026-10-09'}],
+    [{type:'registry',keyPath:'HKEY_LOCAL_MACHINE\\Software\\Example',detectionType:'integer',operator:'equal',detectionValue:'abc'}],
+    [{type:'msi',productCode:'{11111111-2222-3333-4444-555555555555}',productVersionOperator:'equal',productVersion:'256.1.2'}],
+  ])('rejects invalid opted in detection before preflight and job creation', async rules => {
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({items:[makeWin32Item({psadtConfig:{customDetection:true},detectionRules:rules})]}),
+    }));
+    expect(response.status).toBe(400);
+    expect(enforceInstallerPreflightMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves exact custom marker-shaped rules in both persisted rule stores', async () => {
+    const rules = [{type:'registry',keyPath:'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Test_App',valueName:'Version',detectionType:'version',operator:'equal',detectionValue:'0.9.0'}];
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method:'POST',headers:{Authorization:'Bearer test-token','Content-Type':'application/json'},
+      body:JSON.stringify({items:[makeWin32Item({psadtConfig:{customDetection:true},detectionRules:rules})]}),
+    }));
+    expect(response.status).toBe(200);
+    const job = createMock.mock.calls[0][0];
+    expect(job.detection_rules).toEqual(rules);
+    expect(job.package_config.psadtConfig).toMatchObject({customDetection:true,detectionRules:rules});
+  });
+
+  it('returns an actionable conflict for removed versions before creating or dispatching jobs', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([]);
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'MANIFEST_UNAVAILABLE', retryable: false });
+    expect(enforceInstallerPreflightMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['Autodesk.DesktopApp', 'vendor_retired'],
+    ['Google.GoogleDesktop', 'vendor_retired'],
     ['Wondershare.Filmora', 'unsupported_managed_install'],
+    ['ZorusInc.ArchonAgent', 'unsupported_managed_install'],
     ['GlassWire.GlassWire', 'unsupported_managed_uninstall'],
     ['Wargaming.GameCenter', 'unsupported_managed_uninstall'],
+    ['leezer3.OpenBVE', 'unsupported_managed_uninstall'],
     ['Microsoft.VCLibs.14', 'unsupported_managed_uninstall'],
     ['Microsoft.VCLibs.Desktop.14', 'unsupported_managed_uninstall'],
   ])('blocks %s before QA or customer workflow payload creation', async (wingetId, code) => {
@@ -880,11 +990,13 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
-  it('preflights Blender through its official mirror while preserving manifest identity', async () => {
-    const manifestUrl =
-      'https://download.blender.org/release/Blender4.2/blender-4.2.16-windows-x64.msi';
-    const mirrorUrl =
-      'https://mirror.blender.org/release/Blender4.2/blender-4.2.16-windows-x64.msi';
+  it.each([
+    ['BlenderFoundation.Blender.LTS.4.2', '4.2.16', '4.2'],
+    ['BlenderFoundation.Blender', '5.2.1', '5.2'],
+    ['BlenderFoundation.Blender', '5.2.2', '5.2'],
+  ])('preflights %s %s through its official mirror while preserving manifest identity', async (wingetId, version, release) => {
+    const manifestUrl = `https://download.blender.org/release/Blender${release}/blender-${version}-windows-x64.msi`;
+    const mirrorUrl = `https://mirror.blender.org/release/Blender${release}/blender-${version}-windows-x64.msi`;
     getLiveInstallersMock.mockResolvedValueOnce([{
       architecture: 'x64',
       url: manifestUrl,
@@ -902,9 +1014,9 @@ describe('POST /api/package (workflow dispatch)', () => {
       },
       body: JSON.stringify({
         items: [makeWin32Item({
-          wingetId: 'BlenderFoundation.Blender.LTS.4.2',
-          displayName: 'Blender 4.2 LTS',
-          version: '4.2.16',
+          wingetId,
+          displayName: 'Blender',
+          version,
           installerType: 'wix',
           installerUrl: manifestUrl,
           installerSha256: 'A'.repeat(64),
@@ -918,7 +1030,7 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(response.status).toBe(200);
     expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        wingetId: 'BlenderFoundation.Blender.LTS.4.2',
+        wingetId,
         installerUrl: mirrorUrl,
         manifestInstallerUrl: manifestUrl,
         installerSha256: 'A'.repeat(64),
@@ -1070,6 +1182,133 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(response.status).toBe(200);
     expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(1);
     expect(triggerPackagingWorkflowMock.mock.calls[0][0].relationships).toBeUndefined();
+  });
+
+  function postSingleItem() {
+    return POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    }));
+  }
+
+  it('records a security verdict at the dispatch gate as a validation block with its reason', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new QaSecurityGateError({
+      wingetId: 'Test.App',
+      version: '1.0.0',
+      architecture: 'x64',
+      malicious: 3,
+      totalEngines: 71,
+    }));
+
+    const body = await (await postSingleItem()).json();
+
+    const reason = 'VirusTotal reported 3 malicious verdicts for the Test.App 1.0.0 (x64) installer. '
+      + 'Packaging is blocked for this version until the finding is reviewed. '
+      + 'Earlier versions with a clean verdict remain available.';
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      status: 'failed',
+      error_stage: 'validation',
+      error_category: null,
+      error_code: 'QA_SECURITY_FLAGGED_CURRENT_VERSION',
+      error_message: reason,
+    }));
+    expect(body.errors).toEqual([{ wingetId: 'Test.App', error: reason }]);
+  });
+
+  it('records a pending installation test at the dispatch gate with its own code', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new QaGateNotPassedError({
+      wingetId: 'Test.App',
+      version: '1.0.0',
+      architecture: 'x64',
+      installerSha256: 'A'.repeat(64),
+      packageProfileSha256: 'B'.repeat(64),
+      reason: 'package_profile',
+    }));
+
+    await postSingleItem();
+
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      error_stage: 'validation',
+      error_code: 'QA_NOT_PASSED_CURRENT_VERSION',
+      error_message: expect.stringContaining('Installation testing has not passed yet for Test.App 1.0.0 (x64)'),
+    }));
+  });
+
+  it('keeps WORKFLOW_DISPATCH_FAILED for errors that prevent the workflow from starting', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(
+      new Error('Failed to trigger GitHub Actions workflow: 502 Bad Gateway')
+    );
+
+    const body = await (await postSingleItem()).json();
+
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      status: 'failed',
+      error_stage: 'authenticate',
+      error_category: 'network',
+      error_code: 'WORKFLOW_DISPATCH_FAILED',
+      error_message: 'Failed to trigger GitHub Actions workflow: 502 Bad Gateway',
+    }));
+    expect(body.errors).toEqual([{
+      wingetId: 'Test.App',
+      error: 'Failed to trigger GitHub Actions workflow: 502 Bad Gateway',
+    }]);
+  });
+
+  it('logs a deployment that could not start to the server log', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(
+      new Error('Failed to trigger GitHub Actions workflow: 502 Bad Gateway')
+    );
+
+    try {
+      await postSingleItem();
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[Package] Deployment of Test.App failed: Failed to trigger GitHub Actions workflow: 502 Bad Gateway'
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('logs each created deployment job to the server log', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: true });
+
+    try {
+      const body = await (await postSingleItem()).json();
+
+      expect(body.jobs).toHaveLength(1);
+      expect(infoSpy).toHaveBeenCalledWith(
+        `[Package] Deployment job ${body.jobs[0].id} created for Test.App 1.0.0 (status: queued)`
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('queues a customer deployment strictly above the shared auto_update/managed demand tier', async () => {
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items: [makeWin32Item()] }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ priority: QA_PRIORITY_CUSTOMER, demandSource: 'customer' })
+    );
+    expect(QA_PRIORITY_CUSTOMER).toBeGreaterThan(QA_PRIORITY_DEMAND);
   });
 
   it('uses a reviewed user scope consistently for QA, packaging, and Intune', async () => {
@@ -2168,6 +2407,55 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
+  it('does not create a customer workflow payload for held SSMS 22.10.2 bytes', async () => {
+    ensureQaDemandMock.mockResolvedValueOnce({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+      identity: {
+        executionProfileSha256: 'A'.repeat(64), packageProfileSha256: 'A'.repeat(64),
+        presentationProfileSha256: 'B'.repeat(64),
+      },
+    });
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [makeWin32Item({
+        wingetId: 'Microsoft.SQLServerManagementStudio.22',
+        displayName: 'Microsoft SQL Server Management Studio 22', version: '22.10.2',
+        installerSha256: 'E7B3885D3A0FEBB83B7A5CB155EFD8410A9A651A1BE16EAAA35D594C4D1D75D2',
+      })] }),
+    });
+    const response = await POST(request);
+    const body = await response.json();
+    expect(response.status).toBe(200);
+    expect(body.jobs[0]).toMatchObject({ status: 'qa_failed' });
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('does not create a customer workflow payload for held Proton Mail bytes', async () => {
+    ensureQaDemandMock.mockResolvedValueOnce({
+      state: 'failed', candidateId: null,
+      failureSummary: 'This app version is not available for automated deployment.',
+      identity: {
+        executionProfileSha256: 'A'.repeat(64), packageProfileSha256: 'A'.repeat(64),
+        presentationProfileSha256: 'B'.repeat(64),
+      },
+    });
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [makeWin32Item({
+        wingetId: 'Proton.ProtonMail', displayName: 'Proton Mail', version: '1.14.0',
+        installerSha256: '456ADBFE362FDF14EF0A189CDE1962316B46A8E277D139C12A99D39BCAC89BC3',
+      })] }),
+    });
+    const response = await POST(request);
+    const body = await response.json();
+    expect(response.status).toBe(200);
+    expect(body.jobs[0]).toMatchObject({ status: 'qa_failed' });
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
   it('creates an actionable blocked job for a failed execution profile', async () => {
     process.env.QA_DEFERRED_CUSTOMER_UPLOADS_UNTIL = new Date(
       Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -2243,5 +2531,117 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(
       (job.package_config as Record<string, unknown>).allowAvailableUninstall
     ).toBe(false);
+  });
+});
+
+describe('POST /api/package (curated licence attestation)', () => {
+  const acrobat = CURATED_APPS.find(app => app.id === 'acrobat-reader')!;
+  const attestation = acrobat.licenceAttestation!;
+  const acceptances = new Set<string>();
+  let original: Record<string, unknown>;
+  let acrobatItem: Record<string, unknown>;
+  let chromeItem: Record<string, unknown>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    acceptances.clear();
+    original = { ...curatedState.envelope };
+    const fixture = signedFixture([releaseFixture(acrobat), releaseFixture(CURATED_APPS[0])]);
+    Object.assign(curatedState.envelope, fixture.envelope);
+    vi.stubEnv('CURATED_CATALOG_PUBLIC_KEYS', JSON.stringify(fixture.keys));
+    const cart = (index: number, app = acrobat) => ({
+      ...buildCuratedCartItem(app, fixture.envelope.payload.releases[index]), id: `cart-${index}`, addedAt: new Date().toISOString(),
+    });
+    acrobatItem = cart(0);
+    chromeItem = cart(1, CURATED_APPS[0]);
+    getDatabaseMock.mockReturnValue({
+      jobs: { create: createMock, update: updateMock, getApprovalFailures: getApprovalFailuresMock },
+      userSettings: { get: getUserSettingsMock },
+      curatedLicenceAttestations: {
+        get: vi.fn(async (tenantId: string, id: string, version: string) => acceptances.has(`${tenantId}|${id}|${version}`)
+          ? { id: 'acceptance', tenant_id: tenantId, app_id: acrobat.id, attestation_id: id, attestation_version: version,
+              accepted_by_user_id: 'admin-1', accepted_by_email: 'admin@contoso.test', accepted_at: '2026-10-04T00:00:00.000Z' }
+          : null),
+      },
+    });
+    createMock.mockImplementation(async (data: Record<string, unknown>) => ({ ...data, created_at: new Date().toISOString() }));
+    updateMock.mockResolvedValue({});
+    parseAccessTokenMock.mockResolvedValue({ userId: 'user-1', userEmail: 'user@example.com', tenantId: 'tenant-1', userName: 'User' });
+    checkStoredConsentMock.mockResolvedValue(true);
+    getFeatureFlagsMock.mockReturnValue({ pipeline: true, localPackager: false });
+    isGitHubActionsConfiguredMock.mockReturnValue(true);
+    getAppConfigMock.mockReturnValue({ app: { url: 'http://localhost:3000' } });
+    triggerPackagingWorkflowMock.mockResolvedValue({ success: true });
+    enforceInstallerPreflightMock.mockResolvedValue({ cacheKey: 'healthy-key', status: 'healthy', source: 'cache' });
+    ensureQaDemandMock.mockResolvedValue({ state: 'passed', candidateId: null, identity: {
+      executionProfileSha256: 'A'.repeat(64), packageProfileSha256: 'A'.repeat(64), presentationProfileSha256: 'B'.repeat(64) } });
+    getPackageEligibilityBlocksMock.mockResolvedValue([]);
+    isSupabaseServerConfiguredMock.mockReturnValue(true);
+    getUserSettingsMock.mockResolvedValue(null);
+  });
+  afterEach(() => {
+    Object.keys(curatedState.envelope).forEach(key => delete curatedState.envelope[key]);
+    Object.assign(curatedState.envelope, original);
+    vi.unstubAllEnvs();
+  });
+
+  const post = (items: unknown[]) => POST(new NextRequest('http://localhost:3000/api/package', {
+    method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  }));
+
+  it('checks the canonical curated package ID before any demand or job for mixed casing', async () => {
+    getApprovalFailuresMock.mockImplementation(async (_tenant: string, packageId: string) => packageId === acrobat.packageId
+      ? [{ tenant_id: 'tenant-1', winget_id: acrobat.packageId, status: 'failed', error_category: 'approval', error_details: null }]
+      : []);
+    const response = await post([{ ...acrobatItem, wingetId: acrobat.packageId.toUpperCase() }]);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'INTUNE_APPROVAL_PENDING', package: { wingetId: acrobat.packageId } });
+    expect(getApprovalFailuresMock).toHaveBeenCalledWith('tenant-1', acrobat.packageId, undefined);
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks a curated app whose agreement the tenant has not accepted, before any job exists', async () => {
+    const response = await post([acrobatItem]);
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body).toMatchObject({ code: 'CURATED_LICENCE_NOT_ACCEPTED', attestation, package: { wingetId: acrobat.packageId } });
+    expect(body.message).toContain(attestation.title);
+    expect(createMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+  });
+
+  it('blocks acceptances recorded for another tenant or an earlier agreement version', async () => {
+    acceptances.add(`tenant-2|${attestation.id}|${attestation.version}`);
+    acceptances.add(`tenant-1|${attestation.id}|2025-01-01`);
+    expect((await post([acrobatItem])).status).toBe(409);
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores an acceptance claimed by the cart and records the server-verified one', async () => {
+    const forged = { attestationId: attestation.id, attestationVersion: attestation.version, acceptedAt: 'forged', acceptedByUserId: 'x', acceptedByEmail: null };
+    expect((await post([{ ...acrobatItem, curatedLicenceAcceptance: forged }])).status).toBe(409);
+
+    acceptances.add(`tenant-1|${attestation.id}|${attestation.version}`);
+    const response = await post([{ ...acrobatItem, curatedLicenceAcceptance: forged }]);
+    expect(response.status).toBe(200);
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      tenant_id: 'tenant-1',
+      package_config: expect.objectContaining({ curatedLicenceAcceptance: {
+        attestationId: attestation.id, attestationVersion: attestation.version, acceptedAt: '2026-10-04T00:00:00.000Z',
+        acceptedByUserId: 'admin-1', acceptedByEmail: 'admin@contoso.test',
+      } }),
+    }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves curated apps without an agreement unaffected', async () => {
+    const response = await post([chromeItem]);
+    expect(response.status).toBe(200);
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({
+      package_config: expect.not.objectContaining({ curatedLicenceAcceptance: expect.anything() }),
+    }));
   });
 });

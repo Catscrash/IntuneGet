@@ -20,8 +20,7 @@ import { parseAccessToken } from '@/lib/auth-utils';
 import { getCatalogSource } from '@/lib/catalog';
 import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
 import type { IntuneWin32App, AppUpdateInfo } from '@/types/inventory';
-
-const GRAPH_API_BASE = 'https://graph.microsoft.com/beta';
+import { fetchUpdateInventory, mapUpdateApps, UpdateScanGraphError, UpdateScanUnavailable, withinUpdateScanBudget } from '@/lib/intune/update-scan';
 
 interface CheckedResult {
   app: string;
@@ -99,10 +98,32 @@ function hasLegacyIntuneGetMarker(app: IntuneWin32App): boolean {
   return Boolean(app.description?.includes(LEGACY_INTUNE_APP_SOURCE_MARKER));
 }
 
-// Extend timeout for Vercel (Pro plan: up to 60s)
-export const maxDuration = 30;
+export const maxDuration = 60;
+
+/** How long one tenant scan may run before it gives up rather than time out. */
+const UPDATE_SCAN_BUDGET_MS = 45_000;
+
+function isRetryableScanError(error: unknown): boolean {
+  return error instanceof UpdateScanUnavailable ||
+    (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name));
+}
 
 export async function GET(request: NextRequest) {
+  const deadlineAt = Date.now() + UPDATE_SCAN_BUDGET_MS;
+  try {
+    return await withinUpdateScanBudget(scanUpdates(request, deadlineAt), deadlineAt);
+  } catch (error) {
+    if (error instanceof UpdateScanGraphError) {
+      return NextResponse.json({ error: error.message, code: 'UPDATE_SCAN_GRAPH_REJECTED' }, { status: error.status });
+    }
+    if (isRetryableScanError(error)) {
+      return NextResponse.json({ error: 'The update scan could not finish. Please try again shortly.', code: 'UPDATE_SCAN_RETRYABLE' }, { status: 503, headers: { 'Retry-After': '30' } });
+    }
+    return NextResponse.json({ error: 'Failed to check for updates' }, { status: 500 });
+  }
+}
+
+async function scanUpdates(request: NextRequest, deadlineAt: number) {
   try {
     const user = await parseAccessToken(request.headers.get('Authorization'));
     if (!user) {
@@ -157,6 +178,7 @@ export async function GET(request: NextRequest) {
       userId: user.userId,
       tenantId,
       supabase,
+      deadlineAt,
     });
 
     return NextResponse.json({
@@ -166,6 +188,7 @@ export async function GET(request: NextRequest) {
       checkedApps: scan.checked,
     });
   } catch (error) {
+    if (error instanceof UpdateScanGraphError || isRetryableScanError(error)) throw error;
     const status = error instanceof TenantUpdateScanError ? error.status : 500;
     return NextResponse.json(
       { error: 'Failed to check for updates' },
@@ -203,10 +226,13 @@ export async function scanTenantForUpdates({
   userId,
   tenantId,
   supabase,
+  deadlineAt = Date.now() + UPDATE_SCAN_BUDGET_MS,
 }: {
   userId: string;
   tenantId: string;
   supabase: ReturnType<typeof getServerClientOrNull>;
+  /** Wall-clock limit for the Graph reads and the database matching. */
+  deadlineAt?: number;
 }): Promise<TenantUpdateScan> {
   // Get service principal token
   const graphToken = await getServicePrincipalToken(tenantId);
@@ -215,33 +241,7 @@ export async function scanTenantForUpdates({
     throw new TenantUpdateScanError(`Failed to get a Graph API token for tenant ${tenantId}`);
   }
 
-  // Fetch Win32 apps from Intune using isof filter with pagination
-  // Note: We can't use $select with derived type fields (like displayVersion) when using type filters
-  const apps: IntuneWin32App[] = [];
-  let nextUrl: string | null = `${GRAPH_API_BASE}/deviceAppManagement/mobileApps?$filter=isof('microsoft.graph.win32LobApp')&$top=100`;
-
-  while (nextUrl) {
-    const graphResponse: Response = await fetch(nextUrl, {
-      headers: {
-        Authorization: `Bearer ${graphToken}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!graphResponse.ok) {
-      const errorText = await graphResponse.text();
-      throw new TenantUpdateScanError(
-        `Failed to fetch apps from Intune: ${errorText}`,
-        graphResponse.status
-      );
-    }
-
-    const graphData = await graphResponse.json();
-    const pageApps: IntuneWin32App[] = graphData.value || [];
-    apps.push(...pageApps);
-
-    nextUrl = graphData['@odata.nextLink'] || null;
-  }
+  const apps = await fetchUpdateInventory(graphToken, deadlineAt);
 
   const liveIntuneAppIds = new Set(apps.map((a) => a.id));
 
@@ -321,7 +321,19 @@ export async function scanTenantForUpdates({
     }
   }
 
-  // Match apps to Winget IDs
+  // Match apps to Winget IDs. The fuzzy and database matches run up front
+  // with bounded concurrency; apps with an explicit provenance signal below
+  // never need them.
+  const databaseMatches = new Map(await mapUpdateApps(apps, async (app) => {
+    const name = app.displayName.toLowerCase().trim();
+    if (uploadHistoryWingetMap.has(app.id) || extractDeployedWingetId(app) ||
+        claimedWingetByIntuneAppId.has(app.id) || manualWingetByName.has(name) || claimedWingetByName.has(name)) {
+      return [app.id, null] as const;
+    }
+    let match = matchAppToWinget(app);
+    if (!match || match.confidence === 'low') match = await matchAppToWingetWithDatabase(app, supabase);
+    return [app.id, match] as const;
+  }, deadlineAt));
   const updates: AppUpdateInfo[] = [];
   const checked: CheckedResult[] = [];
   const matchedApps: MatchedApp[] = [];
@@ -363,11 +375,7 @@ export async function scanTenantForUpdates({
       continue;
     }
 
-    let match = matchAppToWinget(app);
-
-    if (!match || match.confidence === 'low') {
-      match = await matchAppToWingetWithDatabase(app, supabase);
-    }
+    const match = databaseMatches.get(app.id);
 
     if (!match) {
       checked.push({

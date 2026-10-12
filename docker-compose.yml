@@ -15,6 +15,8 @@ services:
       # "supabase" - Uses Supabase (default, requires Supabase credentials)
       - DATABASE_MODE=${DATABASE_MODE:-supabase}
       - DATABASE_PATH=/data/intuneget.db
+      - INTUNEGET_LOG_DIR=${INTUNEGET_LOG_DIR:-/data/logs}
+      - INTUNEGET_LOG_LEVEL=${INTUNEGET_LOG_LEVEL:-info}
 
       # Shared secret between the scheduler below and the cron routes. The
       # routes reject every call while it is unset - they are ordinary HTTP

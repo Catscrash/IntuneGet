@@ -181,6 +181,11 @@ function buildFtsMatch(query: string): string | null {
 }
 
 export class SnapshotCatalogSource implements CatalogSource {
+  async countReleaseHistory(filters: ReleaseHistoryFilters): Promise<number> {
+    // Local sqlite enrichment of one page is cheap, so reuse the full query.
+    return (await this.getReleaseHistory(filters)).total;
+  }
+
   async getReleaseHistory(filters: ReleaseHistoryFilters): Promise<ReleaseHistoryResult> {
     return withDb((db) => {
       // Older snapshots remain readable; release dates were not exported then.
@@ -626,15 +631,20 @@ export class SnapshotCatalogSource implements CatalogSource {
       (db) => {
         if (ids.length === 0 || !hasCompatibleQaResultsTable(db)) return [];
         const placeholders = ids.map(() => '?').join(', ');
+        const columns = db.prepare('PRAGMA table_info(qa_results)').all() as Array<{ name: string }>;
+        const hasBlocked = columns.some(column => column.name === 'deployment_blocked');
         return db
           .prepare(
             `SELECT winget_id, outcome, tested_version, architecture, tested_at_utc,
-                    test_level, package_profile_sha256,
-                    virustotal_malicious, virustotal_total_engines
+                    test_level, package_profile_sha256, installer_sha256,
+                    virustotal_malicious, virustotal_total_engines${hasBlocked ? ', deployment_blocked' : ''}
              FROM qa_results
              WHERE test_level = 'psadt-package' AND winget_id IN (${placeholders})`
           )
-          .all(...ids) as QaStatusRow[];
+          .all(...ids).map(value => {
+            const row = value as Omit<QaStatusRow, 'deployment_blocked'> & { deployment_blocked?: number };
+            return { ...row, deployment_blocked: hasBlocked ? row.deployment_blocked === 1 : undefined };
+          }) as QaStatusRow[];
       },
       () => []
     );
@@ -669,6 +679,7 @@ export class SnapshotCatalogSource implements CatalogSource {
 
         return {
           ...row,
+          deployment_blocked: row.deployment_blocked === undefined ? undefined : Number(row.deployment_blocked) === 1,
           detection,
           phase_results: phaseResults,
           changes: parseJson<QaChanges>(row.changes),

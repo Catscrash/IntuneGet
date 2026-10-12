@@ -43,7 +43,8 @@ import type { CartItem, StoreCartItem, IntuneAppCategorySelection, PackageAssign
 import type { EspProfileSelection } from '@/types/esp';
 import { isStoreCartItem, isWin32CartItem } from '@/types/upload';
 import type { AppRelationship, MsiDetectionRule } from '@/types/intune';
-import { sanitizeProcessesToClose } from '@/types/psadt';
+import { DEFAULT_PSADT_CONFIG, sanitizeProcessesToClose } from '@/types/psadt';
+import { testedCuratedSettings } from '@/lib/curated-catalog/settings';
 import type {
   PSADTConfig,
   ProcessToClose,
@@ -67,6 +68,7 @@ interface CartItemConfigProps {
 }
 
 type ConfigSection =
+  | 'appearance'
   | 'behavior'
   | 'deferral'
   | 'progress'
@@ -85,6 +87,12 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   const updateItem = useCartStore((state) => state.updateItem);
   const isStore = isStoreCartItem(item);
   const isWin32 = isWin32CartItem(item);
+  const isCurated = isWin32 && item.sourceType === 'curated';
+  const isEditableWin32 = isWin32 && !isCurated;
+  const [curatedSettingsMode, setCuratedSettingsMode] = useState<'tested-defaults' | 'custom'>(
+    isCurated ? item.curatedSettingsMode || 'custom' : 'custom'
+  );
+  const canEditExecution = isWin32 && (!isCurated || curatedSettingsMode === 'custom');
 
   // Store app state
   const [storeInstallExperience, setStoreInstallExperience] = useState<'user' | 'system'>(
@@ -112,6 +120,10 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   );
   const [installCommand, setInstallCommand] = useState(isWin32 ? item.installCommand : '');
   const [uninstallCommand, setUninstallCommand] = useState(isWin32 ? item.uninstallCommand : '');
+  // Editable Intune app description (#117, #162). An empty field keeps the
+  // description the item had when this dialog opened.
+  const initialDescription = item.description ?? '';
+  const [description, setDescription] = useState(initialDescription);
   const [updatePolicy, setUpdatePolicy] = useState<CartUpdatePolicyValue>(
     isWin32 ? item.updatePolicy : undefined
   );
@@ -123,7 +135,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   );
 
   // UI state
-  const [expandedSection, setExpandedSection] = useState<ConfigSection | null>(isStore ? 'assignment' : 'behavior');
+  const [expandedSection, setExpandedSection] = useState<ConfigSection | null>(isStore || isCurated ? 'assignment' : 'behavior');
   const [isSaving, setIsSaving] = useState(false);
   const [processesError, setProcessesError] = useState<string | null>(null);
 
@@ -133,9 +145,10 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const configSnapshot = JSON.stringify({
     storeInstallExperience, selectedScope, config, assignments, categories,
-    espProfiles, relationships, installCommand, uninstallCommand,
+    espProfiles, relationships, installCommand, uninstallCommand, description,
     updatePolicy: updatePolicy ?? null,
     carryOverAssignments,
+    curatedSettingsMode,
   });
   const baselineSnapshotRef = useRef(configSnapshot);
   const requestClose = () => {
@@ -192,11 +205,63 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
     }));
   };
 
+  // Post-install / post-uninstall command list editors (#118, #162)
+  const addCommand = (key: 'postInstallCommands' | 'postUninstallCommands') => {
+    setConfig((prev) => ({ ...prev, [key]: [...(prev[key] || []), ''] }));
+  };
+
+  const updateCommand = (
+    key: 'postInstallCommands' | 'postUninstallCommands',
+    index: number,
+    value: string
+  ) => {
+    setConfig((prev) => ({
+      ...prev,
+      [key]: (prev[key] || []).map((c, i) => (i === index ? value : c)),
+    }));
+  };
+
+  const removeCommand = (
+    key: 'postInstallCommands' | 'postUninstallCommands',
+    index: number
+  ) => {
+    setConfig((prev) => ({
+      ...prev,
+      [key]: (prev[key] || []).filter((_, i) => i !== index),
+    }));
+  };
+
   const toggleSection = (section: ConfigSection) => {
     setExpandedSection(expandedSection === section ? null : section);
   };
 
   const handleSave = async () => {
+    if (isCurated) {
+      // PSADT behaviour may be customised; the server verifies a changed
+      // execution configuration in the QA VM before its first deployment.
+      const savedConfig = curatedSettingsMode === 'tested-defaults'
+        ? testedCuratedSettings({ ...DEFAULT_PSADT_CONFIG, detectionRules: item.detectionRules }, config) : config;
+      const curatedProcesses = sanitizeProcessesToClose(savedConfig.processesToClose);
+      if (curatedProcesses.invalid.length > 0) {
+        setProcessesError(
+          'Each process to close needs an executable name, for example chrome. Fill in the process name or remove the row.'
+        );
+        setExpandedSection('behavior');
+        return;
+      }
+      updateItem(item.id, {
+        curatedSettingsMode,
+        psadtConfig: { ...savedConfig, registryMarkerPath: item.psadtConfig.registryMarkerPath, processesToClose: curatedProcesses.processes },
+        assignments: assignments.length ? assignments : undefined,
+        categories: categories.length ? categories : undefined,
+        espProfiles: espProfiles.length ? espProfiles : undefined,
+        updatePolicy,
+        assignmentMigration: updatePolicy === 'auto_update'
+          ? { carryOverAssignments, removeAssignmentsFromPreviousApp: carryOverAssignments } : undefined,
+      });
+      onClose();
+      return;
+    }
     // The packaging pipeline rejects close-process entries without an
     // executable name, so block the save instead of storing a config that
     // fails minutes later during packaging.
@@ -248,6 +313,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
           requirementRules,
           installCommand,
           uninstallCommand,
+          description: description.trim() || item.description,
           updatePolicy,
           assignmentMigration:
             updatePolicy === 'auto_update'
@@ -355,7 +421,20 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
             )}
 
             {/* Win32 app: Install Scope */}
-            {isWin32 && (
+            {isCurated && <fieldset className="space-y-3 rounded-xl border border-accent-cyan/20 bg-accent-cyan/5 p-4">
+              <legend className="px-1 text-sm font-medium text-text-primary">Curated deployment settings</legend>
+              <label className="flex items-start gap-2 text-sm text-text-primary">
+                <input type="radio" name="curated-settings" checked={curatedSettingsMode === 'tested-defaults'}
+                  onChange={() => setCuratedSettingsMode('tested-defaults')} className="mt-1" />
+                <span>Use tested defaults (recommended)<span className="mt-1 block text-xs text-text-secondary">Deploy without waiting for custom-settings QA. Assignments, categories, update preferences and branding remain configurable.</span></span>
+              </label>
+              <label className="flex items-start gap-2 text-sm text-text-primary">
+                <input type="radio" name="curated-settings" checked={curatedSettingsMode === 'custom'}
+                  onChange={() => setCuratedSettingsMode('custom')} className="mt-1" />
+                <span>Customize deployment behaviour<span className="mt-1 block text-xs text-text-secondary">Changed execution settings require their own automatic QA pass before deployment.</span></span>
+              </label>
+            </fieldset>}
+            {isEditableWin32 && (
               <div>
                 <label className="block text-sm font-medium text-text-muted mb-2">Install Scope</label>
                 <div className="flex gap-2">
@@ -386,8 +465,51 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                 Deployment Configuration
               </h3>}
 
+              {isCurated && !canEditExecution && <ConfigSection
+                title="Dialog appearance"
+                icon={<MessageSquare className="w-4 h-4" />}
+                expanded={expandedSection === 'appearance'}
+                onToggle={() => toggleSection('appearance')}
+              >
+                <div className="space-y-4">
+                  <p className="text-xs text-text-muted">These choices apply when a dialog is shown. Tested defaults control whether dialogs appear.</p>
+                  <div>
+                    <label htmlFor="curated-dialog-position" className="block text-sm font-medium text-text-secondary mb-2">Dialog position</label>
+                    <select id="curated-dialog-position" value={config.windowLocation || 'Default'}
+                      onChange={(e) => updateConfig({ windowLocation: e.target.value as DialogPosition })}
+                      className="w-full px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm">
+                      <option value="Default">Default</option>
+                      <option value="Center">Center</option>
+                      <option value="Top">Top</option>
+                      <option value="Bottom">Bottom</option>
+                      <option value="TopLeft">Top Left</option>
+                      <option value="TopRight">Top Right</option>
+                      <option value="BottomLeft">Bottom Left</option>
+                      <option value="BottomRight">Bottom Right</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="curated-progress-message" className="block text-sm font-medium text-text-secondary mb-2">Status message (optional)</label>
+                    <input id="curated-progress-message" type="text" value={config.progressDialog?.statusMessage || ''}
+                      onChange={(e) => updateConfig({ progressDialog: { ...config.progressDialog, statusMessage: e.target.value || undefined } })}
+                      placeholder="Installing application..."
+                      className="w-full px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm" />
+                  </div>
+                  <div>
+                    <label htmlFor="curated-progress-position" className="block text-sm font-medium text-text-secondary mb-2">Progress window position</label>
+                    <select id="curated-progress-position" value={config.progressDialog?.windowLocation || 'Default'}
+                      onChange={(e) => updateConfig({ progressDialog: { ...config.progressDialog, windowLocation: e.target.value as DialogPosition } })}
+                      className="w-full px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm">
+                      <option value="Default">Default</option>
+                      <option value="Center">Center</option>
+                      <option value="BottomRight">Bottom Right</option>
+                    </select>
+                  </div>
+                </div>
+              </ConfigSection>}
+
               {/* Installation Behavior (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Installation Behavior"
                 icon={<Settings className="w-4 h-4" />}
                 expanded={expandedSection === 'behavior'}
@@ -429,8 +551,8 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                     onChange={(checked) => updateConfig({ verifyInstall: checked })}
                   />
 
-                  {/* Detection Marker Registry Path */}
-                  <div>
+                  {/* Detection Marker Registry Path: curated detection is fixed to the signed release. */}
+                  {!isCurated && <div>
                     <label className="block text-sm font-medium text-text-secondary mb-1.5">
                       Detection marker registry path
                     </label>
@@ -444,7 +566,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                     <p className="text-xs text-text-muted mt-1">
                       Registry key under HKLM/HKCU where the detection marker is written. Customize to track deployments under your own key, e.g. SOFTWARE\CompanyName\Apps. The detection rule updates automatically on save.
                     </p>
-                  </div>
+                  </div>}
 
                   {/* Processes to Close */}
                   <div>
@@ -605,7 +727,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Deferral Settings (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Deferral Settings"
                 icon={<Clock className="w-4 h-4" />}
                 expanded={expandedSection === 'deferral'}
@@ -682,7 +804,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Progress & Notifications (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Progress & Notifications"
                 icon={<Bell className="w-4 h-4" />}
                 expanded={expandedSection === 'progress'}
@@ -836,7 +958,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Custom Prompts (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Custom Prompts"
                 icon={<MessageSquare className="w-4 h-4" />}
                 expanded={expandedSection === 'prompts'}
@@ -1043,7 +1165,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Restart Prompt (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Restart Prompt"
                 icon={<RefreshCw className="w-4 h-4" />}
                 expanded={expandedSection === 'restart'}
@@ -1109,7 +1231,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Disk Space Check (win32 only) */}
-              {isWin32 && <ConfigSection
+              {canEditExecution && <ConfigSection
                 title="Disk Space Check"
                 icon={<HardDrive className="w-4 h-4" />}
                 expanded={expandedSection === 'diskspace'}
@@ -1207,7 +1329,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Dependencies & Supersedence (win32 only) */}
-              {isWin32 && <ConfigSection
+              {isEditableWin32 && <ConfigSection
                 title="Dependencies & Supersedence"
                 icon={<Link2 className="w-4 h-4" />}
                 expanded={expandedSection === 'dependencies'}
@@ -1221,7 +1343,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Branding (win32 only) */}
-              {isWin32 && <ConfigSection
+              {isEditableWin32 && <ConfigSection
                 title="Branding"
                 icon={<Palette className="w-4 h-4" />}
                 expanded={expandedSection === 'branding'}
@@ -1325,13 +1447,31 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               </ConfigSection>}
 
               {/* Advanced (win32 only) */}
-              {isWin32 && <ConfigSection
+              {isEditableWin32 && <ConfigSection
                 title="Advanced Options"
                 icon={<Terminal className="w-4 h-4" />}
                 expanded={expandedSection === 'advanced'}
                 onToggle={() => toggleSection('advanced')}
               >
                 <div className="space-y-4">
+                  {/* Custom Description */}
+                  <div>
+                    <label htmlFor="cart-description-override" className="block text-sm font-medium text-text-secondary mb-2">
+                      Description override
+                    </label>
+                    <textarea
+                      id="cart-description-override"
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      rows={3}
+                      placeholder={initialDescription || 'Description shown in Intune and Company Portal'}
+                      className="w-full px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm resize-y"
+                    />
+                    <p className="text-text-muted text-xs mt-1">
+                      Shown in Intune and the Company Portal. Leave empty to keep the current description.
+                    </p>
+                  </div>
+
                   {/* Custom Install Command */}
                   <div>
                     <label className="block text-sm font-medium text-text-secondary mb-2">
@@ -1360,6 +1500,88 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                       className="w-full px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm font-mono"
                     />
                     <p className="text-text-muted text-xs mt-1">Override the auto-generated uninstall command</p>
+                  </div>
+
+                  {/* Post-install commands (#118) */}
+                  <div>
+                    <label className="block text-sm font-medium text-text-secondary mb-2">
+                      Post-install commands
+                    </label>
+                    <div className="space-y-2">
+                      {(config.postInstallCommands || []).map((cmd, index) => (
+                        <div key={index} className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={cmd}
+                            onChange={(e) => updateCommand('postInstallCommands', index, e.target.value)}
+                            aria-label={`Post-install command ${index + 1}`}
+                            placeholder={'e.g. powershell.exe -NoProfile -Command "Remove-Item \'$env:Public\\Desktop\\App.lnk\' -Force"'}
+                            className="flex-1 px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm font-mono"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeCommand('postInstallCommands', index)}
+                            className="flex-shrink-0 text-text-muted hover:text-red-400 transition-colors p-1"
+                            aria-label="Remove command"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => addCommand('postInstallCommands')}
+                        aria-label="Add post-install command"
+                        className="flex items-center gap-1.5 text-xs font-medium text-accent-cyan hover:text-accent-cyan/80 transition-colors"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add command
+                      </button>
+                    </div>
+                    <p className="text-text-muted text-xs mt-1">
+                      Run after the app installs (in order), e.g. to remove a desktop shortcut. Each runs via cmd.exe; a failure fails the deployment.
+                    </p>
+                  </div>
+
+                  {/* Post-uninstall commands (#118) */}
+                  <div>
+                    <label className="block text-sm font-medium text-text-secondary mb-2">
+                      Post-uninstall commands
+                    </label>
+                    <div className="space-y-2">
+                      {(config.postUninstallCommands || []).map((cmd, index) => (
+                        <div key={index} className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={cmd}
+                            onChange={(e) => updateCommand('postUninstallCommands', index, e.target.value)}
+                            aria-label={`Post-uninstall command ${index + 1}`}
+                            placeholder={'e.g. cmd.exe /c rmdir /s /q "C:\\ProgramData\\App"'}
+                            className="flex-1 px-3 py-2 bg-bg-elevated border border-overlay/15 rounded-lg text-text-primary text-sm font-mono"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeCommand('postUninstallCommands', index)}
+                            className="flex-shrink-0 text-text-muted hover:text-red-400 transition-colors p-1"
+                            aria-label="Remove command"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => addCommand('postUninstallCommands')}
+                        aria-label="Add post-uninstall command"
+                        className="flex items-center gap-1.5 text-xs font-medium text-accent-cyan hover:text-accent-cyan/80 transition-colors"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add command
+                      </button>
+                    </div>
+                    <p className="text-text-muted text-xs mt-1">
+                      Run after the app uninstalls (in order), e.g. to clean up leftover files.
+                    </p>
                   </div>
                 </div>
               </ConfigSection>}

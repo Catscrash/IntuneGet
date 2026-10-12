@@ -5,67 +5,57 @@ const { parseAccessTokenMock, getServerClientOrNullMock } = vi.hoisted(() => ({
   getServerClientOrNullMock: vi.fn(),
 }));
 
-vi.mock('@/lib/auth-utils', () => ({
-  parseAccessToken: parseAccessTokenMock,
-}));
+vi.mock('@/lib/auth-utils', () => ({ parseAccessToken: parseAccessTokenMock }));
+vi.mock('@/lib/supabase', () => ({ getServerClientOrNull: getServerClientOrNullMock }));
 
-vi.mock('@/lib/supabase', () => ({
-  getServerClientOrNull: getServerClientOrNullMock,
-}));
-
-import { GET } from '@/app/api/notifications/unread-count/route';
-
-function makeRequest() {
-  const request = new NextRequest('http://localhost:3000/api/notifications/unread-count');
-  request.headers.set('Authorization', 'Bearer test-token');
-  return request;
-}
+import { GET } from './route';
 
 describe('GET /api/notifications/unread-count', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    parseAccessTokenMock.mockResolvedValue({ userId: 'test-user' });
     getServerClientOrNullMock.mockReturnValue(null);
-    parseAccessTokenMock.mockResolvedValue({
-      userId: 'user-1',
-      userEmail: 'user@example.com',
-      tenantId: 'tenant-1',
-      userName: 'User',
-    });
   });
 
-  it('returns an empty badge without Supabase instead of crashing', async () => {
-    // Regression: the route called createServerClient() unconditionally, which
-    // throws without Supabase config, so every dashboard load logged a 500.
-    // user_notifications is Supabase-only, so an empty count is the honest
-    // answer here - under the same `unread_count` key the bell reads.
-    getServerClientOrNullMock.mockReturnValue(null);
+  function request() {
+    return new NextRequest('http://localhost/api/notifications/unread-count');
+  }
 
-    const response = await GET(makeRequest());
-    const body = await response.json();
+  it('returns the unread count contract when Supabase is unavailable', async () => {
+    const response = await GET(request());
 
     expect(response.status).toBe(200);
-    expect(body.unread_count).toBe(0);
+    expect(await response.json()).toEqual({ unread_count: 0 });
   });
 
-  it('counts unread notifications when Supabase is configured', async () => {
-    const query: Record<string, unknown> = {};
-    query.select = vi.fn(() => query);
-    query.eq = vi.fn(() => query);
-    query.is = vi.fn(async () => ({ count: 3, error: null }));
-    getServerClientOrNullMock.mockReturnValue({ from: vi.fn(() => query) });
+  it('returns the configured database count for the authenticated user', async () => {
+    const query = {
+      select: vi.fn(),
+      eq: vi.fn(),
+      is: vi.fn().mockResolvedValue({ count: 3, error: null }),
+    };
+    query.select.mockReturnValue(query);
+    query.eq.mockReturnValue(query);
+    const from = vi.fn().mockReturnValue(query);
+    getServerClientOrNullMock.mockReturnValue({ from });
 
-    const response = await GET(makeRequest());
-    const body = await response.json();
+    const response = await GET(request());
 
     expect(response.status).toBe(200);
-    expect(body.unread_count).toBe(3);
+    expect(await response.json()).toEqual({ unread_count: 3 });
+    expect(from).toHaveBeenCalledWith('user_notifications');
+    expect(query.select).toHaveBeenCalledWith('*', { count: 'exact', head: true });
+    expect(query.eq).toHaveBeenCalledWith('user_id', 'test-user');
+    expect(query.is).toHaveBeenCalledWith('read_at', null);
   });
 
-  it('returns 401 without valid auth', async () => {
+  it('requires authentication before initializing the database client', async () => {
     parseAccessTokenMock.mockResolvedValue(null);
 
-    const response = await GET(makeRequest());
+    const response = await GET(request());
 
     expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'Authentication required' });
+    expect(getServerClientOrNullMock).not.toHaveBeenCalled();
   });
 });

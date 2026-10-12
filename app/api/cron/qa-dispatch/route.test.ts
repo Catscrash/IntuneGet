@@ -1,21 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
+  getPackageCompatibilityBlockMock,
   cancelStaleWaitingQaRunsMock,
   createServerClientMock,
   dispatchQaCandidateMock,
   getGitHubActionsHealthMock,
   isQaWorkflowRunCompletedMock,
+  dispatchCuratedQueueMock,
 } = vi.hoisted(() => ({
+  getPackageCompatibilityBlockMock: vi.fn(),
   cancelStaleWaitingQaRunsMock: vi.fn(),
   createServerClientMock: vi.fn(),
   dispatchQaCandidateMock: vi.fn(),
   getGitHubActionsHealthMock: vi.fn(),
   isQaWorkflowRunCompletedMock: vi.fn(),
+  dispatchCuratedQueueMock: vi.fn(async () => ({ handled: false, dispatched: false })),
 }));
 
 vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock }));
+vi.mock('@/lib/package-eligibility', () => ({ getPackageCompatibilityBlock: getPackageCompatibilityBlockMock }));
 vi.mock('@/lib/qa/dispatch', () => ({ dispatchQaCandidate: dispatchQaCandidateMock }));
+vi.mock('@/lib/qa/curated-queue', () => ({ dispatchCuratedQueue: dispatchCuratedQueueMock }));
 vi.mock('@/lib/qa/github-actions-health', () => ({
   getGitHubActionsHealth: getGitHubActionsHealthMock,
 }));
@@ -45,7 +51,7 @@ function testUuid(index: number): string {
 
 function query(result: QueryResult) {
   const builder: Record<string, unknown> = {};
-  for (const method of ['eq', 'in', 'order', 'limit', 'or', 'select']) {
+  for (const method of ['eq', 'in', 'is', 'order', 'limit', 'or', 'select', 'lte', 'delete']) {
     builder[method] = vi.fn(() => builder);
   }
   builder.maybeSingle = vi.fn(async () => result);
@@ -56,7 +62,7 @@ function query(result: QueryResult) {
   return builder;
 }
 
-function candidate(profileKind: 'catalog-default' | 'deployment-config') {
+function candidate(profileKind: 'catalog-default' | 'deployment-config', installerSha256 = 'A'.repeat(64)) {
   const profileInput = {
     profileKind,
     wingetId: 'Example.App',
@@ -64,7 +70,7 @@ function candidate(profileKind: 'catalog-default' | 'deployment-config') {
     publisher: 'Contoso',
     version: '1.2.3',
     architecture: 'x64',
-    installerSha256: 'A'.repeat(64),
+    installerSha256,
     sourceInstallerType: 'nullsoft',
     silentArgs: '/S',
     uninstallCommand: 'REGISTRY_UNINSTALL:Example:/S',
@@ -81,6 +87,7 @@ function candidate(profileKind: 'catalog-default' | 'deployment-config') {
     version: profileInput.version,
     architecture: profileInput.architecture,
     installer_sha256: profileInput.installerSha256,
+    installer_url: 'https://example.com/installer.exe',
     package_profile_sha256: identity.packageProfileSha256,
     test_config: {
       profileKind,
@@ -89,6 +96,7 @@ function candidate(profileKind: 'catalog-default' | 'deployment-config') {
     },
     priority: profileKind === 'deployment-config' ? 1000 : 0,
     enqueued_at: '2026-08-08T12:00:00.000Z',
+    next_retry_at: '-infinity',
     attempts: 0,
     status: 'queued',
     test_level: 'psadt-package',
@@ -102,6 +110,9 @@ function createSupabaseStub(
     paused?: boolean;
     requiredPackagerCommit?: string | null;
     claimNullIds?: string[];
+    grantEligibleIds?: string[];
+    grantError?: { message: string; code?: string };
+    claimBlockedIds?: string[];
     claimErrorById?: Record<string, { message: string; code?: string }>;
     supersedeError?: { message: string; code?: string };
     activeCandidates?: Array<Record<string, unknown>>;
@@ -122,7 +133,25 @@ function createSupabaseStub(
   let queuePageIndex = 0;
 
   const client = {
+    rpc: vi.fn(async (name: string, args: { p_id?: string; p_candidate_id?: string }) => {
+      if (name === 'qa_retest_grant_eligible') return {
+        data: options.grantEligibleIds?.includes(args.p_candidate_id!) === true,
+        error: options.grantError || null,
+      };
+      if (name !== 'claim_qa_work') return { data: '2026-09-24T12:30:00.000Z', error: null };
+      const id = args.p_id!;
+      claimAttemptIds.push(id);
+      if (options.claimBlockedIds?.includes(id)) return { data: { reason: 'package_compatibility_blocked' }, error: null };
+      const claimError = options.claimErrorById?.[id];
+      if (claimError) return { data: null, error: claimError };
+      if (options.claimNullIds?.includes(id)) return { data: null, error: null };
+      const row = allQueued.find(entry => entry.id === id);
+      if (row) claimedIds.push(id);
+      return { data: row ? { row: { ...row, status: 'dispatched', attempts: row.attempts + 1, dispatched_at: new Date().toISOString() } } : null, error: null };
+    }),
     from: vi.fn((table: string) => {
+      if (table === 'qa_installer_security_holds') return query({ data: [], error: null });
+      if (table === 'qa_source_backoff') return query({ data: null, error: null });
       if (table === 'qa_pipeline_control') {
         return query({
           data: {
@@ -161,6 +190,10 @@ function createSupabaseStub(
             const builder = query({ data: [], error: null }) as Record<string, unknown>;
             builder.in = vi.fn((_column: string, value: string[]) => {
               ids = value;
+              return builder;
+            });
+            builder.eq = vi.fn((column: string, value: string) => {
+              if (column === 'id') ids = [value];
               return builder;
             });
             builder.select = vi.fn(() => {
@@ -245,6 +278,7 @@ function cronRequest(): Request {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  getPackageCompatibilityBlockMock.mockReset().mockResolvedValue(null);
   process.env.CRON_SECRET = 'test-cron-secret';
   dispatchQaCandidateMock.mockResolvedValue(undefined);
   getGitHubActionsHealthMock.mockResolvedValue({ operational: true, status: 'operational' });
@@ -262,6 +296,82 @@ afterEach(() => {
 });
 
 describe('GET /api/cron/qa-dispatch', () => {
+  it('supersedes an exact held payload before claiming and dispatches an unaffected payload', async () => {
+    const held = candidate('deployment-config');
+    const allowed = candidate('catalog-default', 'B'.repeat(64));
+    const { client, claimedIds, supersededIds } = createSupabaseStub([held, allowed]);
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockImplementation(async (_client, tuple) =>
+      tuple.installerSha256 === held.installer_sha256 ? { code: 'failed_managed_lifecycle' } : null
+    );
+    const response = await GET(cronRequest());
+    expect(response.status).toBe(200);
+    expect(supersededIds).toContain(held.id);
+    expect(claimedIds).toEqual([allowed.id]);
+    expect(dispatchQaCandidateMock).toHaveBeenCalledTimes(1);
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(client, {
+      wingetId: held.winget_id, version: held.version,
+      architecture: held.architecture, installerSha256: held.installer_sha256,
+    });
+  });
+
+  it('fails closed without claiming when the compatibility lookup fails', async () => {
+    const { client, claimedIds } = createSupabaseStub([candidate('catalog-default')]);
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockRejectedValueOnce(new Error('Compatibility gate unavailable'));
+    await expect(GET(cronRequest())).rejects.toThrow('Compatibility gate unavailable');
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('dispatches a managed failure only with an exact eligible diagnostic grant', async () => {
+    const row = candidate('catalog-default');
+    const { client, claimedIds, supersededIds } = createSupabaseStub([row], [], { grantEligibleIds: [row.id] });
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockResolvedValue({ code: 'failed_managed_lifecycle' });
+    await GET(cronRequest());
+    expect(claimedIds).toEqual([row.id]);
+    expect(supersededIds).toEqual([]);
+    expect(client.rpc).toHaveBeenCalledWith('qa_retest_grant_eligible', { p_candidate_id: row.id });
+    expect(dispatchQaCandidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never uses a diagnostic grant for another compatibility block', async () => {
+    const row = candidate('catalog-default');
+    const { client, claimedIds, supersededIds } = createSupabaseStub([row], [], { grantEligibleIds: [row.id] });
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockResolvedValue({ code: 'unsupported_managed_uninstall' });
+    await GET(cronRequest());
+    expect(client.rpc).not.toHaveBeenCalledWith('qa_retest_grant_eligible', expect.anything());
+    expect(claimedIds).toEqual([]);
+    expect(supersededIds).toContain(row.id);
+  });
+
+  it('fails closed when diagnostic grant eligibility cannot be verified', async () => {
+    const row = candidate('catalog-default');
+    const { client, claimedIds } = createSupabaseStub([row], [], { grantError: { message: 'Grant gate unavailable' } });
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockResolvedValue({ code: 'failed_managed_lifecycle' });
+    await expect(GET(cronRequest())).rejects.toEqual({ message: 'Grant gate unavailable' });
+    expect(claimedIds).toEqual([]);
+    expect(dispatchQaCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('advances the fair queue when the locked claim rejects a formerly eligible grant', async () => {
+    const held = candidate('deployment-config');
+    const next = candidate('catalog-default', 'B'.repeat(64));
+    const { client, claimedIds, supersededIds } = createSupabaseStub([held, next], [], {
+      grantEligibleIds: [held.id], claimBlockedIds: [held.id],
+    });
+    createServerClientMock.mockReturnValue(client);
+    getPackageCompatibilityBlockMock.mockImplementation(async (_client, tuple) =>
+      tuple.installerSha256 === held.installer_sha256 ? { code: 'failed_managed_lifecycle' } : null);
+    await GET(cronRequest());
+    expect(supersededIds).toContain(held.id);
+    expect(claimedIds).toEqual([next.id]);
+    expect(dispatchQaCandidateMock).toHaveBeenCalledTimes(1);
+  });
+
   it('does not reconcile or dispatch candidates while maintenance is paused', async () => {
     const row = candidate('catalog-default');
     const { client, claimedIds } = createSupabaseStub([row], [], { paused: true });
@@ -429,6 +539,65 @@ describe('GET /api/cron/qa-dispatch', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('unblocks a stale dispatch before charging another app timeout attempt', async () => {
+    const active = { ...candidate('catalog-default'), status: 'dispatched', attempts: 2,
+      dispatched_at: '2026-09-24T18:00:00Z', started_at: null, github_run_id: null };
+    const { client, rollbackIds, terminalErrorIds, claimedIds } = createSupabaseStub([], [], { activeCandidates: [active] });
+    createServerClientMock.mockReturnValue(client);
+    cancelStaleWaitingQaRunsMock.mockResolvedValue([36037902554]);
+    expect(await (await GET(cronRequest())).json()).toMatchObject({ reason: 'stale_waiting_run_cancelled' });
+    expect(rollbackIds).toEqual([]);
+    expect(terminalErrorIds).toEqual([]);
+    expect(claimedIds).toEqual([]);
+  });
+
+  it('retains an unfinished workflow and its run ID even beyond the hard timeout', async () => {
+    const active = { ...candidate('catalog-default'), status: 'running', phase: 'publishing', attempts: 1,
+      dispatched_at: '2026-09-24T17:57:36Z', started_at: '2026-09-24T17:57:41Z',
+      github_run_id: '36037902554' };
+    const { client, rollbackIds, terminalErrorIds } = createSupabaseStub([], [], { activeCandidates: [active] });
+    createServerClientMock.mockReturnValue(client);
+    isQaWorkflowRunCompletedMock.mockResolvedValue(false);
+    expect(await (await GET(cronRequest())).json()).toMatchObject({ reason: 'qa_active', reconciled: 0 });
+    expect(rollbackIds).toEqual([]);
+    expect(terminalErrorIds).toEqual([]);
+    expect(isQaWorkflowRunCompletedMock).toHaveBeenCalledWith('36037902554');
+  });
+
+  it('preserves a cancelled publisher for publication-only recovery even when cron wins the race', async () => {
+    const active = { ...candidate('catalog-default'), status: 'running', phase: 'publishing', attempts: 1,
+      dispatched_at: '2026-09-24T17:57:36Z', started_at: '2026-09-24T17:57:41Z', github_run_id: '36037902554' };
+    const { client, rollbackIds, terminalErrorPayloads } = createSupabaseStub([], [], { activeCandidates: [active] });
+    createServerClientMock.mockReturnValue(client);
+    isQaWorkflowRunCompletedMock.mockResolvedValue(true);
+    await GET(cronRequest());
+    expect(rollbackIds).toEqual([]);
+    expect(terminalErrorPayloads).toContainEqual(expect.objectContaining({
+      failure_summary: 'QA result publication did not complete; inspect the protected workflow run.',
+    }));
+    expect(terminalErrorPayloads[0]).not.toHaveProperty('github_run_id');
+  });
+
+  it('reports an unstarted dispatch as infrastructure failure, not failed installation', async () => {
+    const active = { ...candidate('catalog-default'), status: 'dispatched', attempts: 2,
+      dispatched_at: '2026-09-24T18:00:00Z', started_at: null, github_run_id: null };
+    const { client, terminalErrorPayloads } = createSupabaseStub([], [], { activeCandidates: [active] });
+    createServerClientMock.mockReturnValue(client);
+    await GET(cronRequest());
+    expect(terminalErrorPayloads).toContainEqual(expect.objectContaining({
+      failure_summary: 'The QA workflow did not start before the dispatch timeout.',
+    }));
+  });
+
+  it('never inspects orphaned runs while a fresh VM lifecycle is executing', async () => {
+    const active = { ...candidate('catalog-default'), status: 'running', attempts: 1,
+      dispatched_at: new Date().toISOString(), started_at: new Date().toISOString(), github_run_id: '123' };
+    const { client } = createSupabaseStub([], [], { activeCandidates: [active] });
+    createServerClientMock.mockReturnValue(client);
+    expect(await (await GET(cronRequest())).json()).toMatchObject({ reason: 'qa_active' });
+    expect(cancelStaleWaitingQaRunsMock).not.toHaveBeenCalled();
   });
 
   it('supersedes an invalid row and dispatches the valid row behind it', async () => {
@@ -683,13 +852,13 @@ describe('GET /api/cron/qa-dispatch', () => {
     expect(dispatchQaCandidateMock).toHaveBeenCalledTimes(1);
   });
 
-  it('terminates an exhausted installer preflight retry and continues dispatching', async () => {
+  it('persists an installer cooldown after repeated failures and continues dispatching', async () => {
     const unavailable = candidate('catalog-default');
     unavailable.id = testUuid(52);
     unavailable.attempts = 1;
     const valid = candidate('catalog-default');
     valid.id = testUuid(53);
-    const { client, claimedIds, terminalErrorIds, terminalErrorPayloads } = createSupabaseStub([
+    const { client, claimedIds, terminalErrorIds, rollbackPayloads } = createSupabaseStub([
       unavailable,
       valid,
     ]);
@@ -708,11 +877,11 @@ describe('GET /api/cron/qa-dispatch', () => {
     expect(response.status).toBe(200);
     expect(body).toMatchObject({ dispatched: true, candidateId: valid.id });
     expect(claimedIds).toEqual([unavailable.id, valid.id]);
-    expect(terminalErrorIds).toEqual([unavailable.id]);
-    expect(terminalErrorPayloads).toContainEqual(expect.objectContaining({
-      status: 'error',
+    expect(terminalErrorIds).toEqual([]);
+    expect(rollbackPayloads).toContainEqual(expect.objectContaining({
+      status: 'queued',
       attempts: 2,
-      finished_at: expect.any(String),
+      next_retry_at: '2026-09-24T12:30:00.000Z',
     }));
   });
 

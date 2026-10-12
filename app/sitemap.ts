@@ -3,7 +3,7 @@ import { blogPosts } from "@/lib/data/blog-data";
 import { getCatalogSource } from "@/lib/catalog";
 import { absoluteAppCatalogUrl, mergeCategoryCounts } from "@/lib/catalog/seo";
 
-const BASE_URL = "https://intuneget.com";
+const BASE_URL = "https://www.intuneget.com";
 
 export function generateSitemaps() {
   return [{ id: 0 }, { id: 1 }, { id: 2 }];
@@ -72,9 +72,9 @@ export default async function sitemap({ id }: { id: Promise<number> }): Promise<
       priority: 0.7,
     },
     {
-      url: `${BASE_URL}/changelog`,
+      url: `${BASE_URL}/roadmap`,
       lastModified: now,
-      changeFrequency: "weekly",
+      changeFrequency: "monthly",
       priority: 0.6,
     },
     {
@@ -109,6 +109,8 @@ export default async function sitemap({ id }: { id: Promise<number> }): Promise<
     "/api-reference",
     "/sccm-migration",
     "/updates-policies",
+    "/packaging",
+    "/catalog",
     "/inventory-reports-uploads",
     "/unmanaged-apps",
     "/msp",

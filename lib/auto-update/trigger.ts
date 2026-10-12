@@ -4,6 +4,7 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { supabaseDb } from '@/lib/db/supabase-adapter';
 import {
   AppUpdatePolicy,
   AutoUpdateHistory,
@@ -15,6 +16,14 @@ import {
 } from '@/types/update-policies';
 import type { IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
 import { getCatalogSource } from '@/lib/catalog';
+import { isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
+import { findCuratedApp } from '@/lib/curated-catalog/definitions';
+import { assertCuratedInstaller, authorizeCuratedWorkflow, getApprovedCuratedRelease } from '@/lib/curated-catalog/server';
+import { CuratedConfigVerificationError } from '@/lib/curated-catalog/custom-config';
+import { buildCuratedCartItem, curatedWorkflowInput } from '@/lib/curated-catalog/package';
+import { testedCuratedSettings } from '@/lib/curated-catalog/settings';
+import { assertCuratedLicenceAccepted, CuratedLicenceError } from '@/lib/curated-catalog/licence';
+import type { CuratedLicenceAcceptanceSnapshot } from '@/lib/curated-catalog/types';
 import {
   normalizeInstallerSha256,
   selectWingetInstaller,
@@ -38,6 +47,8 @@ import {
 } from '@/lib/packaging-adapters';
 import type { NormalizedInstaller, WingetInstaller, WingetScope } from '@/types/winget';
 import { DEFAULT_PSADT_CONFIG, type DetectionRule } from '@/types/psadt';
+import { QA_PRIORITY_DEMAND } from '@/lib/qa/constants';
+import { findPendingApprovalBlocks } from '@/lib/intune-approval-guard';
 
 interface TriggerResult {
   success: boolean;
@@ -51,10 +62,19 @@ interface TriggerResult {
     | 'QA_FAILED_CURRENT_VERSION'
     | 'QA_NOT_PASSED_CURRENT_VERSION'
     | 'QA_SECURITY_FLAGGED_CURRENT_VERSION'
-    | 'QA_PACKAGE_COMPATIBILITY_BLOCKED';
+    | 'QA_PACKAGE_COMPATIBILITY_BLOCKED'
+    | 'CURATED_LICENCE_NOT_ACCEPTED'
+    | 'CURATED_CONFIG_VERIFICATION_REQUIRED'
+    | 'INTUNE_APPROVAL_PENDING'
+    | 'CURATED_CONFIG_VERIFICATION_FAILED'
+    | 'RATE_LIMIT_UNVERIFIED'
+    | 'PSADT_BACKFILL_UNAVAILABLE';
 }
 
 export interface UpdateInfo {
+  sourceType?: 'curated';
+  curatedReleaseId?: string;
+  curatedLicenceAcceptance?: CuratedLicenceAcceptanceSnapshot;
   wingetId: string;
   currentVersion: string;
   latestVersion: string;
@@ -74,6 +94,7 @@ export interface UpdateInfo {
 }
 
 export type InstallerResolutionFailureReason =
+  | 'curated_release_unavailable'
   | 'app_not_in_catalog'
   | 'version_record_missing'
   | 'installer_metadata_missing'
@@ -95,6 +116,18 @@ interface RateLimitCheck {
   allowed: boolean;
   reason?: string;
   retryAfterMinutes?: number;
+  // Set when a read failed, so callers can report it instead of treating it
+  // as an ordinary skip.
+  code?: 'RATE_LIMIT_UNVERIFIED';
+}
+
+type RecentUpdateCount = { count: number } | { count: null; error: string };
+
+function readErrorMessage(error: unknown): string {
+  if (error && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  return 'no data returned';
 }
 
 function buildCurrentVersionInstallCommand(installer: NormalizedInstaller): string {
@@ -157,12 +190,23 @@ export function normalizeCategories(config: DeploymentConfig): IntuneAppCategory
   return normalized;
 }
 
+// Rate limit reads: keyset page size for policy ids, and how many ids go into
+// one `policy_id=in.(...)` count so the request stays inside URL limits.
+const RATE_LIMIT_PAGE_SIZE = 1000;
+const RATE_LIMIT_ID_CHUNK_SIZE = 100;
+
 /**
  * Main service for triggering auto-updates
  */
 export class AutoUpdateTrigger {
   private supabase: SupabaseClient;
   private safetyConfig: AutoUpdateSafetyConfig;
+  // Per instance (one cron run or one request) rate limit state, so many
+  // candidates in one run do not rescan the same policy lists. Policy ids
+  // hardly change within a run, and a scope at its limit stays there for the
+  // few minutes a run takes, because the counted window is one hour.
+  private ratePolicyIds = new Map<string, string[]>();
+  private rateLimitedScopes = new Map<string, RateLimitCheck>();
 
   constructor(
     supabaseUrl: string,
@@ -199,6 +243,11 @@ export class AutoUpdateTrigger {
         };
       }
 
+      // Custom detection belongs to the administrator and stays fixed until edited.
+      if (policy.deployment_config.psadtConfig?.customDetection) {
+        return { success: false, skipped: true, skipReason: customDetectionUpdateHold(updateInfo.latestVersion) };
+      }
+
       // Safety check 3: Verify prior deployment exists (if required)
       if (this.safetyConfig.requirePriorDeployment && !options?.skipPriorDeploymentCheck && !policy.original_upload_history_id) {
         return {
@@ -215,6 +264,7 @@ export class AutoUpdateTrigger {
             success: false,
             skipped: true,
             skipReason: rateLimitResult.reason,
+            code: rateLimitResult.code,
           };
         }
       }
@@ -230,9 +280,28 @@ export class AutoUpdateTrigger {
         }
       }
 
+      const curated = isCuratedPackageId(updateInfo.wingetId) || updateInfo.sourceType === 'curated'
+        ? findCuratedApp(updateInfo.wingetId) : undefined;
+      const approvalBlocks = await findPendingApprovalBlocks({ tenantId: policy.tenant_id,
+        wingetIds: curated ? [curated.packageId, updateInfo.wingetId] : [updateInfo.wingetId] }, { db: supabaseDb });
+      if (approvalBlocks.length) {
+        return { success: false, skipped: true, code: approvalBlocks[0].code,
+          skipReason: approvalBlocks[0].message };
+      }
+
       // Backfill PSADT settings from the original deployment for policies
       // created before psadtConfig was stored on deployment_config
-      await this.ensurePsadtConfig(policy);
+      if (!(await this.ensurePsadtConfig(policy))) {
+        return {
+          success: false,
+          skipped: true,
+          code: 'PSADT_BACKFILL_UNAVAILABLE',
+          skipReason: 'IntuneGet could not load the original deployment settings for this policy. The update was not started. Try again shortly.',
+        };
+      }
+      if (policy.deployment_config.psadtConfig?.customDetection) {
+        return { success: false, skipped: true, skipReason: customDetectionUpdateHold(updateInfo.latestVersion) };
+      }
 
       // Policies created by older IntuneGet releases can contain generated
       // defaults that were never valid at runtime (for example an MSI
@@ -247,7 +316,7 @@ export class AutoUpdateTrigger {
         storedDeploymentConfig.installScope || updateInfo.installScope
       );
       updateInfo = { ...updateInfo, installScope: effectiveInstallScope };
-      const deploymentConfig: DeploymentConfig = {
+      let deploymentConfig: DeploymentConfig = {
         ...storedDeploymentConfig,
         installScope: effectiveInstallScope,
         uninstallCommand:
@@ -259,6 +328,47 @@ export class AutoUpdateTrigger {
           storedDeploymentConfig.psadtConfig || DEFAULT_PSADT_CONFIG
         ),
       };
+      if (isCuratedPackageId(updateInfo.wingetId)) {
+        const approved = assertCuratedInstaller({
+          wingetId: updateInfo.wingetId, version: updateInfo.latestVersion,
+          architecture: deploymentConfig.architecture, installScope: effectiveInstallScope,
+          installerUrl: updateInfo.installerUrl, installerSha256: updateInfo.installerSha256,
+          installerType: updateInfo.installerType, curatedReleaseId: updateInfo.curatedReleaseId,
+        });
+        const current = buildCuratedCartItem(approved.app, approved.release);
+        deploymentConfig = {
+          ...deploymentConfig, sourceType: 'curated', curatedReleaseId: approved.release.id,
+          displayName: current.displayName, publisher: current.publisher,
+          architecture: current.architecture, installScope: current.installScope,
+          installerType: current.installerType, installCommand: current.installCommand,
+          uninstallCommand: current.uninstallCommand, detectionRules: current.detectionRules,
+          // Keep the tenant's PSADT settings. Custom execution settings must be
+          // verified for this release; until then the update waits (queued for
+          // verification) without counting a failure.
+          psadtConfig: deploymentConfig.curatedSettingsMode === 'tested-defaults'
+            ? testedCuratedSettings(current.psadtConfig, deploymentConfig.psadtConfig || current.psadtConfig)
+            : deploymentConfig.psadtConfig || current.psadtConfig,
+        };
+        try {
+          await authorizeCuratedWorkflow({
+            ...curatedWorkflowInput({ ...current, psadtConfig: deploymentConfig.psadtConfig || current.psadtConfig }),
+            installerUrl: current.installerUrl, curatedReleaseId: approved.release.id,
+          }, { tenantId: policy.tenant_id, userId: policy.user_id });
+        } catch (error) {
+          if (!(error instanceof CuratedConfigVerificationError)) throw error;
+          return { success: false, skipped: true, skipReason: error.message, code: error.verificationCode };
+        }
+        updateInfo = { ...updateInfo, sourceType: 'curated', curatedReleaseId: approved.release.id };
+        // Automatic updates never imply licence acceptance: skip (without
+        // counting a failure) until the tenant accepts the current agreement.
+        try {
+          const acceptance = await assertCuratedLicenceAccepted(policy.tenant_id, approved.app.packageId);
+          if (acceptance) updateInfo = { ...updateInfo, curatedLicenceAcceptance: acceptance };
+        } catch (error) {
+          if (!(error instanceof CuratedLicenceError)) throw error;
+          return { success: false, skipped: true, skipReason: error.message, code: error.code };
+        }
+      }
       // Keep the effective adapter in this update attempt so QA and the job
       // receive the same config, without persisting derived adapter output into
       // the customer's policy. A later adapter revision is therefore reapplied.
@@ -299,7 +409,7 @@ export class AutoUpdateTrigger {
         detectionRules: JSON.stringify(
           updateInfo.detectionRules || deploymentConfig.detectionRules || []
         ),
-        priority: 1500,
+        priority: QA_PRIORITY_DEMAND,
         demandSource: 'auto_update',
       });
       if (qaDemand.state === 'failed') {
@@ -359,61 +469,123 @@ export class AutoUpdateTrigger {
   }
 
   /**
-   * Check rate limits for auto-updates
+   * Count auto-update history rows since `since` for every policy of one
+   * tenant or one user. Policy ids are read with keyset paging and counted in
+   * small chunks, so a large policy list cannot exceed URL limits. Returns
+   * the read error when any read fails, so callers can fail closed and say why.
+   */
+  private async countRecentUpdates(
+    scope: { column: 'tenant_id' | 'user_id'; value: string },
+    since: string,
+    completedOnly: boolean
+  ): Promise<RecentUpdateCount> {
+    const scopeKey = `${scope.column}:${scope.value}`;
+    const cachedIds = this.ratePolicyIds.get(scopeKey);
+    const policyIds: string[] = cachedIds ? [...cachedIds] : [];
+    let afterId: string | null = null;
+    while (!cachedIds) {
+      const query = this.supabase
+        .from('app_update_policies')
+        .select('id')
+        .eq(scope.column, scope.value);
+      const page: { data: Array<{ id: unknown }> | null; error: unknown } = await (afterId
+        ? query.gt('id', afterId)
+        : query
+      )
+        .order('id')
+        .limit(RATE_LIMIT_PAGE_SIZE);
+      const { data, error } = page;
+      if (error || !data) {
+        return { count: null, error: `policy read failed: ${readErrorMessage(error)}` };
+      }
+      if (data.length === 0) {
+        this.ratePolicyIds.set(scopeKey, [...policyIds]);
+        break;
+      }
+      const lastId: unknown = data[data.length - 1].id;
+      if (typeof lastId !== 'string' || lastId === afterId) {
+        return { count: null, error: 'policy read did not return an advancing id' };
+      }
+      policyIds.push(...data.map((row) => String(row.id)));
+      afterId = lastId;
+    }
+
+    let total = 0;
+    for (let start = 0; start < policyIds.length; start += RATE_LIMIT_ID_CHUNK_SIZE) {
+      let query = this.supabase
+        .from('auto_update_history')
+        .select('id', { count: 'exact', head: true })
+        .gte('triggered_at', since)
+        .in('policy_id', policyIds.slice(start, start + RATE_LIMIT_ID_CHUNK_SIZE));
+      if (completedOnly) {
+        query = query.eq('status', 'completed');
+      }
+      const { count, error } = await query;
+      if (error || typeof count !== 'number') {
+        return { count: null, error: `update count failed: ${readErrorMessage(error)}` };
+      }
+      total += count;
+    }
+    return { count: total };
+  }
+
+  /**
+   * Check rate limits for auto-updates. A count that cannot be read counts as
+   * a reached limit, so a failed or oversized query never lets updates through.
    */
   private async checkRateLimits(userId: string, tenantId: string, policyId: string): Promise<RateLimitCheck> {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const { rateLimits } = this.safetyConfig;
+    const unverified = (error: string): RateLimitCheck => ({
+      allowed: false,
+      reason: `Rate limit could not be verified (${error}), the update will be retried later`,
+      retryAfterMinutes: rateLimits.cooldownMinutes,
+      code: 'RATE_LIMIT_UNVERIFIED',
+    });
 
-    // First, get the policy IDs for this tenant
-    const { data: tenantPolicies } = await this.supabase
-      .from('app_update_policies')
-      .select('id')
-      .eq('tenant_id', tenantId);
-
-    if (tenantPolicies && tenantPolicies.length > 0) {
-      const tenantPolicyIds = tenantPolicies.map((p) => p.id);
-
-      // Check per-tenant rate limit
-      const { count: tenantCount } = await this.supabase
-        .from('auto_update_history')
-        .select('id', { count: 'exact', head: true })
-        .eq('status', 'completed')
-        .gte('triggered_at', oneHourAgo)
-        .in('policy_id', tenantPolicyIds);
-
-      if (tenantCount && tenantCount >= rateLimits.maxUpdatesPerTenant) {
-        return {
-          allowed: false,
-          reason: `Rate limit exceeded: ${rateLimits.maxUpdatesPerTenant} updates per tenant per hour`,
-          retryAfterMinutes: 60,
-        };
-      }
+    const tenantScope = `tenant_id:${tenantId}`;
+    const userScope = `user_id:${userId}`;
+    const limited = this.rateLimitedScopes.get(tenantScope) ?? this.rateLimitedScopes.get(userScope);
+    if (limited) {
+      return limited;
     }
 
-    // Get policy IDs for this user
-    const { data: userPolicies } = await this.supabase
-      .from('app_update_policies')
-      .select('id')
-      .eq('user_id', userId);
+    // Check per-tenant rate limit
+    const tenantCount = await this.countRecentUpdates(
+      { column: 'tenant_id', value: tenantId },
+      oneHourAgo,
+      true
+    );
+    if (tenantCount.count === null) {
+      return unverified(tenantCount.error);
+    }
+    if (tenantCount.count >= rateLimits.maxUpdatesPerTenant) {
+      const denial: RateLimitCheck = {
+        allowed: false,
+        reason: `Rate limit exceeded: ${rateLimits.maxUpdatesPerTenant} updates per tenant per hour`,
+        retryAfterMinutes: 60,
+      };
+      this.rateLimitedScopes.set(tenantScope, denial);
+      return denial;
+    }
 
-    if (userPolicies && userPolicies.length > 0) {
-      const userPolicyIds = userPolicies.map((p) => p.id);
-
-      // Check global hourly rate limit
-      const { count: globalCount } = await this.supabase
-        .from('auto_update_history')
-        .select('id', { count: 'exact', head: true })
-        .gte('triggered_at', oneHourAgo)
-        .in('policy_id', userPolicyIds);
-
-      if (globalCount && globalCount >= rateLimits.maxUpdatesPerHour) {
-        return {
-          allowed: false,
-          reason: `Rate limit exceeded: ${rateLimits.maxUpdatesPerHour} updates per hour`,
-          retryAfterMinutes: 60,
-        };
-      }
+    // Check global hourly rate limit for this user
+    const userCount = await this.countRecentUpdates(
+      { column: 'user_id', value: userId },
+      oneHourAgo,
+      false
+    );
+    if (userCount.count === null) {
+      return unverified(userCount.error);
+    }
+    if (userCount.count >= rateLimits.maxUpdatesPerHour) {
+      const denial: RateLimitCheck = {
+        allowed: false,
+        reason: `Rate limit exceeded: ${rateLimits.maxUpdatesPerHour} updates per hour`,
+        retryAfterMinutes: 60,
+      };
+      this.rateLimitedScopes.set(userScope, denial);
+      return denial;
     }
 
     // Check cooldown since last update for this specific policy
@@ -421,12 +593,16 @@ export class AutoUpdateTrigger {
       Date.now() - rateLimits.cooldownMinutes * 60 * 1000
     ).toISOString();
 
-    const { data: recentUpdate } = await this.supabase
+    const { data: recentUpdate, error: recentUpdateError } = await this.supabase
       .from('auto_update_history')
       .select('id')
       .eq('policy_id', policyId)
       .gte('triggered_at', cooldownTime)
       .limit(1);
+
+    if (recentUpdateError) {
+      return unverified(`cooldown read failed: ${readErrorMessage(recentUpdateError)}`);
+    }
 
     if (recentUpdate && recentUpdate.length > 0) {
       return {
@@ -541,19 +717,19 @@ export class AutoUpdateTrigger {
    * read it from the most recent packaging job for this app and store it
    * back on the policy so per-package settings (deploy mode, command
    * overrides, verifyInstall, removeExistingInstall, registryMarkerPath)
-   * survive updates. Mutates policy.deployment_config in place; failures
-   * are non-fatal (the update proceeds without PSADT settings, as before).
+   * survive updates. Mutates policy.deployment_config in place. A failed
+   * read stops the update rather than discarding the administrator's settings.
    */
-  private async ensurePsadtConfig(policy: AppUpdatePolicy): Promise<void> {
+  private async ensurePsadtConfig(policy: AppUpdatePolicy): Promise<boolean> {
     const config = policy.deployment_config as DeploymentConfig | null;
     if (!config || config.psadtConfig) {
-      return;
+      return true;
     }
 
     try {
       // Tenant-wide: the PSADT settings belong to the app as it was deployed,
       // not to the administrator who happens to own this policy.
-      const { data: uploadHistory } = await this.supabase
+      const { data: uploadHistory, error: historyError } = await this.supabase
         .from('upload_history')
         .select('packaging_job_id')
         .eq('intune_tenant_id', policy.tenant_id)
@@ -563,42 +739,56 @@ export class AutoUpdateTrigger {
         .limit(1)
         .maybeSingle();
 
+      if (historyError) {
+        console.warn('Could not load saved deployment settings: upload history read failed.');
+        return false;
+      }
       if (!uploadHistory?.packaging_job_id) {
-        return;
+        return true;
       }
 
-      const { data: packagingJob } = await this.supabase
+      const { data: packagingJob, error: jobError } = await this.supabase
         .from('packaging_jobs')
         .select('package_config')
         .eq('id', uploadHistory.packaging_job_id)
         .maybeSingle();
 
+      if (jobError) {
+        console.warn('Could not load saved deployment settings: packaging job read failed.');
+        return false;
+      }
       const packageConfig = packagingJob?.package_config;
       if (
         !packageConfig ||
         typeof packageConfig !== 'object' ||
         Array.isArray(packageConfig)
       ) {
-        return;
+        return true;
       }
 
       const psadtConfig = (packageConfig as Record<string, unknown>).psadtConfig;
       if (!psadtConfig || typeof psadtConfig !== 'object' || Array.isArray(psadtConfig)) {
-        return;
+        return true;
       }
 
       config.psadtConfig = psadtConfig as DeploymentConfig['psadtConfig'];
 
-      await this.supabase
-        .from('app_update_policies')
-        .update({ deployment_config: policy.deployment_config })
-        .eq('id', policy.id);
-    } catch (error) {
-      console.warn(
-        `Could not backfill psadtConfig for policy ${policy.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
+      // The recovered settings already protect this run if persistence fails.
+      try {
+        const { error: persistError } = await this.supabase
+          .from('app_update_policies')
+          .update({ deployment_config: policy.deployment_config })
+          .eq('id', policy.id);
+        if (persistError) {
+          console.warn('Could not save recovered deployment settings; this update uses them and a later update retries saving.');
+        }
+      } catch {
+        console.warn('Could not save recovered deployment settings; this update uses them and a later update retries saving.');
+      }
+      return true;
+    } catch {
+      console.warn('Could not load saved deployment settings: backfill read failed.');
+      return false;
     }
   }
 
@@ -690,6 +880,10 @@ export class AutoUpdateTrigger {
       install_scope: updateInfo.installScope || config.installScope,
       detection_rules: config.detectionRules,
       package_config: {
+        sourceType: updateInfo.sourceType || config.sourceType,
+        curatedReleaseId: updateInfo.curatedReleaseId,
+        curatedSettingsMode: config.curatedSettingsMode,
+        curatedLicenceAcceptance: updateInfo.curatedLicenceAcceptance,
         assignments,
         categories,
         assignedGroups: config.assignedGroups,
@@ -898,6 +1092,26 @@ export async function getLatestInstallerInfo(
   architecture?: string,
   installScope?: string
 ): Promise<InstallerResolutionResult> {
+  if (isCuratedPackageId(wingetId)) {
+    try {
+      const { app, release } = getApprovedCuratedRelease(wingetId);
+      if ((architecture && architecture !== app.architecture) || (installScope && installScope !== app.scope)) {
+        throw new Error('The curated pilot supports x64 machine installations.');
+      }
+      const item = buildCuratedCartItem(app, release);
+      return { ok: true, info: {
+        wingetId: app.packageId, currentVersion: '', latestVersion: item.version,
+        displayName: item.displayName, installerUrl: item.installerUrl,
+        installerSha256: item.installerSha256, installerType: item.installerType,
+        installCommand: item.installCommand, uninstallCommand: item.uninstallCommand,
+        detectionRules: item.detectionRules, silentSwitches: app.silentArgs,
+        installScope: app.scope, sourceType: 'curated', curatedReleaseId: release.id,
+      } };
+    } catch {
+      return { ok: false, failure: { reason: 'curated_release_unavailable',
+        message: 'No approved curated release is available for this application and installation configuration.' } };
+    }
+  }
   const catalog = getCatalogSource();
 
   // Get the curated app info
@@ -1084,3 +1298,4 @@ export async function getLatestInstallerInfo(
     },
   };
 }
+import { customDetectionUpdateHold } from '@/lib/custom-detection';

@@ -45,7 +45,7 @@ function MicrosoftLogo({ className }: { className?: string }) {
 }
 
 export default function SignInClient({ callbackUrl }: { callbackUrl: string }) {
-  const { isAuthenticated, signIn, signOut, getAccessToken } = useMicrosoftAuth();
+  const { isAuthenticated, signIn, signInRedirect, signOut, getAccessToken } = useMicrosoftAuth();
   const { signinClicks, appsSupported } = useLandingStats();
   const router = useRouter();
   const shouldReduceMotion = useReducedMotion();
@@ -562,10 +562,37 @@ export default function SignInClient({ callbackUrl }: { callbackUrl: string }) {
                   </Button>
                 </motion.div>
 
+                {/* Popup blockers and embedded browsers cannot open the sign-in window. */}
+                <p className="mt-3 text-center text-xs text-text-muted">
+                  <button
+                    type="button"
+                    onClick={() => { trackSigninClick(); setError(null); void signInRedirect(); }}
+                    disabled={isSigningIn}
+                    className="font-medium text-accent-cyan hover:underline disabled:opacity-50"
+                  >
+                    <T>No sign-in window? Continue in this tab</T>
+                  </button>
+                </p>
+
                 {/* Trust badge */}
                 <div className="mt-6 flex items-center justify-center gap-2 rounded-full border border-accent-cyan/15 bg-accent-cyan/5 px-3 py-2 text-xs font-medium text-text-secondary">
                   <Shield className="h-3.5 w-3.5 text-accent-cyan" />
                   <span><T>Protected by Microsoft Entra ID</T></span>
+                </div>
+
+                {/* Access disclosure so the consent choice is informed */}
+                <div className="mt-4 space-y-2 text-xs leading-relaxed text-text-muted">
+                  <p>
+                    <T>Sign-in requests delegated access to <Var>User.Read</Var>, <Var>openid</Var>, and <Var>profile</Var> only, so IntuneGet can read your basic work profile.</T>
+                  </p>
+                  <p>
+                    <T>Intune actions run server-side through an app registration your admin approves, so privileged Graph access is never handed to the browser.</T>
+                  </p>
+                  <p>
+                    <Link href="/security" className="font-medium text-accent-cyan hover:underline">
+                      <T>See the full permission list and data flow</T>
+                    </Link>
+                  </p>
                 </div>
               </div>
 

@@ -1,9 +1,12 @@
 import config from '@/.ugurlabs/changelog.json';
+import { isApplicationSpecific } from './changelog/application-specific.mjs';
 
 export const CHANGELOG_FEED_URL = `${config.apiUrl}/${config.productId}?limit=20`;
 export const CHANGELOG_ARCHIVE_URL = `https://changelog.ugurlabs.com/?product=${config.productId}`;
 export const CHANGELOG_SEEN_KEY = `ugurlabs:changelog:last-seen:${config.productId}`;
 export const CHANGELOG_SEEN_EVENT = 'intuneget:changelog-seen';
+export const CHANGELOG_OPEN_EVENT = 'intuneget:changelog-open';
+export const CHANGELOG_HASH = '#changelog';
 const CACHE_TTL_MS = 5 * 60_000;
 
 export interface ProductChangelogEntry {
@@ -32,20 +35,25 @@ export function parseProductChangelog(value: unknown): ProductChangelogFeed {
     throw new Error('Invalid product updates response');
   }
   const ids = new Set<string>();
-  const entries = value.entries.map((entry): ProductChangelogEntry => {
-    if (!isRecord(entry) || typeof entry.id !== 'string' || !entry.id ||
-        typeof entry.title !== 'string' || !entry.title.trim() || entry.title.length > 160 ||
-        typeof entry.summary !== 'string' || entry.summary.length > 2000 ||
-        typeof entry.publishedOn !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.publishedOn)) {
-      throw new Error('Invalid product update');
-    }
-    const date = new Date(`${entry.publishedOn}T00:00:00Z`);
-    if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 10) !== entry.publishedOn || ids.has(entry.id)) {
-      throw new Error('Invalid product update date or ID');
-    }
-    ids.add(entry.id);
-    return { id: entry.id, title: entry.title, summary: entry.summary, publishedOn: entry.publishedOn };
-  });
+  const entries = value.entries
+    .map((entry): ProductChangelogEntry => {
+      if (!isRecord(entry) || typeof entry.id !== 'string' || !entry.id ||
+          typeof entry.title !== 'string' || !entry.title.trim() || entry.title.length > 160 ||
+          typeof entry.summary !== 'string' || entry.summary.length > 2000 ||
+          typeof entry.publishedOn !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.publishedOn)) {
+        throw new Error('Invalid product update');
+      }
+      const date = new Date(`${entry.publishedOn}T00:00:00Z`);
+      if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 10) !== entry.publishedOn || ids.has(entry.id)) {
+        throw new Error('Invalid product update date or ID');
+      }
+      ids.add(entry.id);
+      return { id: entry.id, title: entry.title, summary: entry.summary, publishedOn: entry.publishedOn };
+    })
+    // The public feed also carries single-application catalog maintenance published
+    // by the QA pipeline. Those are not product updates, so hide them from the bell
+    // using the same rule the publication validator enforces.
+    .filter((entry) => !isApplicationSpecific(entry));
   return {
     product: { id: value.product.id, name: value.product.name, websiteUrl: value.product.websiteUrl },
     entries,
@@ -82,6 +90,15 @@ export function readChangelogSeen(): string | null {
 export function markChangelogSeen(id: string): void {
   try { window.localStorage.setItem(CHANGELOG_SEEN_KEY, id); } catch { /* Keep the panel usable without storage. */ }
   window.dispatchEvent(new CustomEvent(CHANGELOG_SEEN_EVENT, { detail: id }));
+}
+
+// Opens the updates panel owned by the page's ChangelogBell. Pages without a
+// bell (error pages) fall back to the home page, which opens it from the hash.
+export function openChangelog(): void {
+  const event = new CustomEvent(CHANGELOG_OPEN_EVENT, { cancelable: true });
+  // A full load is intended: error pages may not have a working router.
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+  if (window.dispatchEvent(event)) window.location.assign(`/${CHANGELOG_HASH}`);
 }
 
 export function changelogEntryUrl(id: string): string {

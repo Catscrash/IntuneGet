@@ -203,6 +203,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     requiredInstallScope: 'user',
   },
   {
+    // GreenTunnel's assisted NSIS installer explicitly sets perMachine: false.
+    // WinGet omits Scope; the LocalSystem lifecycle captured an unavailable
+    // systemprofile uninstaller. Use the supported signed-in user context in
+    // both QA and customer packages, retaining the exact registered identity.
+    // https://github.com/SadeghHayeri/GreenTunnel/blob/v3.0.5/apps/desktop/electron-builder.yml
+    wingetId: 'SadeghHayeri.GreenTunnel',
+    requiredInstallScope: 'user',
+  },
+  {
     // Arvis 0.14.6 is built with Electron Builder's default one-click NSIS
     // target and does not enable perMachine. WinGet omits Scope, so the generic
     // machine default installs below LocalSystem's disposable systemprofile and
@@ -805,6 +814,35 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     reviewedUninstallArguments: ['/S'],
   },
   {
+    // Since v6 Bandisoft uses its own installer. Its argumentless ARP command
+    // needs the documented /S switch to suppress the hidden SYSTEM wizard.
+    // https://en.bandisoft.com/bandizip/help/uninstall/
+    wingetId: 'Bandisoft.Bandizip',
+    reviewedUninstallArguments: ['/S'],
+  },
+  {
+    // The curated Firefox ESR MSI hands removal to Mozilla's NSIS helper.exe,
+    // whose captured ARP command has no silent switch. Under SYSTEM it opened
+    // an invisible wizard and the registration outlived the deadline (curated
+    // verification run 37291324155). Apply Mozilla's documented /S contract.
+    wingetId: 'IntuneGet.Curated.FirefoxESR',
+    reviewedUninstallArguments: ['/S'],
+  },
+  {
+    // Stable Firefox uses the same Mozilla helper as ESR. Curated verification
+    // run 37675391823 left its registration present after an interactive removal.
+    // https://support.mozilla.org/en-US/kb/silently-install-uninstall-firefox-enterprise
+    wingetId: 'IntuneGet.Curated.Firefox',
+    reviewedUninstallArguments: ['/S'],
+  },
+  {
+    // The curated Thunderbird MSI wraps the same Mozilla NSIS helper.exe
+    // lifecycle as Firefox, so its captured removal command needs the same
+    // documented /S switch to stay silent under SYSTEM.
+    wingetId: 'IntuneGet.Curated.Thunderbird',
+    reviewedUninstallArguments: ['/S'],
+  },
+  {
     // Waterfox uses Mozilla's NSIS helper.exe lifecycle. Its captured ARP
     // command contains only the helper path, so invoking it unchanged opens an
     // uninstall wizard that is invisible under SYSTEM and leaves the exact
@@ -1154,6 +1192,29 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     reviewedExactUninstall: {
       executablePath: '%PackageInstaller%',
       arguments: ['/passthrough', '/silent', '/remove'],
+      completionTimeoutMinutes: 10,
+    },
+  },
+  {
+    // ZWCAD 2025's cached ARP helper returns without removing its exact
+    // registration (QA run 35624376194). ZWSOFT documents removal through
+    // the original installer: https://confluence.zwcad.com/pages/viewpage.action?pageId=314348444
+    // Retain exact registration completion checks and the verified payload.
+    wingetId: 'ZWSOFT.ZWCAD.2025',
+    reviewedExactUninstall: {
+      executablePath: '%PackageInstaller%',
+      arguments: ['/q', '/u'],
+      completionTimeoutMinutes: 10,
+    },
+  },
+  {
+    // The same cached-helper failure affects 2026 (QA run 35681512218).
+    // ZWSOFT's original-installer /q /u contract above applies to 2023+.
+    // Bind this to the exact edition and preserve exact registration removal.
+    wingetId: 'ZWSOFT.ZWCAD.2026',
+    reviewedExactUninstall: {
+      executablePath: '%PackageInstaller%',
+      arguments: ['/q', '/u'],
       completionTimeoutMinutes: 10,
     },
   },
@@ -1817,6 +1878,42 @@ const REVIEWED_REGISTRY_UNINSTALL_IDENTITIES: Readonly<Record<string, Readonly<{
   registeredDisplayName: string;
   registeredRegistryKey?: string;
 }>>> = {
+  // WinGet 3.14.0 and isolated run 35536993050 identify this bare NSIS key.
+  // The generated braced product code does not match it; Edge servicing must
+  // never become the uninstall target when the catalog title also differs.
+  'zhipuai.zcode': {
+    generatedDisplayName: 'Z Code',
+    manifestRegistryKey: '{268CE9E6-A30B-5890-AD18-D4B3EBBA5377}',
+    registeredDisplayName: 'ZCode',
+    registeredRegistryKey: '268ce9e6-a30b-5890-ad18-d4b3ebba5377',
+  },
+  // WinGet's tldx.tldv 3.0.264 manifest and isolated run 35500166302 agree
+  // on this exact NSIS key and `tldv 3.0.264` registration. The catalog
+  // title `tl;dv` is not its installed name. Keep removal bound to the key.
+  'tldx.tldv': {
+    generatedDisplayName: 'tl;dv',
+    manifestRegistryKey: '{D4EF7ABC-E624-5946-B915-B84166F8A4BF}',
+    registeredDisplayName: 'tldv',
+    registeredRegistryKey: 'd4ef7abc-e624-5946-b915-b84166f8a4bf',
+  },
+  // Kiwix's v3.8.2-Wikivoyage package.json declares productName
+  // `Wikivoyage by Kiwix` and appId `kiwix.js.wikivoyage`. Isolated run
+  // 35429157707 observed this exact electron-builder key alongside unrelated
+  // Edge servicing. The catalog's `Electron Edition` suffix is not registered.
+  'kiwix.wikivoyage.electron': {
+    generatedDisplayName: 'Wikivoyage by Kiwix Electron Edition',
+    registeredDisplayName: 'Wikivoyage by Kiwix',
+    registeredRegistryKey: '149170a6-d630-5e6f-a054-8c34dd8a32a2',
+  },
+  // Zermelo 26.09.1 registers the exact NSIS key/name `Zermelo`, not its
+  // catalog title `Zermelo Desktop`. Isolated run 35420836685 observed this
+  // alongside Edge/WebView2 servicing. Preserve the exact captured vendor
+  // command and keep unrelated registrations outside the removal identity.
+  'zermelosoftwarebv.zermelodesktop': {
+    generatedDisplayName: 'Zermelo Desktop',
+    registeredDisplayName: 'Zermelo',
+    registeredRegistryKey: 'Zermelo',
+  },
   // RackSight v1.1.9 uses electron-builder appId net.authoritygate.racksight
   // and productName RackSight. Isolated run 34787649769 captured this exact
   // NSIS key alongside WebView2 servicing; never select the runtime instead.

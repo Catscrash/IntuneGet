@@ -35,6 +35,100 @@ const input = {
 };
 
 describe('PSADT QA package identity', () => {
+  it('preserves the exact failed Wacom driver identity for the shared registered-command adapter', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'Wacom.WacomTabletDriver', displayName: 'Wacom Tablet', publisher: 'Wacom',
+      version: '6.4.14-1', architecture: 'x64',
+      installerSha256: '9DDB4C8FB467B1C9A9B9377F7FCD7ED481550D6F43BB9EA62E4724089EEECD63',
+      installerType: 'exe', installScope: 'machine', silentSwitches: '/s',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Wacom Tablet Driver:Wacom Tablet',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      sourceType: 'exe', installScope: 'machine', silentArgs: '/s',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Wacom Tablet Driver:Wacom Tablet',
+      sha256: '9DDB4C8FB467B1C9A9B9377F7FCD7ED481550D6F43BB9EA62E4724089EEECD63',
+    });
+  });
+
+  it('normalizes the failed Bandizip tuple with shared silent removal', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'Bandisoft.Bandizip', displayName: 'Bandizip', publisher: 'Bandisoft',
+      version: '7.46', architecture: 'x64',
+      installerSha256: 'D6D6489113C013ED7F44C0DCA24B1A882494ACE246E14D10533C4969A0F41CFE',
+      installerType: 'exe', installScope: 'machine', silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Bandizip:Bandizip',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.psadtConfig.reviewedUninstallArguments).toEqual(['/S']);
+    expect(normalized.identity.profile.installer.uninstallCommand).toBe('REGISTRY_UNINSTALL_KEY:Bandizip:Bandizip');
+  });
+  it('normalizes ZWCAD 2025 to vendor-documented packaged removal with exact identity', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'ZWSOFT.ZWCAD.2025', displayName: 'ZWCAD 2025', publisher: 'ZWSOFT',
+      version: '25.21.10.19929', architecture: 'x64',
+      installerSha256: '018E6F9E2C5F3F7B88EA5CBF9585B204EB3F9B6536741C82FFE26F61941E0F13',
+      installerType: 'exe', installScope: 'machine', silentSwitches: '/install /quiet',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{82434F95-A001-0000-A200-7E20F67BFF3C}:ZWCAD 2025',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine', silentArgs: '/install /quiet',
+      sha256: '018E6F9E2C5F3F7B88EA5CBF9585B204EB3F9B6536741C82FFE26F61941E0F13',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{82434F95-A001-0000-A200-7E20F67BFF3C}:ZWCAD 2025',
+    });
+    expect(normalized.identity.profile.psadtConfig).toMatchObject({
+      reviewedExactUninstall: { executablePath: '%PackageInstaller%', arguments: ['/q', '/u'], completionTimeoutMinutes: 10 },
+    });
+  });
+  it('normalizes ZWCAD 2026 to vendor-documented packaged removal with exact identity', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'ZWSOFT.ZWCAD.2026', displayName: 'ZWCAD 2026', publisher: 'ZWSOFT',
+      version: '26.10.0.20036', architecture: 'x64',
+      installerSha256: '9ACBCC7CD8EFC4F2F72E529736107E47986B2E881EB8D1558261820C3083D8E8',
+      installerType: 'exe', installScope: 'machine', silentSwitches: '/install /quiet',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{CBC94276-A001-0000-A200-255782FFDEE0}:ZWCAD 2026',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine', silentArgs: '/install /quiet',
+      sha256: '9ACBCC7CD8EFC4F2F72E529736107E47986B2E881EB8D1558261820C3083D8E8',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{CBC94276-A001-0000-A200-255782FFDEE0}:ZWCAD 2026',
+    });
+    expect(normalized.identity.profile.psadtConfig).toMatchObject({
+      reviewedExactUninstall: { executablePath: '%PackageInstaller%', arguments: ['/q', '/u'], completionTimeoutMinutes: 10 },
+    });
+  });
+  it('normalizes ZCode to the observed bare key without changing its exact payload or install scope', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'ZhipuAI.ZCode', displayName: 'Z Code', publisher: 'ZhipuAI',
+      version: '3.14.0', architecture: 'x64',
+      installerSha256: '74AAF7DEEF9B805B993AEAF2133E70EEF74816888B326FC8B4A36C90C4ED15EE',
+      installerType: 'nullsoft', installScope: 'machine', silentSwitches: '/S /allusers',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{268CE9E6-A30B-5890-AD18-D4B3EBBA5377}:Z Code',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine', silentArgs: '/S /allusers',
+      sha256: '74AAF7DEEF9B805B993AEAF2133E70EEF74816888B326FC8B4A36C90C4ED15EE',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:268ce9e6-a30b-5890-ad18-d4b3ebba5377:ZCode',
+    });
+  });
+  it('retains the trusted Kiwix installer while binding its exact installed registry key', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'Kiwix.Wikivoyage.Electron', displayName: 'Wikivoyage by Kiwix Electron Edition', publisher: 'Kiwix',
+      version: '3.8.2-E', architecture: 'x86',
+      installerSha256: '353BFC413A3787D7CEA738AB8BAAAB7E33AF42883963D2C29DDEDA438BFFF0C0',
+      installerType: 'nullsoft', installScope: 'machine', silentSwitches: '/S /ALLUSERS',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Wikivoyage by Kiwix Electron Edition',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine', sha256: '353BFC413A3787D7CEA738AB8BAAAB7E33AF42883963D2C29DDEDA438BFFF0C0',
+      silentArgs: '/S /ALLUSERS',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:149170a6-d630-5e6f-a054-8c34dd8a32a2:Wikivoyage by Kiwix',
+    });
+  });
   it('canonicalizes object keys recursively', () => {
     expect(canonicalQaJson({ z: 1, a: { y: 2, b: 3 } })).toBe(
       '{"a":{"b":3,"y":2},"z":1}'
@@ -636,6 +730,37 @@ describe('PSADT QA package identity', () => {
     ).toEqual(profile.psadtConfig);
   });
 
+  it('keeps authored marker rules and their execution identity fixed during customer dispatch normalization', () => {
+    const rules = [{ type: 'registry', keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\Example_App', valueName: 'Version', detectionType: 'version', operator: 'equal', detectionValue: '1.2.3' }];
+    const workflowInput = { wingetId: 'Example.App', displayName: 'Example', publisher: 'Example', version: '2.0.0', architecture: 'x64', installerSha256: 'b'.repeat(64), installerType: 'exe', silentSwitches: '/quiet', uninstallCommand: 'REGISTRY_UNINSTALL:Example', installScope: 'user' as const, detectionRules: JSON.stringify(rules), psadtConfig: JSON.stringify({ customDetection: true, detectionRules: rules }) };
+    const normalized = normalizeQaWorkflowPackageInput(workflowInput);
+    expect(normalized.detectionRules).toEqual(rules);
+    expect(JSON.parse(normalized.detectionRulesJson)).toEqual(rules);
+    expect(normalized.psadtConfig.detectionRules).toEqual(rules);
+    expect(normalized.psadtConfig.registryMarkerPath).toBe(DEFAULT_PSADT_CONFIG.registryMarkerPath);
+    const profile = normalized.identity.profile as { detectionRules: unknown[]; psadtConfig: { detectionRules: unknown[] } };
+    expect(profile.detectionRules).toEqual(rules);
+    expect(profile.psadtConfig.detectionRules).toEqual(rules);
+    expect(buildQaPackageIdentityFromWorkflowInput(workflowInput)).toEqual(normalized.identity);
+    const otherRules = [{ ...rules[0], detectionValue: '1.2.4' }];
+    const other = normalizeQaWorkflowPackageInput({ ...workflowInput, detectionRules: JSON.stringify(otherRules), psadtConfig: JSON.stringify({ customDetection: true, detectionRules: otherRules }) });
+    expect(other.identity.packageProfileSha256).not.toBe(normalized.identity.packageProfileSha256);
+  });
+
+  it.each([[], [{ type: 'script', scriptContent: 'exit 0' }], [{ type: 'msi', productCode: '{11111111-2222-3333-4444-555555555555}', productVersionOperator: 'equal', productVersion: '256.0.0' }]])('rejects invalid authored rules before creating a workflow identity: %j', rules => {
+    expect(() => normalizeQaWorkflowPackageInput({ wingetId: 'Example.App', displayName: 'Example', publisher: 'Example', version: '2.0.0', architecture: 'x64', installerSha256: 'b'.repeat(64), installerType: 'exe', silentSwitches: '/quiet', uninstallCommand: 'REGISTRY_UNINSTALL:Example', installScope: 'machine', detectionRules: JSON.stringify(rules), psadtConfig: JSON.stringify({ customDetection: true }) })).toThrow();
+  });
+
+  it('infers a custom marker root only for generated rules', () => {
+    const rules = [{ type: 'registry', keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Example\\Apps\\Example_App', valueName: 'Version', detectionType: 'version', operator: 'greaterThanOrEqual', detectionValue: '2.0.0', check32BitOn64System: false }];
+    const workflowInput = { wingetId: 'Example.App', displayName: 'Example', publisher: 'Example', version: '2.0.0', architecture: 'x64', installerSha256: 'b'.repeat(64), installerType: 'exe', silentSwitches: '/quiet', uninstallCommand: 'REGISTRY_UNINSTALL:Example', installScope: 'machine' as const, detectionRules: JSON.stringify(rules), psadtConfig: JSON.stringify({ detectionRules: rules }) };
+    expect(normalizeQaWorkflowPackageInput(workflowInput).psadtConfig.registryMarkerPath).toBe('SOFTWARE\\Example\\Apps');
+    const authored = normalizeQaWorkflowPackageInput({ ...workflowInput, psadtConfig: JSON.stringify({ customDetection: true, detectionRules: rules }) });
+    expect(authored.psadtConfig.registryMarkerPath).toBe(DEFAULT_PSADT_CONFIG.registryMarkerPath);
+    expect(authored.detectionRules).toEqual(rules);
+    expect(authored.identity.packageProfileSha256).not.toBe(normalizeQaWorkflowPackageInput(workflowInput).identity.packageProfileSha256);
+  });
+
   it('repairs a legacy deployment profile that has no detection rules', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'Anysphere.Cursor',
@@ -907,6 +1032,22 @@ describe('PSADT QA package identity', () => {
           'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\SIMSDEV_AndroidAppsManager',
       }),
     ]);
+  });
+
+  it('normalizes GreenTunnel to the vendor user scope and preserves exact removal identity', () => {
+    const uninstallCommand = 'REGISTRY_UNINSTALL_KEY:ba1bb1f3-0069-5c64-9a11-479ebc0471d9:GreenTunnel';
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'SadeghHayeri.GreenTunnel', displayName: 'GreenTunnel',
+      publisher: 'SadeghHayeri', version: '3.0.5', architecture: 'x86',
+      installerSha256: '77CD4E08ABF2E7A0FC235821AE49BBFDD032616A9A0407902F907C96547D2659',
+      installerType: 'nullsoft', silentSwitches: '/S', uninstallCommand,
+      installScope: 'machine', detectionRules: '[]',
+      psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({ installScope: 'user' });
+    expect(normalized.detectionRules).toEqual([expect.objectContaining({
+      keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\SadeghHayeri_GreenTunnel',
+    })]);
   });
 
   it('keeps WowUp Beta out of LocalSystem when WinGet omits its scope', () => {
@@ -1578,6 +1719,42 @@ describe('PSADT QA package identity', () => {
     expect(profile.installer.uninstallCommand).toBe(
       'REGISTRY_UNINSTALL_KEY:239d4e5c-394e-5607-bf11-8b5229505789:DSH-Desktop 0.2.0'
     );
+  });
+
+  it('binds tl;dv QA to the captured NSIS key while retaining its trusted installer profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'tldx.tldv', displayName: 'tl;dv', publisher: 'tldx',
+      version: '3.0.264', architecture: 'x64',
+      installerSha256: 'BB5007C2BF94F717428D5982CF739489CB0BD0CAFD1A193DA671304AD421B25C',
+      installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{D4EF7ABC-E624-5946-B915-B84166F8A4BF}:tl;dv',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine',
+      sha256: 'BB5007C2BF94F717428D5982CF739489CB0BD0CAFD1A193DA671304AD421B25C',
+      silentArgs: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:d4ef7abc-e624-5946-b915-b84166f8a4bf:tldv',
+    });
+  });
+
+  it('binds Zermelo QA to the captured NSIS key while retaining its trusted installer profile', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'ZermeloSoftwareBV.ZermeloDesktop', displayName: 'Zermelo Desktop', publisher: 'Zermelo Software BV',
+      version: '26.09.1', architecture: 'x64',
+      installerSha256: 'A309EB1FFA17A3978C8F2C00A82E279B913434C5AF6C9FA29EB3AAAA75AD6264',
+      installerType: 'nullsoft', installScope: 'machine',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Zermelo Desktop',
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    expect(normalized.identity.profile.installer).toMatchObject({
+      installScope: 'machine',
+      sha256: 'A309EB1FFA17A3978C8F2C00A82E279B913434C5AF6C9FA29EB3AAAA75AD6264',
+      silentArgs: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_KEY:Zermelo:Zermelo',
+    });
   });
 
   it('binds RackSight QA to the captured NSIS key while retaining its trusted installer profile', () => {
@@ -2835,6 +3012,37 @@ describe('current catalog QA package validation', () => {
     expect(
       validateCompatiblePassedCatalogQaProfile(candidateFromIdentity(legacyIdentity))
     ).toEqual({ valid: false, reason: 'compatible-application-adapter-changed' });
+  });
+
+  it.each(['Wacom.WacomTabletDriver', 'Example.App'])('scopes Wacom release compatibility to %s', (wingetId) => {
+    const legacyIdentity = identityWithPackagerCommit(
+      buildQaPackageIdentity({ ...input, wingetId }),
+      '60395492a3d51b2ff6f14b50ed7cd0c7f558be70'
+    );
+    const candidate = { ...candidateFromIdentity(legacyIdentity), candidateWingetId: wingetId };
+    expect(validateCompatiblePassedCatalogQaProfile(candidate)).toMatchObject(
+      wingetId === 'Wacom.WacomTabletDriver'
+        ? { valid: false, reason: 'compatible-application-adapter-changed' }
+        : { valid: true }
+    );
+  });
+
+  it.each([
+    ['REGISTRY_UNINSTALL:Zermelo Desktop', false],
+    ['REGISTRY_UNINSTALL_KEY:Zermelo:Zermelo', true],
+  ])('checks prior catalog uninstall identity %s before reusing a pass', (uninstallCommand, valid) => {
+    const legacyIdentity = identityWithPackagerCommit(
+      buildQaPackageIdentity({
+        ...input,
+        wingetId: 'ZermeloSoftwareBV.ZermeloDesktop',
+        uninstallCommand,
+      }),
+      'bc329cb8bfafd8d2af940bdc9f8ccf044ac15146'
+    );
+    expect(validateCompatiblePassedCatalogQaProfile(candidateFromIdentity(legacyIdentity)))
+      .toMatchObject(valid ? { valid: true } : {
+        valid: false, reason: 'compatible-uninstall-identity-changed',
+      });
   });
 
   it('reuses an adapted pass when a later release leaves its behavior unchanged', () => {

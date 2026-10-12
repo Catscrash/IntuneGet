@@ -3,10 +3,9 @@
  * POST - Run an on-demand update scan and refresh cached update results
  */
 
-import { NextRequest, NextResponse } from 'next/server';
+import { after, NextRequest, NextResponse } from 'next/server';
 import { storeScanForUser } from '@/lib/updates/store-scan';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
-import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { GET as getLiveIntuneUpdates } from '@/app/api/intune/apps/updates/route';
@@ -16,6 +15,10 @@ import type { AppUpdateInfo } from '@/types/inventory';
 interface RefreshRequestBody {
   tenant_id?: string;
 }
+
+// Calling the live route does not inherit its Vercel duration configuration.
+// Leave time after the bounded scan to persist the complete result.
+export const maxDuration = 60;
 
 interface LiveUpdatesResponse {
   updates: AppUpdateInfo[];
@@ -45,7 +48,6 @@ export async function POST(request: NextRequest) {
     // the db abstraction, so both work without Supabase. Only MSP tenant
     // resolution and the notification fan-out below still need it.
     const supabase = isSupabaseServerConfigured() ? createServerClient() : null;
-    const db = getDatabase();
 
     let tenantId = user.tenantId;
     if (supabase) {
@@ -116,23 +118,19 @@ export async function POST(request: NextRequest) {
     // daily cron. Force-send regardless of the user's email frequency, since
     // they just ran an on-demand check. Failures here must not fail the
     // refresh; the daily cron remains the backstop.
-    const hasPendingNotifications = stored.pendingNotifications > 0;
-    let notified: { emailsSent: number; webhooksSent: number } | undefined;
+    //
     // Webhooks reach the user without Supabase - only their storage ever
-    // needed it - so this no longer waits for a Supabase client. Email and the
+    // needed it - so this does not wait for a Supabase client. Email and the
     // notification centre stay Supabase-only and are skipped inside.
+    const hasPendingNotifications = stored.pendingNotifications > 0;
     if (hasPendingNotifications) {
-      try {
-        const res = await notifyUserOfPendingUpdates(supabase, user.userId, {
-          respectFrequency: false,
-        });
-        notified = { emailsSent: res.emailsSent, webhooksSent: res.webhooksSent };
-      } catch (notifyError) {
-        console.error(
-          'On-demand update notification failed:',
-          notifyError instanceof Error ? notifyError.message : notifyError
-        );
-      }
+      after(async () => {
+        try {
+          await notifyUserOfPendingUpdates(supabase, user.userId, { respectFrequency: false });
+        } catch {
+          console.error('On-demand update notification failed; the scheduled notifier will retry.');
+        }
+      });
     }
 
     const removedCount = stored.removedCount;
@@ -141,7 +139,6 @@ export async function POST(request: NextRequest) {
       success: true,
       refreshedCount: stored.refreshedCount,
       removedCount,
-      ...(notified ? { notified } : {}),
       updateCount: liveData.updateCount,
       matchingSummary: {
         totalChecked: liveData.checkedApps?.length || 0,

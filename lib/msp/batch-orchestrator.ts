@@ -8,11 +8,13 @@ import { isQaMaintenanceMode } from '@/lib/qa/maintenance';
 import { createServerClient } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { getDatabase } from '@/lib/db';
+import { findPendingApprovalBlocks } from '@/lib/intune-approval-guard';
 import {
   isGitHubActionsConfigured,
   triggerPackagingWorkflow,
   type WorkflowInputs,
 } from '@/lib/github-actions';
+import { assertCuratedLicenceAccepted, CuratedLicenceError } from '@/lib/curated-catalog/licence';
 import { getAppConfig } from '@/lib/config';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { verifyTenantConsent } from '@/lib/msp/consent-verification';
@@ -31,6 +33,14 @@ import type { WingetInstaller } from '@/types/winget';
 
 // Stale timeout: items in_progress longer than this are marked failed
 const STALE_TIMEOUT_MINUTES = 45;
+
+/** Pending tenants in one batch have no individual creation timestamp. */
+export function loadPendingBatchItems(supabase: ReturnType<typeof createServerClient>, batchId: string, availableSlots: number) {
+  return supabase.from('msp_batch_deployment_items').select('*')
+    .eq('batch_id', batchId).eq('status', 'pending')
+    .order('tenant_display_name', { ascending: true })
+    .order('id', { ascending: true }).limit(availableSlots);
+}
 
 interface InstallerDetails {
   architecture: string;
@@ -228,15 +238,15 @@ async function startBatchItems(batchId: string): Promise<number> {
   }
 
   // Get pending items
-  const { data: pendingItems, error: pendingError } = await supabase
-    .from('msp_batch_deployment_items')
-    .select('*')
-    .eq('batch_id', batchId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .limit(availableSlots);
+  const { data: pendingItems, error: pendingError } = await loadPendingBatchItems(supabase, batchId, availableSlots);
 
-  if (pendingError || !pendingItems || pendingItems.length === 0) {
+  if (pendingError) {
+    // Database messages can include customer data. Log the code, never row values.
+    const code = /^[A-Z0-9_]{2,20}$/.test(pendingError.code || '') ? pendingError.code : 'unknown';
+    console.error(`[BatchOrchestrator] Failed to load pending items (${code})`);
+    return 0;
+  }
+  if (!pendingItems || pendingItems.length === 0) {
     return 0;
   }
 
@@ -331,6 +341,32 @@ async function startBatchItems(batchId: string): Promise<number> {
             error_message: 'Tenant consent not granted or revoked',
             completed_at: new Date().toISOString(),
           })
+          .eq('id', item.id);
+        continue;
+      }
+
+      // A curated publisher licence is accepted per customer tenant, so an
+      // acceptance for one tenant never authorizes the rest of the batch.
+      try {
+        await assertCuratedLicenceAccepted(item.tenant_id, batch.winget_id, db);
+      } catch (error) {
+        if (!(error instanceof CuratedLicenceError)) throw error;
+        await supabase
+          .from('msp_batch_deployment_items')
+          .update({
+            status: 'skipped',
+            error_message: error.message,
+            completed_at: new Date().toISOString(),
+          })
+          .eq('id', item.id);
+        continue;
+      }
+
+      const approvalBlocks = await findPendingApprovalBlocks({ tenantId: item.tenant_id,
+        wingetIds: [batch.winget_id] }, { db });
+      if (approvalBlocks.length) {
+        await supabase.from('msp_batch_deployment_items').update({ status: 'skipped',
+          error_message: approvalBlocks[0].message, completed_at: new Date().toISOString() })
           .eq('id', item.id);
         continue;
       }

@@ -2,7 +2,8 @@
 
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchQaStatuses, QA_STATUS_FRESH_MS } from '@/lib/qa/client-status-cache';
-import type { QaDetailsResponse, QaLiveResponse, QaStatus } from '@/types/qa';
+import { qaLiveRefetchInterval } from '@/lib/qa/live-view';
+import type { CuratedQaRun, QaDetailsResponse, QaLiveResponse, QaStatus } from '@/types/qa';
 
 interface QaStatusesResponse {
   statuses: Record<string, QaStatus | null>;
@@ -88,12 +89,22 @@ export function useQaLive() {
       return response.json();
     },
     staleTime: 500,
-    refetchInterval: (query) => {
-      const phase = query.state.data?.current?.phase;
-      if (phase === 'installing' || phase === 'uninstalling') return 1_000;
-      return query.state.data?.active ? 2_000 : 10_000;
-    },
+    refetchInterval: (query) => qaLiveRefetchInterval(query.state.data),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: 'always',
+  });
+}
+
+export function useCuratedQaHistory() {
+  return useQuery<{ runs: CuratedQaRun[] }>({
+    queryKey: ['qa', 'curated'],
+    queryFn: async ({ signal }) => {
+      const response = await fetch('/api/qa/curated', { cache: 'no-store', signal });
+      if (!response.ok) throw new Error('Failed to load curated QA history');
+      return response.json();
+    },
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
   });
 }
