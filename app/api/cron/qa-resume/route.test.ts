@@ -32,6 +32,9 @@ vi.mock('@/lib/curated-catalog/licence', async (importOriginal) => ({
   assertCuratedLicenceAccepted: assertCuratedLicenceAcceptedMock,
 }));
 vi.mock('@/lib/qa/demand', () => ({ ensureQaDemand: ensureQaDemandMock }));
+// Recovery has its own real-route regression suite. Keep these existing
+// waiting-job tests focused on their original conditional writes.
+vi.mock('@/lib/qa/customer-failure-recovery', () => ({ reopenSupersededQaFailures: vi.fn(async () => 0) }));
 vi.mock('@/lib/package-eligibility', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/package-eligibility')>()),
   getPackageCompatibilityBlock: getPackageCompatibilityBlockMock,
@@ -167,7 +170,7 @@ describe('GET /api/cron/qa-resume', () => {
     const response = await GET(new Request('https://example.test/api/cron/qa-resume', {
       headers: { authorization: 'Bearer secret' },
     }));
-    expect.soft(await response.json()).toEqual({ success: true, scanned: jobCount, resumed: 0, failed: 0, waiting: jobCount });
+    expect.soft(await response.json()).toEqual({ success: true, scanned: jobCount, resumed: 0, failed: 0, waiting: jobCount, reopened: 0, recoveryDeferred: false });
     expect.soft(updates.update).not.toHaveBeenCalled();
     expect.soft(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
@@ -955,7 +958,7 @@ describe('GET /api/cron/qa-resume', () => {
     }));
     const released = current === 'queued';
     expect(await response.json()).toEqual({ success: true, scanned: 1,
-      resumed: released ? 1 : 0, failed: 0, waiting: released ? 0 : 1 });
+      resumed: released ? 1 : 0, failed: 0, waiting: released ? 0 : 1, reopened: 0, recoveryDeferred: false });
     expect(store.row.qa_candidate_id).toBe('publication-candidate');
     expect(store.row.status).toBe(released ? 'packaging' : 'awaiting_qa');
     expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(released ? 1 : 0);
