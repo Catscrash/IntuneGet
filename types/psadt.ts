@@ -22,6 +22,7 @@ export type RestartBehavior =
 export type DeployMode =
   | 'Silent'           // No UI at all (recommended for Intune)
   | 'NonInteractive'   // Shows progress but no user interaction required
+  | 'Interactive'      // Full UI: close prompts, deferrals and other user dialogs
   | 'Auto';            // PSADT auto-detects based on session state
 
 /**
@@ -558,4 +559,23 @@ export function sanitizeProcessesToClose(
     kept.push(process);
   }
   return { processes: kept, invalid };
+}
+
+export type InteractiveOnlyFeature = 'closePrompt' | 'deferral';
+
+/**
+ * PSADT suppresses the welcome dialog in Silent and NonInteractive mode: it
+ * closes listed processes without asking and never offers a deferral. Report
+ * the configured features that only take effect in Interactive (or Auto with a
+ * logged-on user) so the UI can point out the mismatch.
+ */
+export function interactiveOnlyFeaturesSuppressedByDeployMode(
+  config: Pick<PSADTConfig, 'deployMode' | 'showClosePrompt' | 'allowDefer'>
+): InteractiveOnlyFeature[] {
+  const mode = config.deployMode || 'Silent';
+  if (mode !== 'Silent' && mode !== 'NonInteractive') return [];
+  const features: InteractiveOnlyFeature[] = [];
+  if (config.showClosePrompt) features.push('closePrompt');
+  if (config.allowDefer) features.push('deferral');
+  return features;
 }

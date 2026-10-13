@@ -330,6 +330,36 @@ describe('buildQaLiveResponse', () => {
     expect(response.log).toBeNull();
   });
 
+  it('keeps Interactive as the expected deploy mode instead of reporting Silent', () => {
+    const response = buildQaLiveResponse({
+      now: new Date('2026-08-08T18:26:00.000Z'),
+      current: {
+        id: '44444444-4444-4444-4444-444444444444',
+        winget_id: 'Example.App', version: '2', architecture: 'x64', status: 'dispatched',
+        priority: 0, enqueued_at: '2026-08-08T15:00:00.000Z',
+        dispatched_at: '2026-08-08T18:25:40.000Z', started_at: null,
+        phase: null, phase_started_at: null, phase_updated_at: null,
+        test_config: {
+          packageProfileCanonicalJson: JSON.stringify({
+            psadtConfig: { deployMode: 'Interactive', allowDefer: true, processesToClose: [{ name: 'app' }] },
+          }),
+        },
+      } as never,
+      queuedCount: 1,
+      queued: [],
+      poll: null,
+      consecutivePollFailures: 0,
+      recent: [],
+      apps: [],
+      frame: null,
+    });
+    expect(response.current).toMatchObject({
+      deployMode: 'Interactive',
+      dialogExpected: true,
+      expectedUi: { deployMode: 'Interactive', uiEvidenceExpected: true },
+    });
+  });
+
   it('publishes only a sanitized GitHub rate-limit cause', () => {
     const response = buildQaLiveResponse({
       now: new Date('2026-08-08T19:11:00.000Z'),

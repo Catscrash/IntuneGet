@@ -210,14 +210,20 @@ function executionContext(config: Json): 'LocalSystem' | 'User' {
   }
 }
 
-function deployMode(config: Json): 'Auto' | 'Silent' | 'NonInteractive' {
+type DeployMode = 'Auto' | 'Silent' | 'NonInteractive' | 'Interactive';
+
+function isNonDefaultDeployMode(value: unknown): value is Exclude<DeployMode, 'Silent'> {
+  return value === 'Auto' || value === 'NonInteractive' || value === 'Interactive';
+}
+
+function deployMode(config: Json): DeployMode {
   if (!config || typeof config !== 'object' || Array.isArray(config)) return 'Silent';
   const canonical = config.packageProfileCanonicalJson;
   if (typeof canonical !== 'string') return 'Silent';
   try {
     const parsed = JSON.parse(canonical) as { psadtConfig?: { deployMode?: unknown } };
     const value = parsed.psadtConfig?.deployMode;
-    return value === 'Auto' || value === 'NonInteractive' ? value : 'Silent';
+    return isNonDefaultDeployMode(value) ? value : 'Silent';
   } catch {
     return 'Silent';
   }
@@ -231,9 +237,7 @@ function expectedUiConfiguration(config: Json): QaLiveUiConfiguration | null {
     const parsed = JSON.parse(canonical) as { psadtConfig?: Record<string, unknown> };
     const psadt = parsed.psadtConfig;
     if (!psadt || typeof psadt !== 'object' || Array.isArray(psadt)) return null;
-    const mode = psadt.deployMode === 'Auto' || psadt.deployMode === 'NonInteractive'
-      ? psadt.deployMode
-      : 'Silent';
+    const mode = isNonDefaultDeployMode(psadt.deployMode) ? psadt.deployMode : 'Silent';
     const restartBehavior = psadt.restartBehavior === 'Force' || psadt.restartBehavior === 'Prompt'
       ? psadt.restartBehavior
       : 'Suppress';

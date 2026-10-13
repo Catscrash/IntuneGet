@@ -548,6 +548,8 @@ function getDefaultReturnCodes() {
     { returnCode: 3010, type: 'softReboot' },
     { returnCode: 1641, type: 'hardReboot' },
     { returnCode: 1618, type: 'retry' },
+    // PSADT's DeferExitCode: the user postponed the install from the welcome prompt.
+    { returnCode: 1602, type: 'retry' },
   ];
 }
 

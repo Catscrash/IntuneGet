@@ -1428,6 +1428,7 @@ jobs:
                 $deployModeFlag = switch ($psadtConfig.deployMode) {
                   'Silent' { ' -DeployMode Silent' }
                   'NonInteractive' { ' -DeployMode NonInteractive' }
+                  'Interactive' { ' -DeployMode Interactive' }
                   'Auto' { '' }
                   default { ' -DeployMode Silent' }
                 }
@@ -1702,6 +1703,7 @@ jobs:
               @{ returnCode = 3010; type = "softReboot" }
               @{ returnCode = 1641; type = "hardReboot" }
               @{ returnCode = 1618; type = "retry" }
+              @{ returnCode = 1602; type = "retry" }  # PSADT DeferExitCode - user postponed from the welcome prompt
               @{ returnCode = 60012; type = "retry" }  # No user logged in - retry later for per-user installs
             )
             rules = $graphRules

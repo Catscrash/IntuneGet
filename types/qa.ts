@@ -61,7 +61,7 @@ export interface QaPromptConfiguration {
 }
 
 export interface QaEffectiveConfiguration {
-  deployMode: 'Auto' | 'Silent' | 'NonInteractive';
+  deployMode: 'Auto' | 'Silent' | 'NonInteractive' | 'Interactive';
   /** Vendor-provided arguments only; custom deployment arguments are withheld. */
   vendorSilentArguments: string | null;
   restartBehavior: 'Suppress' | 'Force' | 'Prompt';
@@ -163,7 +163,7 @@ export interface QaLiveResponse {
     catalogVersion: string;
     architecture: QaArchitecture;
     executionContext: 'LocalSystem' | 'User';
-    deployMode: 'Auto' | 'Silent' | 'NonInteractive';
+    deployMode: 'Auto' | 'Silent' | 'NonInteractive' | 'Interactive';
     dialogExpected: boolean;
     expectedUi: QaLiveUiConfiguration | null;
     phase: QaLivePhase;

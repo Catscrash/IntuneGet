@@ -34,6 +34,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { cn } from '@/lib/utils';
+import { DeployModeHint } from '@/components/DeployModeHint';
 import { AssignmentConfig } from '@/components/AssignmentConfig';
 import { CartUpdatePolicyPicker, type CartUpdatePolicyValue } from '@/components/updates/CartUpdatePolicyPicker';
 import { CategoryConfig } from '@/components/CategoryConfig';
@@ -528,11 +529,18 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                     >
                       <option value="Silent">Silent - No UI popups (recommended)</option>
                       <option value="NonInteractive">Non-Interactive - Show progress only</option>
+                      <option value="Interactive">Interactive - Full user interface</option>
                       <option value="Auto">Auto-detect (PSADT default)</option>
                     </select>
                     <p className="text-xs text-text-muted mt-1">
                       Controls whether PSADT shows dialogs during installation. Silent is recommended for Intune.
                     </p>
+                    <div className="mt-2">
+                      <DeployModeHint
+                        config={config}
+                        onSwitchToInteractive={() => updateConfig({ deployMode: 'Interactive' })}
+                      />
+                    </div>
                   </div>
 
                   {/* Remove Existing Install Toggle */}
@@ -739,6 +747,12 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                     description="Let users postpone the installation to a later time"
                     checked={config.allowDefer}
                     onChange={(checked) => updateConfig({ allowDefer: checked })}
+                  />
+
+                  <DeployModeHint
+                    config={config}
+                    features={['deferral']}
+                    onSwitchToInteractive={() => updateConfig({ deployMode: 'Interactive' })}
                   />
 
                   {config.allowDefer && (

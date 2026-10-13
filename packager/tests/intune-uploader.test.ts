@@ -395,3 +395,43 @@ describe('extractAutoSupersede', () => {
     expect(extractAutoSupersede(null)).toBe(false);
   });
 });
+
+describe('PSADT deploy mode command lines', () => {
+  function commandsFor(packageConfig: unknown): { install: string; uninstall: string } {
+    const uploader = new IntuneUploader(makeConfig());
+    const internal = uploader as unknown as {
+      buildCommandLines: (job: PackagingJob) => { install: string; uninstall: string };
+    };
+    return internal.buildCommandLines(
+      makeJob({ package_config: packageConfig as PackagingJob['package_config'] })
+    );
+  }
+
+  it.each([
+    ['Silent', ' -DeployMode Silent'],
+    ['NonInteractive', ' -DeployMode NonInteractive'],
+    ['Interactive', ' -DeployMode Interactive'],
+    ['Auto', ''],
+    [undefined, ' -DeployMode Silent'],
+    ['Bogus', ' -DeployMode Silent'],
+  ])('maps %s to "%s"', (deployMode, flag) => {
+    expect(commandsFor({ psadtConfig: { deployMode } })).toEqual({
+      install: `Invoke-AppDeployToolkit.exe${flag}`,
+      uninstall: `Invoke-AppDeployToolkit.exe -DeploymentType Uninstall${flag}`,
+    });
+  });
+
+  it('retries when a user defers the install from the PSADT welcome prompt', async () => {
+    const postMock = vi.fn().mockResolvedValue({ id: 'app-1' });
+    const graphClientStub = { post: postMock };
+    const uploader = new IntuneUploader(makeConfig());
+    const internal = uploader as unknown as {
+      fetchLargeIcon: (job: PackagingJob) => Promise<unknown>;
+      createWin32App: (g: typeof graphClientStub, job: PackagingJob, packageFileName: string) => Promise<{ id: string }>;
+    };
+    vi.spyOn(internal, 'fetchLargeIcon').mockResolvedValue(null);
+    await internal.createWin32App(graphClientStub, makeJob(), 'Invoke-AppDeployToolkit.intunewin');
+    const body = postMock.mock.calls[0]?.[1] as { returnCodes: unknown[] };
+    expect(body.returnCodes).toContainEqual({ returnCode: 1602, type: 'retry' });
+  });
+});

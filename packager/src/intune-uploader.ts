@@ -356,6 +356,8 @@ export class IntuneUploader {
       const deployMode = psadtConfig?.deployMode;
       if (deployMode === 'NonInteractive') {
         deployModeFlag = ' -DeployMode NonInteractive';
+      } else if (deployMode === 'Interactive') {
+        deployModeFlag = ' -DeployMode Interactive';
       } else if (deployMode === 'Auto') {
         deployModeFlag = '';
       }
@@ -434,6 +436,8 @@ export class IntuneUploader {
         { returnCode: 3010, type: 'softReboot' },
         { returnCode: 1641, type: 'hardReboot' },
         { returnCode: 1618, type: 'retry' },
+        // PSADT's DeferExitCode: the user postponed the install from the welcome prompt.
+        { returnCode: 1602, type: 'retry' },
       ],
       rules: detectionRules,
     };
