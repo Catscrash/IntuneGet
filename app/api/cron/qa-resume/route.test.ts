@@ -1,3 +1,4 @@
+vi.mock('@/lib/customer-upstream-recovery', () => ({ holdCustomerUpstreamJob: vi.fn(async () => false), reopenCustomerUpstreamJobs: vi.fn(async () => 0) }));
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -10,6 +11,8 @@ const {
   triggerPackagingWorkflowMock,
   assertCuratedLicenceAcceptedMock,
   getPackageCompatibilityBlockMock,
+  enforceQaGateMock,
+  getApprovedCuratedReleaseMock,
 } = vi.hoisted(() => ({
   findPendingApprovalBlocksMock: vi.fn(),
   createServerClientMock: vi.fn(),
@@ -20,6 +23,17 @@ const {
   triggerPackagingWorkflowMock: vi.fn(),
   assertCuratedLicenceAcceptedMock: vi.fn(),
   getPackageCompatibilityBlockMock: vi.fn(),
+  enforceQaGateMock: vi.fn(),
+  getApprovedCuratedReleaseMock: vi.fn(),
+}));
+
+vi.mock('@/lib/qa/gate', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/qa/gate')>()),
+  enforceQaGate: enforceQaGateMock,
+}));
+vi.mock('@/lib/curated-catalog/server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/curated-catalog/server')>()),
+  getApprovedCuratedRelease: getApprovedCuratedReleaseMock,
 }));
 
 vi.mock('@/lib/intune-approval-guard', () => ({ findPendingApprovalBlocks: findPendingApprovalBlocksMock }));
@@ -48,10 +62,14 @@ vi.mock('@/lib/catalog-installer-reconciliation', () => ({
 }));
 
 import { GET } from './route';
+import { InstallerPreflightError } from '@/lib/installer-preflight';
+import { holdCustomerUpstreamJob } from '@/lib/customer-upstream-recovery';
 import { CURATED_APPS } from '@/lib/curated-catalog/definitions';
 import { CuratedLicenceError } from '@/lib/curated-catalog/licence';
+import { CuratedCatalogError, CuratedEvidenceMismatchError } from '@/lib/curated-catalog/core.mjs';
 import { QA_PRIORITY_CUSTOMER } from '@/lib/qa/constants';
 import { PACKAGE_VERSION_UNAVAILABLE_MESSAGE } from '@/lib/package-eligibility';
+import { QaGateNotPassedError, QaGateError, QaSecurityGateError, QaCompatibilityGateError } from '@/lib/qa/gate';
 
 function chain(result: { data: unknown; error: unknown }) {
   const builder: Record<string, unknown> = {};
@@ -130,11 +148,171 @@ describe('GET /api/cron/qa-resume', () => {
     getFeatureFlagsMock.mockReturnValue({ localPackager: true });
     assertCuratedLicenceAcceptedMock.mockResolvedValue(null);
     getPackageCompatibilityBlockMock.mockResolvedValue(null);
+    enforceQaGateMock.mockReset();
+    enforceQaGateMock.mockResolvedValue(undefined);
     reconcileCatalogInstallerMock.mockImplementation(async (item) => ({
       item,
       trustedInstallers: [],
     }));
   });
+
+  it.each(['removed', 'metadata mismatch', 'unrecognized preflight', 'retryable', 'unknown', 'concurrent cancel', 'concurrent config', 'concurrent version', 'concurrent candidate', 'write error'])('isolates manifest reconciliation failure from the remaining batch: %s', async kind => {
+    const job = {
+      id: 'recovered-job', winget_id: 'Vendor.App', version: '1.0', status: 'awaiting_qa',
+      updated_at: '2026-10-18T00:00:00Z', qa_candidate_id: null, architecture: 'x64',
+      installer_url: 'https://example.test/old.exe', installer_sha256: 'B'.repeat(64),
+      cancelled_at: null, archived_at: null, github_run_id: null, intune_app_id: null,
+      package_config: { sourceType: 'winget', installerSha256: 'B'.repeat(64), architecture: 'x64' },
+      is_auto_update: true,
+    };
+    const store = jobStore(job);
+    const later = { ...job, id: 'later-job', qa_candidate_id: 'later-candidate' };
+    let reads = 0;
+    createServerClientMock.mockReturnValue({ from: vi.fn((table: string) => {
+      if (table === 'packaging_jobs') {
+        if (++reads === 1) return chain({ data: [structuredClone(job), later], error: null });
+        if (kind === 'write error' && reads === 2) return chain({ data: null, error: { message: 'synthetic private database error' } });
+        return store.updateQuery();
+      }
+      if (table === 'qa_candidates') return candidateQuery([{ id: 'later-candidate', status: 'queued' }]);
+      throw new Error('Unexpected table');
+    }) });
+    reconcileCatalogInstallerMock.mockImplementation(async () => {
+      if (kind === 'concurrent cancel') store.row.cancelled_at = '2026-10-18T00:01:00Z';
+      if (kind === 'concurrent config') store.row.updated_at = '2026-10-18T00:01:00Z';
+      if (kind === 'concurrent version') store.row.version = '2.0';
+      if (kind === 'concurrent candidate') store.row.qa_candidate_id = 'new-candidate';
+      if (kind === 'unknown') throw new Error('https://private.invalid/secret tenant-private');
+      throw new InstallerPreflightError(kind === 'metadata mismatch' ? 'MANIFEST_CHANGED' : kind === 'unrecognized preflight' ? 'NEW_UNKNOWN_CODE' : kind === 'retryable' ? 'UPSTREAM_UNAVAILABLE' : 'MANIFEST_UNAVAILABLE', 'https://private.invalid/secret tenant-private', kind === 'retryable');
+    });
+    const response = await GET(new Request('https://example.test/api/cron/qa-resume', { headers: { authorization: 'Bearer secret' } }));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ resumed: 0, failed: kind === 'removed' ? 1 : 0 });
+    expect(getPackageCompatibilityBlockMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ wingetId: later.winget_id }));
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(findPendingApprovalBlocksMock).not.toHaveBeenCalled();
+    expect(JSON.stringify(store.row)).not.toContain('private.invalid');
+    expect(JSON.stringify(body)).not.toContain('tenant-private');
+    if (kind === 'removed') {
+      expect(store.row.status).toBe('qa_failed');
+      expect(store.row.error_message).toBe('The selected package could not be validated. Review your selection before trying again.');
+      expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledOnce();
+    } else {
+      expect(store.row.status).toBe('awaiting_qa');
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+      if (['retryable', 'unknown', 'metadata mismatch', 'unrecognized preflight', 'write error'].includes(kind)) {
+        expect(store.writes.some(write => vi.mocked(write.update).mock.calls.some(([patch]) => 'qa_resume_due_at' in patch))).toBe(true);
+      }
+    }
+  });
+
+  it.each(['held', 'evidence unavailable'])('never reaches packaging or Graph while an upstream job is %s', async outcome => {
+    if (outcome === 'held') vi.mocked(holdCustomerUpstreamJob).mockResolvedValueOnce(true);
+    else vi.mocked(holdCustomerUpstreamJob).mockRejectedValueOnce(new Error('private evidence error'));
+    const waitingJob = { id: 'upstream-job', status: 'awaiting_qa', winget_id: 'Vendor.App', version: '1.0' };
+    createServerClientMock.mockReturnValue({ from: vi.fn(() => chain({ data: [waitingJob], error: null })) });
+    const response = await GET(new Request('https://example.test/api/cron/qa-resume', { headers: { authorization: 'Bearer secret' } }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject(outcome === 'held' ? { held: 1, resumed: 0 } : { waiting: 1, resumed: 0 });
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(findPendingApprovalBlocksMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('keeps an unverified Passed payload waiting before a claim, local=%s', async (localPackager) => {
+    getFeatureFlagsMock.mockReturnValue({ localPackager });
+    const job = {
+      id: 'reputation-job', tenant_id: 'tenant-fake', winget_id: 'Vendor.App', version: '1.0',
+      status: 'awaiting_qa', qa_candidate_id: 'passed-candidate', architecture: 'x64',
+      installer_sha256: 'B'.repeat(64), execution_profile_sha256: 'A'.repeat(64),
+      package_config: { sourceType: 'winget', installerSha256: 'B'.repeat(64), architecture: 'x64' },
+    };
+    const store = jobStore(job);
+    let reads = 0;
+    createServerClientMock.mockReturnValue({ from: vi.fn((table: string) => {
+      if (table === 'packaging_jobs') return ++reads === 1
+        ? chain({ data: [structuredClone(job)], error: null }) : store.updateQuery();
+      if (table === 'qa_candidates') return candidateQuery([{
+        id: 'passed-candidate', status: 'passed', package_profile_sha256: 'A'.repeat(64),
+      }]);
+      if (table === 'qa_package_results') return chain({ data: { outcome: 'Passed' }, error: null });
+      throw new Error(`Unexpected table ${table}`);
+    }) });
+    enforceQaGateMock.mockRejectedValue(new QaGateNotPassedError({
+      wingetId: job.winget_id, version: job.version, architecture: 'x64',
+      installerSha256: job.installer_sha256, packageProfileSha256: job.execution_profile_sha256,
+      reason: 'reputation',
+    }));
+    const response = await GET(new Request('https://example.test/api/cron/qa-resume', {
+      headers: { authorization: 'Bearer secret' },
+    }));
+    expect(response.status).toBe(200);
+    expect(store.row.status).toBe('awaiting_qa');
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    expect(enforceQaGateMock).toHaveBeenCalledWith(expect.objectContaining({
+      wingetId: job.winget_id, version: job.version, installerSha256: job.installer_sha256,
+    }));
+  });
+
+  it.each(['one flag', 'two flags', 'failed install', 'compatibility', 'curated', 'curated override', 'curated architecture', 'curated pending', 'curated withdrawn', 'curated changed identity', 'changed identity', 'clean changed identity']
+    .flatMap((kind) => [true, false].map((localPackager) => ({ kind, localPackager }))))(
+    'preserves the customer gate disposition for %j', async ({ kind, localPackager }) => {
+      getFeatureFlagsMock.mockReturnValue({ localPackager });
+      const job = {
+        id: 'gate-disposition-job', tenant_id: 'tenant-fake', winget_id: 'Vendor.App', version: '1.0',
+        status: 'awaiting_qa', qa_candidate_id: 'passed-candidate', architecture: 'x64',
+        installer_sha256: 'B'.repeat(64), execution_profile_sha256: 'A'.repeat(64),
+        package_config: { sourceType: 'winget', installerSha256: 'B'.repeat(64), architecture: 'x64' },
+      };
+      const store = jobStore(job); let reads = 0;
+      if (kind.startsWith('curated')) {
+        if (kind === 'curated override') process.env.QA_MAINTENANCE_MODE = 'true';
+        job.package_config.sourceType = 'curated';
+        store.row.package_config = structuredClone(job.package_config);
+        getApprovedCuratedReleaseMock.mockImplementation(() => {
+          if (kind === 'curated pending' || kind === 'curated withdrawn') throw new CuratedCatalogError('Synthetic trust or release verification failure');
+          return {
+            app: { architecture: kind === 'curated architecture' ? 'arm64' : 'x64' },
+            release: { installerSha256: kind === 'curated override' || kind === 'curated architecture' ? job.installer_sha256 : 'D'.repeat(64) },
+          };
+        });
+      }
+      createServerClientMock.mockReturnValue({ from: vi.fn((table: string) => {
+        if (table === 'packaging_jobs') return ++reads === 1
+          ? chain({ data: [structuredClone(job)], error: null }) : store.updateQuery();
+        if (table === 'qa_candidates') return candidateQuery([{ id: 'passed-candidate', status: 'passed', package_profile_sha256: 'A'.repeat(64) }]);
+        if (table === 'qa_package_results') return chain({ data: { outcome: 'Passed' }, error: null });
+        throw new Error('Unexpected table');
+      }) });
+      const security = new QaSecurityGateError({ wingetId: job.winget_id, version: job.version, architecture: 'x64', malicious: kind === 'one flag' ? 1 : 2, totalEngines: 72 });
+      const gateError = kind === 'failed install' ? new QaGateError({ wingetId: job.winget_id, testedVersion: job.version, architecture: 'x64', testedAtUtc: '2026-10-16T00:00:00Z', classification: { signal: 'failed', bucket: 'unknown', confidence: 'low', evidence: 'Synthetic failed installation', remediation: 'Review the failed installation', source: 'heuristic' } })
+        : kind === 'compatibility' ? new QaCompatibilityGateError({ wingetId: job.winget_id, version: job.version, architecture: 'x64', installerSha256: job.installer_sha256, blockCode: 'failed_managed_lifecycle' })
+          : kind.startsWith('curated') ? new CuratedEvidenceMismatchError() : security;
+      enforceQaGateMock.mockImplementation(async (input) => {
+        if (kind.includes('changed identity')) store.row.installer_sha256 = 'C'.repeat(64);
+        if (kind === 'clean changed identity') return;
+        if (kind.startsWith('curated')) {
+          const actual = await vi.importActual<typeof import('@/lib/qa/gate')>('@/lib/qa/gate');
+          return actual.enforceQaGate(input);
+        }
+        throw gateError;
+      });
+      const response = await GET(new Request('https://example.test/api/cron/qa-resume', { headers: { authorization: 'Bearer secret' } }));
+      const terminal = kind !== 'one flag' && kind !== 'curated pending' && kind !== 'curated withdrawn' && !kind.includes('changed identity');
+      expect(await response.json()).toMatchObject({ resumed: 0, failed: terminal ? 1 : 0 });
+      expect(store.row.status).toBe(terminal ? 'qa_failed' : 'awaiting_qa');
+      if (kind === 'one flag') expect(store.row.status_message).toBe('VirusTotal: 1 engine flagged, rechecking daily');
+      else if (kind === 'two flags') expect(store.row.status_message).toBe('VirusTotal refused execution for this installer hash.');
+      else if (kind === 'curated pending' || kind === 'curated withdrawn') expect(store.row.status_message).toBe('Curated release verification is pending. Packaging remains on hold.');
+      else if (!kind.includes('changed identity')) expect(store.row.status_message).toContain(gateError.message);
+      expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      if (terminal) expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledWith(job.id, 'failed', store.row.status_message);
+      else expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    }
+  );
 
   it.each([1, 2, 3].flatMap((jobCount) => [true, false].flatMap((localPackager) =>
     [true, false].flatMap((isAutoUpdate) => [true, false].map((continuity) =>
@@ -348,6 +526,7 @@ describe('GET /api/cron/qa-resume', () => {
     });
     expect(update.update).toHaveBeenCalledWith(expect.objectContaining({
       status: 'qa_failed', status_message: PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
+      error_message: PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
     }));
     expect(update.eq).toHaveBeenCalledWith('status', 'awaiting_qa');
     expect(update.update).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
@@ -631,7 +810,8 @@ describe('GET /api/cron/qa-resume', () => {
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
-  it('finalizes auto-update tracking when the required QA candidate fails', async () => {
+  it.each(['Installer remained interactive.', null, '', '   '])('records the failed candidate reason in both customer fields: %s', async (summary) => {
+    const reason = summary?.trim() || 'The required installation test could not complete.';
     const job = {
       tenant_id: 'tenant-1', id: 'job-failed-qa',
       qa_candidate_id: 'candidate-failed',
@@ -652,7 +832,7 @@ describe('GET /api/cron/qa-resume', () => {
             data: {
               id: 'candidate-failed',
               status: 'failed',
-              failure_summary: 'Installer remained interactive.',
+              failure_summary: summary,
               package_profile_sha256: 'A'.repeat(64),
             },
             error: null,
@@ -672,12 +852,13 @@ describe('GET /api/cron/qa-resume', () => {
     expect(body).toMatchObject({ resumed: 0, failed: 1, waiting: 0 });
     expect(packagingUpdate.update).toHaveBeenCalledWith(expect.objectContaining({
       status: 'qa_failed',
-      status_message: 'Installer remained interactive.',
+      status_message: reason,
+      error_message: reason,
     }));
     expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledWith(
       job.id,
       'failed',
-      'Installer remained interactive.'
+      reason
     );
   });
 
@@ -971,6 +1152,8 @@ describe('GET /api/cron/qa-resume', () => {
       held: 0, deferred: 0, budgetExhausted: false, reopened: 0, recoveryDeferred: false });
     expect(store.row.qa_candidate_id).toBe('publication-candidate');
     expect(store.row.status).toBe(released ? 'packaging' : 'awaiting_qa');
+    if (!released) expect(store.row.status_message)
+      .toBe('Waiting for installation validation before deployment');
     expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(released ? 1 : 0);
     expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
     expect(assertCuratedLicenceAcceptedMock).not.toHaveBeenCalled();

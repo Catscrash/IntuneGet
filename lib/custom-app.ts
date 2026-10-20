@@ -86,10 +86,10 @@ export function buildCustomWingetId(publisher: string, displayName: string): str
  * rejects the shapes that are wrong regardless of where they point, so the
  * form can say so before the request is made.
  */
-export function isValidInstallerUrl(value: string): boolean {
+export function isValidInstallerUrl(value: string, { allowHttp = false }: { allowHttp?: boolean } = {}): boolean {
   try {
     const parsed = new URL(value);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    if (parsed.protocol !== 'https:' && !(allowHttp && parsed.protocol === 'http:')) {
       return false;
     }
     if (parsed.username || parsed.password) {
@@ -130,7 +130,7 @@ export function buildCustomAppCartItem(input: CustomAppInput): CustomAppCartItem
     throw new Error('Display name, publisher, and version are required');
   }
   if (!isValidInstallerUrl(installerUrl)) {
-    throw new Error('Installer URL must be a valid http(s) URL');
+    throw new Error('Installer URL must be a valid HTTPS URL');
   }
   if (sha256 && !isValidSha256(sha256)) {
     throw new Error('SHA256 must be a 64-character hexadecimal string');

@@ -19,6 +19,8 @@ import {
 } from '@/lib/custom-app';
 import type { WingetArchitecture, WingetScope } from '@/types/winget';
 import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
+import { SavedCustomApps } from '@/components/SavedCustomApps';
+import { customAppVersionInput, parseCustomAppDefinition } from '@/lib/custom-app-definitions';
 
 interface CustomAppModalProps {
   onClose: () => void;
@@ -97,7 +99,7 @@ export function CustomAppModal({ onClose }: CustomAppModalProps) {
     if (!installerUrl.trim()) {
       nextErrors.installerUrl = 'Installer URL is required';
     } else if (!isValidInstallerUrl(installerUrl.trim())) {
-      nextErrors.installerUrl = 'Must be a valid http:// or https:// URL';
+      nextErrors.installerUrl = 'Must be a valid HTTPS URL';
     }
     if (sha256.trim() && !isValidSha256(sha256.trim())) {
       nextErrors.sha256 = 'Must be a 64-character hexadecimal string';
@@ -205,6 +207,14 @@ export function CustomAppModal({ onClose }: CustomAppModalProps) {
         {/* Content */}
         <div className="flex-1 overflow-y-auto">
           <div className="p-6 space-y-6">
+            <SavedCustomApps definition={() => parseCustomAppDefinition({ displayName, publisher, installerType, architecture, installScope, silentSwitches, uninstallCommand, description, iconUrl })} onLoad={definition => {
+              const input = customAppVersionInput(definition);
+              setDisplayName(input.displayName); setPublisher(input.publisher);
+              setInstallerType(input.installerType); setArchitecture(input.architecture); setInstallScope(input.installScope);
+              setSilentSwitches(input.silentSwitches ?? ''); setUninstallCommand(input.uninstallCommand ?? '');
+              setDescription(input.description ?? ''); setIconUrl(input.iconUrl ?? '');
+              setVersion(input.version); setInstallerUrl(input.installerUrl); setSha256(input.sha256 ?? ''); setErrors({});
+            }} />
             {/* Name & Publisher */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>

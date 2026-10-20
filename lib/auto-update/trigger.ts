@@ -13,6 +13,7 @@ import {
   DEFAULT_SAFETY_CONFIG,
   classifyUpdateType,
   canAutoUpdate,
+  autoUpdateScopeReason,
 } from '@/types/update-policies';
 import type { IntuneAppCategorySelection, PackageAssignment } from '@/types/upload';
 import { getCatalogSource } from '@/lib/catalog';
@@ -67,6 +68,7 @@ interface TriggerResult {
     | 'CURATED_CONFIG_VERIFICATION_REQUIRED'
     | 'INTUNE_APPROVAL_PENDING'
     | 'CURATED_CONFIG_VERIFICATION_FAILED'
+    | 'UPDATE_SCOPE_HELD'
     | 'RATE_LIMIT_UNVERIFIED'
     | 'PSADT_BACKFILL_UNAVAILABLE';
 }
@@ -223,7 +225,7 @@ export class AutoUpdateTrigger {
   async triggerAutoUpdate(
     policy: AppUpdatePolicy,
     updateInfo: UpdateInfo,
-    options?: { skipRateLimits?: boolean; skipPriorDeploymentCheck?: boolean }
+    options?: { skipRateLimits?: boolean; skipPriorDeploymentCheck?: boolean; bypassUpdateScope?: boolean }
   ): Promise<TriggerResult> {
     try {
       // Safety check 1: Verify policy allows auto-update
@@ -234,6 +236,9 @@ export class AutoUpdateTrigger {
           skipReason: 'Policy does not allow auto-update or is disabled',
         };
       }
+
+      const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.auto_update_scope, updateInfo.currentVersion, updateInfo.latestVersion);
+      if (scopeReason) return { success: false, skipped: true, code: 'UPDATE_SCOPE_HELD', skipReason: scopeReason };
 
       // Safety check 2: Verify deployment config exists
       if (!policy.deployment_config) {
@@ -920,8 +925,11 @@ export class AutoUpdateTrigger {
       status_message: !qaDemand || qaDemand.state === 'passed'
         ? 'Installation test passed; preparing deployment'
         : qaDemand.state === 'waiting'
-          ? 'Running an isolated installation test to make sure this app works before deployment'
-          : qaDemand.failureSummary || 'This app did not pass the isolated installation test',
+          ? 'Waiting for installation validation before deployment'
+          : qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test',
+      error_message: qaDemand?.state === 'failed'
+        ? qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test'
+        : null,
       progress_percent: 0,
       execution_profile_sha256: qaDemand?.identity.executionProfileSha256 || null,
       presentation_profile_sha256: qaDemand?.identity.presentationProfileSha256 || null,

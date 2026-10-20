@@ -37,13 +37,14 @@ export async function enqueueCuratedVerification(inputs) {
   const kind = configId ? 'config' : 'release';
   const key = configId ? `config:${configId}` : `release:${candidate.id}`;
   const queued = await rest(`curated_verification_queue?select=id,version,verification_key&app_id=eq.${candidate.appId}&kind=eq.release&status=eq.queued`);
-  if (kind === 'release' && (queued || []).some(row => compareReleaseVersions(row.version, candidate.version) > 0)) return { queued: true };
+  if (kind === 'release' && (queued || []).some(row => compareReleaseVersions(row.version, candidate.version) > 0)) return { queued: true, existing: true };
   const supersedeIds = kind === 'release' ? (queued || [])
     .filter(row => row.verification_key !== key && compareReleaseVersions(candidate.version, row.version) > 0).map(row => row.id) : [];
-  await rest('rpc/enqueue_curated_verification', { method: 'POST', body: {
+  const result = await rest('rpc/enqueue_curated_verification', { method: 'POST', body: {
     p_key: key, p_app_id: candidate.appId, p_version: candidate.version, p_kind: kind, p_inputs: inputs, p_supersede_ids: supersedeIds,
   } });
-  return { queued: true };
+  if (result?.held === true) return { held: true, queued: false, reason: 'reviewed_no_go' };
+  return result === null ? { queued: true, existing: true } : { queued: true };
 }
 
 const parseJson = (value, fallback) => {
@@ -125,7 +126,14 @@ async function evidencePrevious(app, release) {
  * each app's newest release so tenant auto-updates keep their settings.
  */
 export async function processConfigVerifications({ runs, releases, apps, readEvidence, authenticate, dispatch, rebuildConfig, slots, now }) {
-  const rows = await rest('curated_config_verifications?select=*&status=in.(requested,verifying,passed,failed)&order=requested_at.asc');
+  const rows = [];
+  for (let offset = 0; ;) {
+    const page = await rest(`curated_config_verifications?select=*&status=in.(requested,verifying,passed)&order=requested_at.asc,id.asc&limit=500&offset=${offset}`) || [];
+    if (!page.length) break;
+    rows.push(...page);
+    // Advance by the returned count so a smaller server row cap cannot hide work.
+    offset += page.length;
+  }
   const states = []; let dispatched = 0;
   const update = (id, patch) => rest(`curated_config_verifications?id=eq.${id}`, { method: 'PATCH', body: { ...patch, updated_at: now.toISOString() } });
 
@@ -144,6 +152,8 @@ export async function processConfigVerifications({ runs, releases, apps, readEvi
       continue;
     }
     if (rows.some(item => item.release_id === latest.id && item.psadt_config_sha256 === rebuilt.psadtConfigSha256)) continue;
+    const existing = await rest(`curated_config_verifications?release_id=eq.${encodeURIComponent(latest.id)}&psadt_config_sha256=eq.${encodeURIComponent(rebuilt.psadtConfigSha256)}&select=id&limit=1`);
+    if (existing?.length) continue;
     await rest('curated_config_verifications?on_conflict=release_id,psadt_config_sha256', { method: 'POST', prefer: 'resolution=ignore-duplicates', body: [{
       release_id: latest.id, app_id: row.app_id, winget_id: row.winget_id, version: latest.candidate.version,
       psadt_config_sha256: rebuilt.psadtConfigSha256, psadt_config: rebuilt.executionConfig, status: 'requested', tenant_id: row.tenant_id, requested_by_user_id: row.requested_by_user_id,
@@ -195,6 +205,7 @@ export async function processConfigVerifications({ runs, releases, apps, readEvi
       candidate: JSON.stringify(release.candidate), previous: previous ? JSON.stringify(previous) : '',
       psadt_config: JSON.stringify(row.psadt_config),
     });
+    if (dispatchResult?.held) { states.push(`${app.name} custom settings ${row.psadt_config_sha256.slice(0, 8)}: held for reviewed QA repair`); continue; }
     if (!dispatchResult?.queued) await update(row.id, { status: 'verifying' });
     dispatched++;
     states.push(`${app.name} custom settings ${row.psadt_config_sha256.slice(0, 8)}: ${dispatchResult?.queued ? 'queued' : 'verification dispatched'}`);

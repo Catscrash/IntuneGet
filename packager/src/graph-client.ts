@@ -6,9 +6,8 @@
 import { ConfidentialClientApplication } from '@azure/msal-node';
 import { ManagedIdentityCredential, type TokenCredential } from '@azure/identity';
 import { PackagerConfig } from './config.js';
+import { ProxyMsalNetwork } from './proxy-msal.js';
 import { createLogger, Logger } from './logger.js';
-import { fetchWithProxy } from './fetch-with-proxy.js';
-import { ProxyHttpClient } from './msal-proxy-http-client.js';
 
 const GRAPH_ENDPOINT = 'https://graph.microsoft.com/beta';
 const GRAPH_SCOPE = 'https://graph.microsoft.com/.default';
@@ -40,13 +39,12 @@ export class GraphClient {
         : new ManagedIdentityCredential();
     } else {
       this.msalClient = new ConfidentialClientApplication({
+        ...(config.proxy?.agentFor(new URL(`https://login.microsoftonline.com/${tenantId}`))
+          ? { system: { networkClient: new ProxyMsalNetwork(config.proxy) } } : {}),
         auth: {
           clientId: config.azure.clientId,
           clientSecret: config.azure.clientSecret,
           authority: `https://login.microsoftonline.com/${tenantId}`,
-        },
-        system: {
-          networkClient: new ProxyHttpClient(),
         },
       });
     }
@@ -102,7 +100,8 @@ export class GraphClient {
     const token = await this.getAccessToken();
     const url = `${GRAPH_ENDPOINT}${path}`;
 
-    const response = await fetchWithProxy(url, {
+    const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -130,7 +129,8 @@ export class GraphClient {
     const token = await this.getAccessToken();
     const url = `${GRAPH_ENDPOINT}${path}`;
 
-    const response = await fetchWithProxy(url, {
+    const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -165,7 +165,8 @@ export class GraphClient {
     const token = await this.getAccessToken();
     const url = `${GRAPH_ENDPOINT}${path}`;
 
-    const response = await fetchWithProxy(url, {
+    const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+    const response = await fetch(url, {
       method: 'PATCH',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -200,7 +201,8 @@ export class GraphClient {
     const token = await this.getAccessToken();
     const url = `${GRAPH_ENDPOINT}${path}`;
 
-    const response = await fetchWithProxy(url, {
+    const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+    const response = await fetch(url, {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${token}`,

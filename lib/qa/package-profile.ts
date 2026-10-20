@@ -15,7 +15,7 @@ import type { PackagedWingetDependency } from '@/lib/winget-dependencies';
 
 export const QA_PSADT_TOOLCHAIN = {
   packagerRepository: 'ugurkocde/IntuneGet',
-  packagerCommit: '665d6f4ec65d457edbd455605a54b4b223392457',
+  packagerCommit: '1cc5fb513cf3c23120f2b0741d66f11ee435d409',
   packagerScriptPath: '.github/scripts/Create-PSADTPackage.ps1',
   psadtVersion: '4.1.8',
   templateUrl:
@@ -644,6 +644,9 @@ export const QA_PACKAGER_RELEASE_HISTORY = [
   // The next activation still requires isolated guest qualification and
   // reviewed exclusions for the intervening generator changes.
   '25849ac512c211e616c135149ef1e059db367ebc',
+  // The next delta adds registration diagnostics and fixes a portable archive
+  // failure path that no passing package could have exercised.
+  '665d6f4ec65d457edbd455605a54b4b223392457',
   QA_PSADT_TOOLCHAIN.packagerCommit,
 ] as const;
 
@@ -1090,6 +1093,13 @@ export function validateCurrentQaPackageProfile(
   input: QaPackageProfileValidationInput
 ): QaPackageProfileValidation {
   return validateQaPackageProfile(input, [QA_PSADT_TOOLCHAIN.packagerCommit]);
+}
+
+/** Historical evidence is a comparison witness, never a source of executable commands. */
+export function validateRecordedQaPackageProfile(
+  input: QaPackageProfileValidationInput
+): QaPackageProfileValidation {
+  return validateQaPackageProfile(input, QA_PACKAGER_RELEASE_HISTORY);
 }
 
 export function validateCompatiblePassedCatalogQaProfile(

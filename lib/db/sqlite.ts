@@ -4,6 +4,10 @@
  */
 
 import Database from 'better-sqlite3';
+import type { PackageAssignment, IntuneAppCategorySelection } from '@/types/upload';
+import type { Json } from '@/types/database';
+import type { SavedCustomAppDefinition } from '@/lib/custom-app-definitions';
+import type { Database as HostedSchema } from '@/types/database';
 import { isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
 import path from 'path';
 import fs from 'fs';
@@ -140,10 +144,87 @@ function buildSetClause(
   return { clause: assignments.join(', '), values };
 }
 
-/**
- * SQLite implementation of the database adapter
- */
+/** Merge settings against the current row while holding the local write lock. */
+export const sqliteDeployedConfig = {
+  mergeFields(
+    id: string,
+    identity: { userId: string; tenantId: string; wingetId: string; intuneAppId: string },
+    patch: { assignments?: PackageAssignment[]; categories?: IntuneAppCategorySelection[] }
+  ): PackagingJob | null {
+    const database = getDb();
+    const where = "id = ? AND user_id = ? AND tenant_id = ? AND winget_id = ? AND intune_app_id = ? AND status = 'deployed' AND archived_at IS NULL";
+    const values = [id, identity.userId, identity.tenantId, identity.wingetId, identity.intuneAppId];
+    return database.transaction(() => {
+      const row = database.prepare(`SELECT * FROM packaging_jobs WHERE ${where}`).get(...values) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      const job = parseJobRow(row);
+      const config = job.package_config;
+      if (!config || typeof config !== 'object' || Array.isArray(config)) return null;
+      const merged = { ...config };
+      if (patch.assignments) merged.assignments = patch.assignments as unknown as Json;
+      if (patch.categories) merged.categories = patch.categories as unknown as Json;
+      const result = database.prepare(`UPDATE packaging_jobs SET package_config = ?, updated_at = ? WHERE ${where}`)
+        .run(JSON.stringify(merged), new Date().toISOString(), ...values);
+      return result.changes === 1 ? { ...job, package_config: merged } : null;
+    }).immediate();
+  },
+};
+
+type MappingRow = HostedSchema['public']['Tables']['manual_app_mappings']['Row'];
+type LocalMappingInput = Pick<MappingRow, 'discovered_app_name' | 'discovered_publisher' | 'winget_package_id'> & { tenant_id: string; created_by: string };
+const mappingRow = (row: unknown): MappingRow => {
+  const stored = row as Omit<MappingRow, 'is_verified'> & { is_verified: number };
+  return { ...stored, is_verified: stored.is_verified === 1 };
+};
+
+/** Local-only mappings share the adapter's connection and migration lifecycle. */
+export const sqliteManualMappings = {
+  async list(tenantId: string): Promise<MappingRow[]> {
+    return getDb().prepare('SELECT * FROM manual_app_mappings WHERE tenant_id = ? ORDER BY created_at DESC, id DESC').all(tenantId).map(mappingRow);
+  },
+  async save(input: LocalMappingInput): Promise<{ record: MappingRow; updated: boolean }> {
+    const database = getDb();
+    return database.transaction(() => {
+      const name = input.discovered_app_name.toLowerCase().trim();
+      const existing = database.prepare('SELECT id FROM manual_app_mappings WHERE tenant_id = ? AND discovered_app_name = ?').get(input.tenant_id, name) as { id: string } | undefined;
+      const now = new Date().toISOString();
+      const id = existing?.id ?? crypto.randomUUID();
+      if (existing) {
+        database.prepare('UPDATE manual_app_mappings SET discovered_publisher = ?, winget_package_id = ?, updated_at = ? WHERE tenant_id = ? AND id = ?').run(input.discovered_publisher, input.winget_package_id, now, input.tenant_id, id);
+      } else {
+        database.prepare('INSERT INTO manual_app_mappings (id, tenant_id, created_by, discovered_app_name, discovered_publisher, winget_package_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, input.tenant_id, input.created_by, name, input.discovered_publisher, input.winget_package_id, now, now);
+      }
+      return { record: mappingRow(database.prepare('SELECT * FROM manual_app_mappings WHERE tenant_id = ? AND id = ?').get(input.tenant_id, id)), updated: Boolean(existing) };
+    })();
+  },
+  async delete(id: string, tenantId: string): Promise<boolean> {
+    return getDb().prepare('DELETE FROM manual_app_mappings WHERE tenant_id = ? AND id = ?').run(tenantId, id).changes > 0;
+  },
+};
+
+/** SQLite implementation of the database adapter. */
 export const sqliteDb: DatabaseAdapter = {
+  customAppDefinitions: {
+    async list(userId, tenantId, limit, offset) {
+      const rows = getDb().prepare('SELECT * FROM custom_app_definitions WHERE user_id = ? AND tenant_id = ? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?').all(userId, tenantId, limit, offset) as Array<Omit<SavedCustomAppDefinition, 'definition'> & { definition: string }>;
+      return rows.map(row => ({ ...row, definition: JSON.parse(row.definition) }));
+    },
+    async save(userId, tenantId, definition, id) {
+      const database = getDb();
+      const now = new Date().toISOString();
+      if (id) {
+        if (!database.prepare('UPDATE custom_app_definitions SET definition = ?, updated_at = ? WHERE id = ? AND user_id = ? AND tenant_id = ?').run(JSON.stringify(definition), now, id, userId, tenantId).changes) return null;
+      } else {
+        id = crypto.randomUUID();
+        database.prepare('INSERT INTO custom_app_definitions (id, user_id, tenant_id, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, userId, tenantId, JSON.stringify(definition), now, now);
+      }
+      const row = database.prepare('SELECT * FROM custom_app_definitions WHERE id = ? AND user_id = ? AND tenant_id = ?').get(id, userId, tenantId) as Omit<SavedCustomAppDefinition, 'definition'> & { definition: string };
+      return { ...row, definition: JSON.parse(row.definition) };
+    },
+    async delete(userId, tenantId, id) {
+      return getDb().prepare('DELETE FROM custom_app_definitions WHERE id = ? AND user_id = ? AND tenant_id = ?').run(id, userId, tenantId).changes > 0;
+    },
+  },
   jobs: {
     /**
      * Get jobs by status
@@ -175,6 +256,19 @@ export const sqliteDb: DatabaseAdapter = {
      * Get jobs by user ID
      * Auto-excludes terminal-state jobs older than 7 days
      */
+    async getLatestDeployed(userId, tenantId, wingetId, intuneAppId) {
+      const values: string[] = [userId, tenantId, wingetId];
+      const appFilter = intuneAppId === undefined ? '' : ' AND intune_app_id = ?';
+      if (intuneAppId !== undefined) values.push(intuneAppId);
+      const row = getDb().prepare(`
+        SELECT * FROM packaging_jobs
+        WHERE user_id = ? AND tenant_id = ? AND winget_id = ?
+          AND status = 'deployed' AND archived_at IS NULL${appFilter}
+        ORDER BY completed_at DESC, created_at DESC, id DESC LIMIT 1
+      `).get(...values) as Record<string, unknown> | undefined;
+      return row ? parseJobRow(row) : null;
+    },
+
     async getByUserId(userId: string, limit: number = 50): Promise<PackagingJob[]> {
       const database = getDb();
       // Return the most recent jobs for the user with no age cutoff, so the
@@ -270,13 +364,13 @@ export const sqliteDb: DatabaseAdapter = {
           id, user_id, user_email, tenant_id, winget_id, version, display_name,
           publisher, architecture, installer_type, installer_url, installer_sha256,
           install_command, uninstall_command, install_scope, detection_rules,
-          package_config, app_source, status, status_message, progress_percent,
+          package_config, app_source, status, status_message, error_message, progress_percent,
           error_stage, error_category, error_code, execution_profile_sha256,
           presentation_profile_sha256, qa_candidate_id, qa_requested_at,
           qa_completed_at, is_auto_update, auto_update_policy_id, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
       `);
 
@@ -301,6 +395,7 @@ export const sqliteDb: DatabaseAdapter = {
         job.app_source || 'win32',
         job.status || 'queued',
         job.status_message || null,
+        job.error_message ?? null,
         job.progress_percent || 0,
         job.error_stage || null,
         job.error_category || null,
@@ -756,12 +851,13 @@ export const sqliteDb: DatabaseAdapter = {
       database
         .prepare(
           `INSERT INTO app_update_policies (
-             id, user_id, tenant_id, winget_id, policy_type, pinned_version,
+             id, user_id, tenant_id, winget_id, policy_type, auto_update_scope, pinned_version,
              deployment_config, original_upload_history_id, last_auto_update_at,
              last_auto_update_version, is_enabled, consecutive_failures, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (user_id, tenant_id, winget_id) DO UPDATE SET
              policy_type = excluded.policy_type,
+             auto_update_scope = CASE WHEN ? THEN excluded.auto_update_scope ELSE app_update_policies.auto_update_scope END,
              pinned_version = excluded.pinned_version,
              deployment_config = excluded.deployment_config,
              original_upload_history_id = excluded.original_upload_history_id,
@@ -774,6 +870,7 @@ export const sqliteDb: DatabaseAdapter = {
           policy.tenant_id,
           policy.winget_id,
           policy.policy_type,
+          policy.auto_update_scope ?? 'all',
           policy.pinned_version ?? null,
           policy.deployment_config ? JSON.stringify(policy.deployment_config) : null,
           policy.original_upload_history_id ?? null,
@@ -782,7 +879,8 @@ export const sqliteDb: DatabaseAdapter = {
           policy.is_enabled === false ? 0 : 1,
           policy.consecutive_failures ?? 0,
           policy.created_at || now,
-          policy.updated_at || now
+          policy.updated_at || now,
+          policy.auto_update_scope === undefined ? 0 : 1
         );
 
       const row = database

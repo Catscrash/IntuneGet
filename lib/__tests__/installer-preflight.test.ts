@@ -116,6 +116,23 @@ describe('installer dispatch preflight', () => {
     },
   );
 
+  it.each([
+    { wingetId: 'Custom.Example.App', sourceType: 'custom' as const },
+    { wingetId: 'Custom.Example.App', sourceType: undefined },
+    { wingetId: 'Example.App', sourceType: 'custom' as const },
+  ])('rejects HTTP custom installers before any network or catalog work: %j', async (custom) => {
+    await expect(enforceInstallerPreflight({
+      ...request,
+      ...custom,
+      installerUrl: 'http://example.com/setup.exe',
+      installerSha256: '',
+    })).rejects.toMatchObject({ code: 'INVALID_INSTALLER_URL', retryable: false });
+    expect(getLiveInstallersMock).not.toHaveBeenCalled();
+    expect(hashRemoteInstallerMock).not.toHaveBeenCalled();
+    expect(requestMock).not.toHaveBeenCalled();
+    expect(assertPublicInstallerUrlMock).not.toHaveBeenCalled();
+  });
+
   it('skips custom installers but still checks where the URL points', async () => {
     await expect(enforceInstallerPreflight({
       ...request,
@@ -138,7 +155,7 @@ describe('installer dispatch preflight', () => {
     await expect(enforceInstallerPreflight({
       ...request,
       wingetId: 'Custom.Example.App',
-      installerUrl: 'http://169.254.169.254/latest/meta-data/',
+      installerUrl: 'https://169.254.169.254/latest/meta-data/',
       installerSha256: '',
       sourceType: 'custom',
     })).rejects.toMatchObject({

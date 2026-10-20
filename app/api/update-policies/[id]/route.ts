@@ -5,6 +5,7 @@
  * DELETE - Delete a specific policy
  */
 
+import { isAutoUpdateScope } from '@/types/update-policies';
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
@@ -73,6 +74,9 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     const { id } = await params;
     const body = await request.json();
     const db = getDatabase();
+    if (body.auto_update_scope !== undefined && !isAutoUpdateScope(body.auto_update_scope)) {
+      return NextResponse.json({ error: 'Invalid auto_update_scope' }, { status: 400 });
+    }
 
     // Read it first so the validation below can fall back to what is already
     // stored: a PATCH that only flips policy_type must not have to resend the
@@ -122,6 +126,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     // the row alone and stamps updated_at itself.
     const updateData: UpdatePolicyPatch = {};
 
+    if (body.auto_update_scope !== undefined) updateData.auto_update_scope = body.auto_update_scope;
     if (body.policy_type !== undefined) updateData.policy_type = body.policy_type;
     if (body.pinned_version !== undefined) updateData.pinned_version = body.pinned_version;
     if (body.deployment_config !== undefined) updateData.deployment_config = body.deployment_config;

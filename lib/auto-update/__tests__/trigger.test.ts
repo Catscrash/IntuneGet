@@ -671,6 +671,35 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
     expect(ensureQaDemandMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['The uninstall step failed.', '', '   '])('persists both failure fields in the auto-update job writer: %s', async (summary) => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({
+      packaging_jobs: { insertSpy: insert, singleResult: { data: { id: 'synthetic-job' }, error: null } },
+    }));
+    const reason = summary.trim() || 'This app did not pass the isolated installation test';
+    await trigger['createPackagingJob'](makePolicy({ displayName: 'Synthetic App', architecture: 'x64' }), UPDATE_INFO, 'synthetic-history', {
+      state: 'failed', candidateId: 'synthetic-candidate', failureSummary: summary,
+      identity: { executionProfileSha256: 'A'.repeat(64), presentationProfileSha256: 'B'.repeat(64) },
+    });
+    expect(insert).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'qa_failed', status_message: reason, error_message: reason,
+    }));
+  });
+
+  it('describes an auto-update job waiting for installation validation without claiming a running test', async () => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({
+      packaging_jobs: { insertSpy: insert, singleResult: { data: { id: 'synthetic-job' }, error: null } },
+    }));
+    await trigger['createPackagingJob'](makePolicy({ displayName: 'Synthetic App', architecture: 'x64' }), UPDATE_INFO, 'synthetic-history', {
+      state: 'waiting', candidateId: 'synthetic-candidate',
+      identity: { executionProfileSha256: 'A'.repeat(64), presentationProfileSha256: 'B'.repeat(64) },
+    });
+    expect(insert).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'awaiting_qa', status_message: 'Waiting for installation validation before deployment',
+    }));
+  });
+
   it('applies the same app adapter to auto-update QA and customer packaging', async () => {
     const supabase = createSupabaseMock({});
     const trigger = makeTrigger(supabase);
@@ -1435,5 +1464,27 @@ describe('AutoUpdateTrigger curated licence attestation', () => {
         curatedSettingsMode: 'tested-defaults', psadtConfig: expect.objectContaining({ processesToClose: [], brandingCompanyName: 'Example Company' }),
       }) }));
     } finally { restore(); }
+  });
+});
+
+
+describe('hosted automatic scope gate', () => {
+  it.each(['minor', 'major'] as const)('holds patch and unparseable changes before any DB work with %s', async scope => {
+    const supabase = createSupabaseMock({});
+    const trigger = makeTrigger(supabase);
+    const policy = { ...makePolicy({}), consecutive_failures: 0, auto_update_scope: scope };
+    for (const [currentVersion, latestVersion] of [['1.0.0', '1.0.1'], ['unknown', '2.0']]) {
+      const result = await trigger.triggerAutoUpdate(policy, { ...UPDATE_INFO, currentVersion, latestVersion });
+      expect(result).toMatchObject({ success: false, skipped: true, code: 'UPDATE_SCOPE_HELD' });
+      expect(result.skipReason).toContain('scope');
+    }
+    expect(supabase.from).not.toHaveBeenCalled();
+  });
+  it('manual bypass retains the normal deployment configuration guard', async () => {
+    const supabase = createSupabaseMock({});
+    const policy = { ...makePolicy({}), deployment_config: null, consecutive_failures: 0, auto_update_scope: 'major' as const };
+    const result = await makeTrigger(supabase).triggerAutoUpdate(policy, { ...UPDATE_INFO, latestVersion: '1.0.1' }, { bypassUpdateScope: true });
+    expect(result.error).toBe('No deployment configuration saved for this policy');
+    expect(result.skipped).not.toBe(true);
   });
 });

@@ -8,7 +8,6 @@ import { PackagerConfig } from './config.js';
 import { PackagingJob } from './job-poller.js';
 import { GraphClient } from './graph-client.js';
 import { createLogger, Logger } from './logger.js';
-import { fetchWithProxy } from './fetch-with-proxy.js';
 import {
   findDuplicateIntuneApp,
   intuneAppSourceMarker,
@@ -160,6 +159,7 @@ interface PackageAssignment {
   filterType?: 'include' | 'exclude';
   notifications?: 'showAll' | 'showReboot' | 'hideAll';
   deliveryOptimizationPriority?: 'notConfigured' | 'foreground';
+  autoUpdateSupersededApps?: boolean;
 }
 
 interface IntuneAppCategorySelection {
@@ -188,11 +188,12 @@ interface GraphMobileAppAssignment {
   // exclusion assignments (it stores settings: null for them).
   settings?: {
     '@odata.type': '#microsoft.graph.win32LobAppAssignmentSettings';
-  autoUpdateSettings?: {
-    autoUpdateSupersededAppsState: 'enabled' | 'notConfigured';
-  };
     notifications: 'showAll' | 'showReboot' | 'hideAll';
     deliveryOptimizationPriority: 'notConfigured' | 'foreground';
+    autoUpdateSettings?: {
+      '@odata.type': '#microsoft.graph.win32LobAppAutoUpdateSettings';
+      autoUpdateSupersededAppsState: 'enabled';
+    };
   };
 }
 
@@ -468,7 +469,8 @@ export class IntuneUploader {
     }
 
     try {
-      const response = await fetchWithProxy(iconUrl);
+      const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+      const response = await fetch(iconUrl);
 
       if (!response.ok) {
         this.logger.warn('Failed to download app icon, creating app without icon', {
@@ -596,6 +598,7 @@ export class IntuneUploader {
     azureStorageUri: string,
     onProgress?: (percent: number) => Promise<void>
   ): Promise<void> {
+    const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
     const fileHandle = await fs.promises.open(filePath, 'r');
     const stats = await fileHandle.stat();
     const fileSize = stats.size;
@@ -618,7 +621,7 @@ export class IntuneUploader {
 
         // Upload block
         const blockUrl = `${azureStorageUri}&comp=block&blockid=${encodeURIComponent(blockId)}`;
-        const response = await fetchWithProxy(blockUrl, {
+        const response = await fetch(blockUrl, {
           method: 'PUT',
           headers: {
             'Content-Length': chunk.length.toString(),
@@ -638,7 +641,7 @@ export class IntuneUploader {
       // Commit blocks
       const blockListXml = this.createBlockListXml(blockIds);
       const commitUrl = `${azureStorageUri}&comp=blocklist`;
-      const commitResponse = await fetchWithProxy(commitUrl, {
+      const commitResponse = await fetch(commitUrl, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/xml',
@@ -1061,6 +1064,7 @@ export class IntuneUploader {
             || assignment.deliveryOptimizationPriority === 'foreground'
             ? assignment.deliveryOptimizationPriority
             : undefined,
+          autoUpdateSupersededApps: assignment.autoUpdateSupersededApps === true ? true : undefined,
         }));
     }
 
@@ -1177,10 +1181,16 @@ export class IntuneUploader {
           deliveryOptimizationPriority: assignment.deliveryOptimizationPriority ?? 'notConfigured',
           // Only meaningful on an available assignment: it governs apps the
           // user installed themselves from Company Portal. A required app is
-          // pushed regardless, so the setting is left off there.
-          ...(autoUpdateSupersededApps && graphIntent === 'available'
-            ? { autoUpdateSettings: { autoUpdateSupersededAppsState: 'enabled' as const } }
-            : {}),
+          // pushed regardless, so the setting is left off there. A job that
+          // supersedes a previous app turns it on for every available
+          // assignment, since supersedence alone leaves user-installed copies
+          // on the old version; otherwise each assignment opts in itself.
+          ...(graphIntent === 'available' && (autoUpdateSupersededApps || assignment.autoUpdateSupersededApps === true) ? {
+            autoUpdateSettings: {
+              '@odata.type': '#microsoft.graph.win32LobAppAutoUpdateSettings' as const,
+              autoUpdateSupersededAppsState: 'enabled' as const,
+            },
+          } : {}),
         };
       }
 

@@ -137,6 +137,14 @@ describe('GET /api/update-policies', () => {
 });
 
 describe('POST /api/update-policies', () => {
+  it('rejects invalid scopes before a write and saves an explicit supported scope', async () => {
+    const base = { winget_id: 'Vendor.Scope', tenant_id: 'tenant-1', policy_type: 'notify' };
+    expect((await POST(makeRequest({ ...base, auto_update_scope: 'unsafe' }))).status).toBe(400);
+    expect(upsertPolicyMock).not.toHaveBeenCalled();
+    expect((await POST(makeRequest({ ...base, auto_update_scope: 'major' }))).status).toBe(200);
+    expect(upsertPolicyMock.mock.calls[0][0].auto_update_scope).toBe('major');
+  });
+
   it('derives the current version for pin_version when client omits it', async () => {
     seed({
       detected: [

@@ -14,13 +14,20 @@ import { handleAutoUpdateJobCompletion } from '@/lib/auto-update/cleanup';
 import { ensureQaDemand } from '@/lib/qa/demand';
 import { isDeferredCustomerQaEnabled } from '@/lib/qa/continuity';
 import { QA_PRIORITY_CUSTOMER, QA_PRIORITY_DEMAND } from '@/lib/qa/constants';
+import { InstallerPreflightError } from '@/lib/installer-preflight';
 import { reconcileCatalogInstaller } from '@/lib/catalog-installer-reconciliation';
 import { getPackageCompatibilityBlock, PACKAGE_VERSION_UNAVAILABLE_MESSAGE } from '@/lib/package-eligibility';
+import { enforceQaGate, describeQaGateError, QaGateError, QaGateNotPassedError, QaSecurityGateError, QaCompatibilityGateError } from '@/lib/qa/gate';
+import { installerSecurityReason } from '@/lib/qa/installer-security-holds';
+import { CuratedCatalogError, CuratedEvidenceMismatchError } from '@/lib/curated-catalog/core.mjs';
 import type { Win32CartItem } from '@/types/upload';
 import type { Json } from '@/types/database';
 import { isAuthorizedCronRequest } from '@/lib/cron-auth';
+import { holdCustomerUpstreamJob, reopenCustomerUpstreamJobs } from '@/lib/customer-upstream-recovery';
 
 const RESUME_BATCH_SIZE = 25;
+const MANIFEST_FAILURE_MESSAGE = 'The selected package could not be validated. Review your selection before trying again.';
+const TERMINAL_MANIFEST_CODES = new Set(['MANIFEST_UNAVAILABLE', 'INSTALLER_TYPE_UNAVAILABLE', 'INSTALL_SCOPE_UNAVAILABLE', 'SILENT_INSTALL_UNAVAILABLE']);
 export const maxDuration = 60;
 
 export async function GET(request: Request) {
@@ -65,6 +72,11 @@ export async function GET(request: Request) {
       break;
     }
     visited++;
+    try {
+      if (await holdCustomerUpstreamJob(supabase, job)) { held++; continue; }
+    } catch {
+      waitingIds.push(job.id); waiting++; continue;
+    }
     const skipCustomerQa = !job.is_auto_update && isQaMaintenanceMode();
     let item = job.package_config as unknown as Win32CartItem;
     let observed = {
@@ -103,21 +115,50 @@ export async function GET(request: Request) {
       // installer command that passed in the VM. Explicit PSADT command
       // overrides remain authoritative inside reconcileCatalogInstaller.
       if (item.sourceType !== 'custom') {
-        const reconciled = await reconcileCatalogInstaller({
-          ...item,
-          wingetId: job.winget_id,
-          displayName: job.display_name || item.displayName,
-          publisher: job.publisher || item.publisher,
-          version: job.version,
-          architecture: (job.architecture || item.architecture) as Win32CartItem['architecture'],
-          installerUrl: job.installer_url || item.installerUrl,
-          installerSha256: job.installer_sha256 || item.installerSha256,
-          installerType: (job.installer_type || item.installerType) as Win32CartItem['installerType'],
-          installCommand: job.install_command || item.installCommand,
-          uninstallCommand: job.uninstall_command || item.uninstallCommand,
-          installScope: (job.install_scope || item.installScope) as Win32CartItem['installScope'],
-        });
-        item = reconciled.item;
+        try {
+          const reconciled = await reconcileCatalogInstaller({
+            ...item,
+            wingetId: job.winget_id,
+            displayName: job.display_name || item.displayName,
+            publisher: job.publisher || item.publisher,
+            version: job.version,
+            architecture: (job.architecture || item.architecture) as Win32CartItem['architecture'],
+            installerUrl: job.installer_url || item.installerUrl,
+            installerSha256: job.installer_sha256 || item.installerSha256,
+            installerType: (job.installer_type || item.installerType) as Win32CartItem['installerType'],
+            installCommand: job.install_command || item.installCommand,
+            uninstallCommand: job.uninstall_command || item.uninstallCommand,
+            installScope: (job.install_scope || item.installScope) as Win32CartItem['installScope'],
+          });
+          item = reconciled.item;
+        } catch (error) {
+          const terminal = error instanceof InstallerPreflightError && !error.retryable && TERMINAL_MANIFEST_CODES.has(error.code);
+          if (!terminal) {
+            waitingIds.push(job.id); waiting++; continue;
+          }
+          // Fail only this unchanged execution input. Never expose producer text,
+          // or overwrite a cancellation, relink, or concurrently dispatched job.
+          let update = supabase.from('packaging_jobs').update({
+            status: 'qa_failed', status_message: MANIFEST_FAILURE_MESSAGE,
+            error_message: MANIFEST_FAILURE_MESSAGE, error_code: error.code,
+            error_stage: 'validation', error_category: 'installer',
+            completed_at: new Date().toISOString(),
+          }).eq('id', job.id).eq('status', 'awaiting_qa')
+            .eq('updated_at', job.updated_at).eq('winget_id', job.winget_id).eq('version', job.version)
+            .is('cancelled_at', null).is('archived_at', null).is('github_run_id', null).is('intune_app_id', null);
+          for (const [field, value] of [
+            ['qa_candidate_id', job.qa_candidate_id], ['installer_url', job.installer_url],
+            ['installer_sha256', job.installer_sha256], ['architecture', job.architecture],
+            ['package_config->>installerSha256', item.installerSha256], ['package_config->>architecture', item.architecture],
+          ] as const) update = value == null ? update.is(field, null) : update.eq(field, value);
+          const result = await update.select('id').maybeSingle();
+          if (result.error) { waitingIds.push(job.id); waiting++; continue; }
+          if (result.data) {
+            failed++;
+            await handleAutoUpdateJobCompletion(job.id, 'failed', MANIFEST_FAILURE_MESSAGE);
+          }
+          continue;
+        }
       }
       const installerType = item.installerType || job.installer_type || 'exe';
       const demand = await ensureQaDemand(supabase, {
@@ -163,7 +204,7 @@ export async function GET(request: Request) {
           uninstall_command: item.uninstallCommand || job.uninstall_command,
           install_scope: item.installScope || job.install_scope,
           status_message: demand.state === 'waiting'
-            ? 'Running an isolated installation test to make sure this app works before deployment'
+            ? 'Waiting for installation validation before deployment'
             : job.status_message,
         })
         .eq('id', job.id)
@@ -221,6 +262,19 @@ export async function GET(request: Request) {
       waiting++;
       continue;
     }
+    const guardObservedIdentity = <T extends { eq: (key: string, value: string) => T; is: (key: string, value: null) => T }>(query: T): T => {
+      const identityFields = [
+        ['qa_candidate_id', observed.qa_candidate_id],
+        ['installer_sha256', observed.installer_sha256],
+        ['architecture', observed.architecture],
+        ['package_config->>installerSha256', observedConfig?.installerSha256],
+        ['package_config->>architecture', observedConfig?.architecture],
+      ] as const;
+      for (const [column, value] of identityFields) {
+        query = value == null ? query.is(column, null) : query.eq(column, value);
+      }
+      return query;
+    };
     if (compatibilityBlock) {
       const now = new Date().toISOString();
       let failureUpdate = supabase
@@ -228,6 +282,7 @@ export async function GET(request: Request) {
         .update({
           status: 'qa_failed',
           status_message: PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
+          error_message: PACKAGE_VERSION_UNAVAILABLE_MESSAGE,
           error_code: 'QA_PACKAGE_COMPATIBILITY_BLOCKED',
           error_stage: 'validation',
           error_category: 'installer',
@@ -237,18 +292,7 @@ export async function GET(request: Request) {
         .eq('status', 'awaiting_qa');
       // Another invocation can relink this job without changing its status.
       // Fail only the raw stored identity that the lookup actually observed.
-      const identityFields = [
-        ['qa_candidate_id', observed.qa_candidate_id],
-        ['installer_sha256', observed.installer_sha256],
-        ['architecture', observed.architecture],
-        ['package_config->>installerSha256', observedConfig?.installerSha256],
-        ['package_config->>architecture', observedConfig?.architecture],
-      ] as const;
-      for (const [column, value] of identityFields) {
-        failureUpdate = value == null
-          ? failureUpdate.is(column, null)
-          : failureUpdate.eq(column, value);
-      }
+      failureUpdate = guardObservedIdentity(failureUpdate);
       const { data: blockedJob, error: blockError } = await failureUpdate
         .select('id')
         .maybeSingle();
@@ -272,11 +316,13 @@ export async function GET(request: Request) {
 
     if (!skipCustomerQa && (!candidateStatus || ['failed', 'error'].includes(candidateStatus))) {
       const now = new Date().toISOString();
+      const failureReason = candidateFailureSummary?.trim() || 'The required installation test could not complete.';
       const { data: updated } = await supabase
         .from('packaging_jobs')
         .update({
           status: 'qa_failed',
-          status_message: candidateFailureSummary || 'The required installation test could not complete.',
+          status_message: failureReason,
+          error_message: failureReason,
           error_code: 'QA_FAILED_EXECUTION_PROFILE',
           error_stage: 'validation',
           error_category: 'installer',
@@ -292,7 +338,7 @@ export async function GET(request: Request) {
         await handleAutoUpdateJobCompletion(
           job.id,
           'failed',
-          candidateFailureSummary || 'The required installation test could not complete.'
+          failureReason
         );
       }
       continue;
@@ -321,6 +367,53 @@ export async function GET(request: Request) {
         waiting++;
         continue;
       }
+    }
+
+    // Keep reputation holds waiting before any claim. Local packaging has no
+    // later workflow gate, and a hosted dispatch failure must not turn a
+    // pending verdict into a terminal job failure.
+    try {
+      await enforceQaGate({
+        wingetId: job.winget_id,
+        version: job.version,
+        architecture: features.localPackager
+          ? observed.architecture || 'x64'
+          : observedConfig?.architecture || observed.architecture || 'x64',
+        installerSha256: features.localPackager
+          ? observed.installer_sha256 || ''
+          : observedConfig?.installerSha256 || observed.installer_sha256 || '',
+        packageProfileSha256: job.execution_profile_sha256 || '',
+        qaOverride: skipCustomerQa,
+        sourceType: observedConfig?.sourceType,
+        curatedReleaseId: observedConfig?.curatedReleaseId,
+      });
+    } catch (error) {
+      const terminal = error instanceof QaGateError || error instanceof QaCompatibilityGateError ||
+        error instanceof CuratedEvidenceMismatchError ||
+        (error instanceof QaSecurityGateError && error.details.malicious >= 2);
+      const message = error instanceof CuratedEvidenceMismatchError
+        ? 'The requested package does not match its approved curated test evidence.'
+        : error instanceof CuratedCatalogError ? 'Curated release verification is pending. Packaging remains on hold.'
+        : error instanceof QaSecurityGateError ? installerSecurityReason(error.details.malicious)
+        : error instanceof QaGateError || error instanceof QaCompatibilityGateError || error instanceof QaGateNotPassedError
+          ? describeQaGateError(error) : 'Installer security verification is temporarily unavailable. Packaging remains on hold.';
+      const patch = terminal ? {
+        status: 'qa_failed', status_message: message, error_message: message,
+        error_code: error.code, error_stage: 'validation', error_category: error instanceof CuratedEvidenceMismatchError ? 'validation' : 'installer',
+        completed_at: new Date().toISOString(),
+      } : { status_message: message };
+      const result = await guardObservedIdentity(supabase.from('packaging_jobs').update(patch)
+        .eq('id', job.id).eq('status', 'awaiting_qa')).select('id').maybeSingle();
+      if (result.error) throw new Error('Could not preserve the customer gate disposition');
+      if (!result.data) continue;
+      if (terminal) {
+        failed++;
+        await handleAutoUpdateJobCompletion(job.id, 'failed', message);
+      } else {
+        waitingIds.push(job.id);
+        waiting++;
+      }
+      continue;
     }
 
     if (features.localPackager) {
@@ -392,7 +485,7 @@ export async function GET(request: Request) {
 
     const now = new Date().toISOString();
     const nextStatus = features.localPackager ? 'queued' : 'packaging';
-    const { data: claimed, error: claimError } = await supabase
+    const { data: claimed, error: claimError } = await guardObservedIdentity(supabase
       .from('packaging_jobs')
       .update({
         status: nextStatus,
@@ -403,7 +496,7 @@ export async function GET(request: Request) {
         packaging_started_at: features.localPackager ? null : now,
       })
       .eq('id', job.id)
-      .eq('status', 'awaiting_qa')
+      .eq('status', 'awaiting_qa'))
       .select('id')
       .maybeSingle();
     if (claimError) throw claimError;
@@ -508,11 +601,16 @@ export async function GET(request: Request) {
   // same guarded path on the next invocation, never a separate dispatch path.
   let reopened = 0;
   let recoveryDeferred = false;
+  let upstreamReopened = 0;
+  if (Date.now() - startedAt < 35_000) {
+    try { upstreamReopened = await reopenCustomerUpstreamJobs(supabase, startedAt + 45_000); }
+    catch { recoveryDeferred = true; }
+  }
   try {
     reopened = await reopenSupersededQaFailures(supabase);
   } catch {
     recoveryDeferred = true;
   }
   return NextResponse.json({ success: true, scanned: jobs?.length || 0, resumed, failed, waiting,
-    held, deferred, budgetExhausted, reopened, recoveryDeferred });
+    held, deferred, budgetExhausted, reopened: reopened + upstreamReopened, recoveryDeferred });
 }

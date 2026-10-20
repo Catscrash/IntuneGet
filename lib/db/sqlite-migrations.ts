@@ -268,8 +268,61 @@ export const MIGRATIONS: SqliteMigration[] = [
   },
   {
     version: 6,
+    name: 'saved custom app definitions',
+    up: db => {
+      db.exec(`CREATE TABLE custom_app_definitions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        definition TEXT NOT NULL CHECK (json_valid(definition) AND json_type(definition) = 'object' AND length(CAST(definition AS BLOB)) <= 16384),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_custom_app_definitions_owner ON custom_app_definitions(user_id, tenant_id, updated_at DESC, id DESC);`);
+    },
+  },
+  {
+    version: 7,
+    name: 'local manual application mappings',
+    up: database => {
+      database.exec(`CREATE TABLE manual_app_mappings (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        discovered_app_name TEXT NOT NULL,
+        discovered_publisher TEXT,
+        winget_package_id TEXT NOT NULL,
+        is_verified INTEGER NOT NULL DEFAULT 0 CHECK (is_verified IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (tenant_id, discovered_app_name)
+      );`);
+    },
+  },
+  {
+    version: 8,
+    name: 'automatic update scope',
+    up: db => {
+      db.exec("ALTER TABLE app_update_policies ADD COLUMN auto_update_scope TEXT NOT NULL DEFAULT 'all' CHECK (auto_update_scope IN ('all', 'minor', 'major'));");
+    },
+  },
+  {
+    version: 9,
     name: 'packager build, user settings and webhooks',
     up: (db) => {
+      // This was migration 6 on the fork until upstream claimed 6 to 8, so a
+      // fork database reports version 6 without upstream's migration 6 having
+      // run. Create its table here; on every other database it already exists.
+      db.exec(`CREATE TABLE IF NOT EXISTS custom_app_definitions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        definition TEXT NOT NULL CHECK (json_valid(definition) AND json_type(definition) = 'object' AND length(CAST(definition AS BLOB)) <= 16384),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_custom_app_definitions_owner ON custom_app_definitions(user_id, tenant_id, updated_at DESC, id DESC);`);
+
       // Build identity the packager reported when it claimed a job.
       addColumnIfMissing(db, 'packaging_jobs', 'packager_build', 'TEXT');
 

@@ -1893,6 +1893,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                 <AssignmentConfig
                   assignments={assignments}
                   onChange={setAssignments}
+                  supportsAutoUpdateSuperseded={!isStoreApp}
                 />
               </ConfigSection>}
 

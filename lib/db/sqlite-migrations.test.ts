@@ -15,6 +15,34 @@ function columnNames(db: Database.Database, table: string): string[] {
 }
 
 describe('sqlite migrations', () => {
+  it('adds tenant mappings after version six without changing saved definitions', () => {
+    const db = new Database(':memory:');
+    for (const migration of MIGRATIONS.filter(migration => migration.version <= 6)) migration.up(db);
+    db.pragma('user_version = 6');
+    db.prepare('INSERT INTO custom_app_definitions (id, user_id, tenant_id, definition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run('saved-fixture', 'user', 'tenant', '{"displayName":"Saved fixture"}', 'fixture', 'fixture');
+    runSqliteMigrations(db);
+    expect(getSqliteSchemaVersion(db)).toBe(LATEST_VERSION);
+    expect(db.prepare('SELECT definition FROM custom_app_definitions WHERE id = ?').get('saved-fixture')).toEqual({ definition: '{"displayName":"Saved fixture"}' });
+    const insert = db.prepare('INSERT INTO manual_app_mappings (id, tenant_id, created_by, discovered_app_name, winget_package_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    insert.run('mapping-one', 'tenant', 'user', 'fixture', 'Fixture.App', 'fixture', 'fixture');
+    expect(() => insert.run('mapping-two', 'tenant', 'user', 'fixture', 'Fixture.App', 'fixture', 'fixture')).toThrow(/UNIQUE/);
+    insert.run('mapping-three', 'other-tenant', 'user', 'fixture', 'Fixture.App', 'fixture', 'fixture');
+    db.close();
+  });
+  it('creates the saved definitions table on a fork database already at version six', () => {
+    // The fork shipped its own migration 6 before upstream claimed that
+    // number, so such a database never ran upstream's migration 6.
+    const db = new Database(':memory:');
+    for (const migration of MIGRATIONS.filter(migration => migration.version <= 5)) migration.up(db);
+    db.pragma('user_version = 6');
+    runSqliteMigrations(db);
+    expect(getSqliteSchemaVersion(db)).toBe(LATEST_VERSION);
+    expect(tableNames(db)).toEqual(
+      expect.arrayContaining(['custom_app_definitions', 'manual_app_mappings', 'user_settings', 'webhook_configurations'])
+    );
+    expect(columnNames(db, 'app_update_policies')).toContain('auto_update_scope');
+    db.close();
+  });
   it('creates every table and records the latest version on a fresh database', () => {
     const db = new Database(':memory:');
     runSqliteMigrations(db);
@@ -71,4 +99,16 @@ describe('sqlite migrations', () => {
     expect(tableNames(db)).toEqual(expect.arrayContaining(['app_update_policies', 'auto_update_history']));
     db.close();
   });
+});
+
+
+it('upgrades existing policies to all updates and constrains scope values', () => {
+  const db = new Database(':memory:');
+  for (const migration of MIGRATIONS.filter(m => m.version < 8)) migration.up(db);
+  db.pragma('user_version = 7');
+  db.exec("INSERT INTO app_update_policies (id,user_id,tenant_id,winget_id,policy_type) VALUES ('p','u','t','App.Test','notify')");
+  runSqliteMigrations(db);
+  expect(db.prepare('SELECT auto_update_scope FROM app_update_policies').get()).toEqual({ auto_update_scope: 'all' });
+  expect(() => db.exec("UPDATE app_update_policies SET auto_update_scope = 'unknown'")).toThrow();
+  db.close();
 });

@@ -23,10 +23,22 @@ type GenericRelationship = {
 export interface Database {
   public: {
     Tables: {
+      custom_app_definitions: {
+        Row: { id: string; user_id: string; tenant_id: string; definition: Json; created_at: string; updated_at: string };
+        Insert: { id?: string; user_id: string; tenant_id: string; definition: Json; created_at?: string; updated_at?: string };
+        Update: { definition?: Json; updated_at?: string };
+        Relationships: GenericRelationship[];
+      };
       qa_installer_security_holds: {
         Row: { sha256: string; malicious_verdicts: number; reason: string; first_held_at: string; verdict_at: string; next_check_at: string; checked_at: string | null; released_at: string | null; recheck_lease: string | null; recheck_lease_expires_at: string | null };
         Insert: { sha256: string; malicious_verdicts: number; first_held_at?: string; verdict_at?: string; next_check_at?: string; checked_at?: string | null; released_at?: string | null };
         Update: { malicious_verdicts?: number; verdict_at?: string; next_check_at?: string; checked_at?: string | null; released_at?: string | null };
+        Relationships: GenericRelationship[];
+      };
+      catalog_file_reputation: {
+        Row: { sha256: string; status: 'pending' | 'found' | 'not_found' | 'error'; malicious: number | null; suspicious: number | null; total_engines: number | null; analyzed_at: string | null; checked_at: string | null; retry_after: string; requested_at: string; priority: number };
+        Insert: { sha256: string; status?: 'pending' | 'found' | 'not_found' | 'error'; malicious?: number | null; suspicious?: number | null; total_engines?: number | null; analyzed_at?: string | null; checked_at?: string | null; retry_after?: string; requested_at?: string; priority?: number };
+        Update: Partial<Database['public']['Tables']['catalog_file_reputation']['Insert']>;
         Relationships: GenericRelationship[];
       };
       qa_automation_state: {
@@ -990,6 +1002,7 @@ export interface Database {
           error_stage: string | null;
           error_category: string | null;
           error_code: string | null;
+          error_details: Json | null;
           error_message: string | null;
           created_at: string;
           updated_at: string;
@@ -1043,6 +1056,7 @@ export interface Database {
           error_stage?: string | null;
           error_category?: string | null;
           error_code?: string | null;
+          error_details?: Json | null;
           error_message?: string | null;
           created_at?: string;
           updated_at?: string;
@@ -1096,6 +1110,7 @@ export interface Database {
           error_stage?: string | null;
           error_category?: string | null;
           error_code?: string | null;
+          error_details?: Json | null;
           error_message?: string | null;
           created_at?: string;
           updated_at?: string;
@@ -1514,6 +1529,7 @@ export interface Database {
           tenant_id: string;
           winget_id: string;
           policy_type: 'auto_update' | 'notify' | 'ignore' | 'pin_version';
+          auto_update_scope: 'all' | 'minor' | 'major';
           pinned_version: string | null;
           deployment_config: Json | null;
           original_upload_history_id: string | null;
@@ -1530,6 +1546,7 @@ export interface Database {
           tenant_id: string;
           winget_id: string;
           policy_type?: 'auto_update' | 'notify' | 'ignore' | 'pin_version';
+          auto_update_scope?: 'all' | 'minor' | 'major';
           pinned_version?: string | null;
           deployment_config?: Json | null;
           original_upload_history_id?: string | null;
@@ -1546,6 +1563,7 @@ export interface Database {
           tenant_id?: string;
           winget_id?: string;
           policy_type?: 'auto_update' | 'notify' | 'ignore' | 'pin_version';
+          auto_update_scope?: 'all' | 'minor' | 'major';
           pinned_version?: string | null;
           deployment_config?: Json | null;
           original_upload_history_id?: string | null;

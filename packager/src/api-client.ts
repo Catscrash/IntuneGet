@@ -53,6 +53,7 @@ export interface JobUpdateResult {
  */
 export class ApiClient {
   private baseUrl: string;
+  private proxy: PackagerConfig['proxy'];
   private apiKey: string;
   private packagerId: string;
   private logger: Logger;
@@ -65,6 +66,7 @@ export class ApiClient {
       throw new Error('API key is required (PACKAGER_API_KEY)');
     }
 
+    this.proxy = config.proxy;
     this.baseUrl = config.api.url.replace(/\/$/, ''); // Remove trailing slash
     this.apiKey = config.api.key;
     this.packagerId = config.packagerId;
@@ -100,7 +102,7 @@ export class ApiClient {
 
     this.logger.debug('API request', { method, path });
 
-    const response = await fetch(url, options);
+    const response = await (this.proxy?.enabled ? this.proxy.webFetch(url, options) : fetch(url, options));
     const data = await response.json() as T & { error?: string };
 
     if (!response.ok) {

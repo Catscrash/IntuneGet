@@ -4,6 +4,7 @@
  */
 
 import type { Json } from '@/types/database';
+import type { CustomAppDefinition, SavedCustomAppDefinition } from '@/lib/custom-app-definitions';
 import type {
   AppUpdatePolicy,
   AutoUpdateHistory,
@@ -255,6 +256,11 @@ export interface UserTenantPair {
 }
 
 export interface DatabaseAdapter {
+  customAppDefinitions: {
+    list(userId: string, tenantId: string, limit: number, offset: number): Promise<SavedCustomAppDefinition[]>;
+    save(userId: string, tenantId: string, definition: CustomAppDefinition, id?: string): Promise<SavedCustomAppDefinition | null>;
+    delete(userId: string, tenantId: string, id: string): Promise<boolean>;
+  };
   jobs: {
     /**
      * Get jobs by status
@@ -265,6 +271,9 @@ export interface DatabaseAdapter {
      * Get a job by ID
      */
     getById(id: string): Promise<PackagingJob | null>;
+
+    /** Most recently completed, unarchived deployment within an exact owner and tenant. */
+    getLatestDeployed(userId: string, tenantId: string, wingetId: string, intuneAppId?: string): Promise<PackagingJob | null>;
 
     /**
      * Get jobs by user ID

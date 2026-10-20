@@ -16,6 +16,7 @@ export async function GET(request: NextRequest) {
 
     const { searchParams } = new URL(request.url);
     const wingetId = searchParams.get('wingetId');
+    const intuneAppId = searchParams.get('intuneAppId');
 
     if (!wingetId) {
       return NextResponse.json(
@@ -24,43 +25,48 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // MSP tenant resolution requires Supabase; fall back to the token's own
-    // tenant in Supabase-less SQLite installs (matches the pattern in
-    // unmanaged-apps/route.ts). The package_config lookup below goes through
-    // the db abstraction, which already supports both SQLite and Supabase, so
-    // there is no need for a separate Supabase-less return path here.
-    let tenantId = user.tenantId;
     const supabase = getServerClientOrNull();
-    if (supabase) {
-      const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
+    const mspTenantId = request.headers.get('X-MSP-Tenant-Id');
 
-      const tenantResolution = await resolveTargetTenantId({
-        supabase,
-        userId: user.userId,
-        tokenTenantId: user.tenantId,
-        requestedTenantId: mspTenantId,
+    if (!supabase) {
+      const job = await getDatabase().jobs.getLatestDeployed(
+        user.userId, user.tenantId, wingetId, intuneAppId ?? undefined
+      );
+      return NextResponse.json({
+        config: job?.package_config ?? null,
+        deployedAt: job?.completed_at ?? null,
+        intuneAppId: job?.intune_app_id ?? null,
       });
+    }
 
-      if (tenantResolution.errorResponse) {
-        return tenantResolution.errorResponse;
-      }
+    const tenantResolution = await resolveTargetTenantId({
+      supabase,
+      userId: user.userId,
+      tokenTenantId: user.tenantId,
+      requestedTenantId: mspTenantId,
+    });
 
-      tenantId = tenantResolution.tenantId;
+    if (tenantResolution.errorResponse) {
+      return tenantResolution.errorResponse;
     }
 
     // Get the most recent successfully deployed job's package_config
-    const db = getDatabase();
-    const userJobs = await db.jobs.getByUserId(user.userId, 500);
-    const deployedJob = userJobs
-      .filter(
-        (job) =>
-          job.tenant_id === tenantId &&
-          job.winget_id === wingetId &&
-          job.status === 'deployed'
-      )
-      .sort((a, b) => (b.completed_at || '').localeCompare(a.completed_at || ''))[0];
+    let query = supabase
+      .from('packaging_jobs')
+      .select('package_config, completed_at, intune_app_id')
+      .eq('user_id', user.userId)
+      .eq('tenant_id', tenantResolution.tenantId)
+      .eq('winget_id', wingetId)
+      .eq('status', 'deployed');
+    if (intuneAppId !== null) query = query.eq('intune_app_id', intuneAppId);
+    const { data, error } = await query
+      .order('completed_at', { ascending: false })
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (!deployedJob) {
+    if (error || !data) {
       return NextResponse.json({
         config: null,
         deployedAt: null,
@@ -69,9 +75,9 @@ export async function GET(request: NextRequest) {
     }
 
     return NextResponse.json({
-      config: deployedJob.package_config,
-      deployedAt: deployedJob.completed_at,
-      intuneAppId: deployedJob.intune_app_id || null,
+      config: data.package_config,
+      deployedAt: data.completed_at,
+      intuneAppId: data.intune_app_id || null,
     });
   } catch {
     return NextResponse.json(

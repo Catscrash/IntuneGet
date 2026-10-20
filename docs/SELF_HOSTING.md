@@ -185,7 +185,9 @@ Optional catalog snapshot overrides (sensible defaults, normally unset):
 > appear as not QA tested until a newer snapshot is downloaded.
 >
 > Note: app update policies and their auto-update history are stored locally in
-> SQLite. Other Supabase-backed surfaces (dashboard history, notifications,
+> SQLite. Manual package links and app claims also stay in SQLite and are
+> reflected when refreshing unmanaged apps for the signed in tenant.
+> Other Supabase-backed surfaces (dashboard history, notifications,
 > automatic update triggering, and MSP features) still require Supabase; the
 > catalog and update policies run Supabase-less.
 
@@ -542,3 +544,7 @@ docker-compose up -d
 
 - GitHub Issues: [github.com/ugurkocde/IntuneGet/issues](https://github.com/ugurkocde/IntuneGet/issues)
 - Documentation: [github.com/ugurkocde/IntuneGet/docs](https://github.com/ugurkocde/IntuneGet/tree/main/docs)
+
+## Saved custom apps
+
+SQLite installations can save reusable custom app definitions and use **Deploy new version** in the custom app form. Definitions stay in the configured SQLite database and are scoped to the signed in account and tenant. New versions still require a fresh installer URL, version and optional hash. See [Custom apps](CUSTOM_APPS.md).

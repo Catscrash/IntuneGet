@@ -146,6 +146,7 @@ export async function GET(request: NextRequest) {
       policyMap.set(`${policy.winget_id}:${policy.tenant_id}`, {
         id: policy.id,
         policy_type: policy.policy_type,
+        auto_update_scope: policy.auto_update_scope,
         is_enabled: policy.is_enabled,
         pinned_version: policy.pinned_version,
         last_auto_update_at: policy.last_auto_update_at,
