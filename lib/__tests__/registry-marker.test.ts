@@ -303,6 +303,27 @@ describe('reconcileManagedMarkerDetectionRules', () => {
     });
   });
 
+  it('keeps the signed greaterThanOrEqual comparison for a curated package', () => {
+    const [rule] = reconcileManagedMarkerDetectionRules({
+      detectionRules: [
+        {
+          type: 'registry',
+          keyPath: 'HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneGet\\Apps\\IntuneGet_Curated_Chrome',
+          valueName: 'Version',
+          check32BitOn64System: false,
+          detectionType: 'version',
+          operator: 'equal',
+          detectionValue: '155.0.8059.80',
+        },
+      ],
+      wingetId: 'IntuneGet.Curated.Chrome',
+      version: '155.0.8059.85',
+      installScope: 'machine',
+    });
+
+    expect(rule).toMatchObject({ operator: 'greaterThanOrEqual', detectionValue: '155.0.8059.85' });
+  });
+
   it('preserves a manually authored value under the marker key', () => {
     const customRule = {
       type: 'registry' as const,

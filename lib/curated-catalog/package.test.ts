@@ -32,6 +32,19 @@ describe('curated packager compatibility', () => {
   });
 });
 
+describe('curated detection', () => {
+  // Signed releases bind the comparison the verification VM tested. Winget
+  // packages detect only their own version; curated apps must not, or the
+  // signature no longer matches and every release is withheld.
+  it('detects the signed version or newer, in both the cart item and its profile', () => {
+    const app = CURATED_APPS.find(candidate => candidate.id === 'chrome')!;
+    const item = buildCuratedCartItem(app, releaseFixture(app));
+    expect(item.detectionRules).toEqual([expect.objectContaining({ type: 'registry', operator: 'greaterThanOrEqual' })]);
+    const profile = JSON.parse(normalizeQaWorkflowPackageInput(curatedWorkflowInput(item)).identity.canonicalJson);
+    expect(JSON.stringify(profile)).not.toContain('"operator":"equal"');
+  });
+});
+
 describe('curated registered uninstall identity', () => {
   it('binds Python customer and verification packages to the Burn uninstall profile', () => {
     const app = CURATED_APPS.find(app => app.id === 'python-314')!;

@@ -15,7 +15,7 @@ import type {
 } from '@/types/intune';
 import type { NormalizedInstaller, WingetInstallerType, WingetScope } from '@/types/winget';
 import { resolveInstallerFileName } from '@/lib/installer-filename';
-import { normalizeMarkerPath } from '@/lib/registry-marker';
+import { markerVersionOperator, normalizeMarkerPath } from '@/lib/registry-marker';
 import { psCommentContent, psDoubleQuotedContent } from '@/lib/powershell-encoding';
 
 /**
@@ -141,12 +141,13 @@ export function generateRegistryMarkerDetectionRules(
       valueName: 'Version',
       check32BitOn64System: false,
       detectionType: useVersionComparison ? 'version' : 'string',
-      // Equal for both comparison types, never greaterThanOrEqual: the marker
-      // records the version this package installed, so each app object must
-      // detect only itself. With >= the previous app keeps detecting as
-      // installed after an update to a newer version, and Intune reports both
-      // versions present on the device.
-      operator: 'equal',
+      // Equal for Winget packages: the marker records the version this
+      // package installed, so each app object must detect only itself. With
+      // >= the previous app keeps detecting as installed after an update to a
+      // newer version, and Intune reports both versions present on the
+      // device. Curated releases keep their signed >=, see
+      // markerVersionOperator().
+      operator: markerVersionOperator(wingetId, useVersionComparison),
       detectionValue: version,
     } as RegistryDetectionRule,
   ];

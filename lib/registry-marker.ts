@@ -23,6 +23,24 @@ export function sanitizeWingetIdForRegistry(wingetId: string): string {
 }
 
 /**
+ * The comparison a generated marker rule uses. Winget packages detect only
+ * the version they installed, so after an update the previous app object
+ * stops reporting as installed. Curated releases are signed with the
+ * greaterThanOrEqual rule the verification VM tested: their execution profile
+ * hash covers it, and several curated apps update themselves past the
+ * installed version. The prefix mirrors isCuratedPackageId(), whose module
+ * pulls node:crypto into the browser bundle.
+ */
+export function markerVersionOperator(
+  wingetId: string,
+  useVersionComparison: boolean
+): RegistryDetectionRule['operator'] {
+  return useVersionComparison && wingetId.toLowerCase().startsWith('intuneget.curated.')
+    ? 'greaterThanOrEqual'
+    : 'equal';
+}
+
+/**
  * Recover the custom marker root from an older saved catalog profile that
  * retained its generated detection rule but lost psadtConfig.registryMarkerPath.
  *
@@ -229,11 +247,10 @@ export function reconcileManagedMarkerDetectionRules({
       check32BitOn64System: false,
       detectionType: useVersionComparison ? 'version' : 'string',
       // Must stay in step with generateRegistryMarkerDetectionRules() in
-      // lib/detection-rules.ts: equal for both comparison types, never
-      // greaterThanOrEqual. This function rewrites managed marker rules
-      // wherever they pass through, so a >= here would quietly undo that
-      // rule's own-version-only detection.
-      operator: 'equal',
+      // lib/detection-rules.ts. This function rewrites managed marker rules
+      // wherever they pass through, so a different operator here would
+      // quietly undo the generated one.
+      operator: markerVersionOperator(wingetId, useVersionComparison),
       detectionValue: version,
     } satisfies RegistryDetectionRule;
   });
