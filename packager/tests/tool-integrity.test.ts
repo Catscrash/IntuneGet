@@ -26,6 +26,21 @@ describe('local packaging tool integrity', () => {
     await expect(processor.ensureToolsAvailable()).rejects.toThrow(/hash|integrity/i);
     expect(powershell).not.toHaveBeenCalled();
   });
+  it('downloads missing tools through the proxy-aware client instead of PowerShell', async () => {
+    const {fetch,processor} = await fixture();
+    const manifest = JSON.parse(await readFile(join(process.cwd(),'packager/scripts/tool-manifest.json'),'utf8'));
+    const powershell = vi.fn(async () => '');
+    Reflect.set(processor,'runPowerShell',powershell);
+    await expect(processor.ensureToolsAvailable()).rejects.toThrow(/hash|integrity/i);
+    expect(fetch).toHaveBeenCalledWith(manifest.intuneWinAppUtil.url);
+    expect(powershell).not.toHaveBeenCalled();
+  });
+  it('keeps the leading PowerShell error message when the process output is long', async () => {
+    const {processor} = await fixture();
+    const output = 'Die Verbindung wurde geschlossen.' + '\n' + '+ '.repeat(600) + 'trailing';
+    const run = Reflect.get(processor,'runProcess').call(processor,process.execPath,['-e',`process.stderr.write(${JSON.stringify(output)}); process.exit(1)`]);
+    await expect(run).rejects.toThrow(/Die Verbindung wurde geschlossen\..*trailing/s);
+  });
   it('does not write a downloaded buffer that fails the expected hash', async () => {
     const {tools,processor} = await fixture();
     const dest = join(tools,'tool.fixture');

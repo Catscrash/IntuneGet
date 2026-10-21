@@ -227,13 +227,15 @@ export class JobProcessor {
     await fs.promises.mkdir(toolsDir, {recursive:true});
     const exe = path.join(toolsDir,manifest.intuneWinAppUtil.fileName);
     if (fs.existsSync(exe)) await this.verifyToolFile(exe,manifest.intuneWinAppUtil.sha256);
-    const script = path.join(__dirname,'..','scripts','download-tools.ps1');
-    if (fs.existsSync(script)) await this.runPowerShell(script,['-ToolsDir',toolsDir]);
-    else await this.downloadToolsInline(toolsDir);
+    await this.downloadToolsInline(toolsDir);
     await this.verifyToolFile(exe,manifest.intuneWinAppUtil.sha256);
   }
 
-  /** The inline download path uses the same shipped toolkit verifier. */
+  /**
+   * Downloads go through the operator's HTTPS_PROXY routing, which Windows
+   * PowerShell's Invoke-WebRequest ignores; PowerShell only verifies and
+   * extracts the toolkit with the shipped verifier.
+   */
   private async downloadToolsInline(toolsDir: string): Promise<void> {
     const manifest = this.toolManifest();
     const verifier = path.join(__dirname,'..','scripts','tool-integrity.ps1');
@@ -2697,7 +2699,10 @@ ${capturedIdentityValues}
         if (code === 0) {
           resolve(stdout);
         } else {
-          const detail = (stderr.trim() || stdout.trim()).slice(-500);
+          // PowerShell leads with the error message and trails with its
+          // position and category, so keep both ends of long output.
+          const output = stderr.trim() || stdout.trim();
+          const detail = output.length > 500 ? output.slice(0, 250) + ' … ' + output.slice(-250) : output;
           reject(new Error(`Process exited with code ${code}${detail ? `: ${detail}` : ''}`));
         }
       });
