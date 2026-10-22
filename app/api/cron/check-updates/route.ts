@@ -208,7 +208,8 @@ async function processAutoUpdates(
       installerInfo.currentVersion = update.current_version;
       // Tenant-wide, like the manual trigger: the app object to supersede and
       // to take assignments from is the newest one in the tenant, whichever
-      // administrator deployed it.
+      // administrator deployed it. When the app has a Company Portal and an
+      // Update Only app, triggerTrackedAutoUpdate picks each track's own.
       const { data: latestUploadForCron } = await supabase
         .from('upload_history')
         .select('intune_app_id')
@@ -221,13 +222,18 @@ async function processAutoUpdates(
         latestUploadForCron?.intune_app_id || update.intune_app_id;
 
       // Trigger the auto-update
-      const triggerResult = await autoUpdateTrigger.triggerAutoUpdate(
+      const triggerResult = await autoUpdateTrigger.triggerTrackedAutoUpdate(
         policy,
         installerInfo
       );
 
       if (triggerResult.success) {
         result.triggered++;
+        if (triggerResult.secondaryTrackError) {
+          result.errors.push(
+            `Update Only app of ${update.winget_id} was not updated: ${triggerResult.secondaryTrackError}`
+          );
+        }
       } else if (triggerResult.skipped) {
         result.skipped++;
         // A failed rate limit read must not look like an ordinary skip, or a

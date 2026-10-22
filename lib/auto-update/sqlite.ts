@@ -238,6 +238,7 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
           assignedGroups: config.assignedGroups,
           requirementRules: config.requirementRules,
           relationships: config.relationships,
+          deploymentTrack: classifyDeploymentTrack(config),
           psadtConfig: config.psadtConfig,
           nestedInstallerType: updateInfo.nestedInstallerType,
           nestedInstallerPath: updateInfo.nestedInstallerPath,
@@ -292,6 +293,70 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
   }
+}
+
+/**
+ * triggerSqliteAutoUpdate for every deployment track of the app, primary
+ * first. See AutoUpdateTrigger.triggerTrackedAutoUpdate for the rules: each
+ * track updates from its own last deployment and Intune app, and the Update
+ * Only app follows only once the Company Portal app was queued.
+ */
+export async function triggerSqliteTrackedAutoUpdate(
+  db: DatabaseAdapter,
+  policy: AppUpdatePolicy,
+  updateInfo: SqliteUpdateInfo,
+  options?: { skipRateLimits?: boolean; skipPriorDeploymentCheck?: boolean; bypassUpdateScope?: boolean }
+): Promise<SqliteTriggerResult & { secondaryTrackError?: string }> {
+  const deployments = await findTrackDeployments(db, policy.tenant_id, updateInfo.wingetId);
+  const primary = deployments.find((deployment) => deployment.track === 'primary');
+  const updateOnly = deployments.find((deployment) => deployment.track === 'update_only');
+  if (!primary || !updateOnly) {
+    return triggerSqliteAutoUpdate(db, policy, updateInfo, options);
+  }
+
+  // Restore a policy config that was saved from the update-only deployment.
+  if (classifyDeploymentTrack(policy.deployment_config) === 'update_only' && primary.job) {
+    const deploymentConfig = assembleDeploymentConfigFromJob(primary.job, updateInfo.latestVersion);
+    policy = { ...policy, deployment_config: deploymentConfig };
+    await db.updatePolicies
+      .update(policy.id, policy.user_id, { deployment_config: deploymentConfig })
+      .catch(() => null);
+  }
+
+  const isOutdated = (deployment: TrackDeployment) =>
+    compareVersions(deployment.uploadHistory.version, updateInfo.latestVersion) < 0;
+  const trackUpdateInfo = (deployment: TrackDeployment): SqliteUpdateInfo => ({
+    ...updateInfo,
+    currentVersion: deployment.uploadHistory.version,
+    currentIntuneAppId: deployment.uploadHistory.intune_app_id,
+  });
+
+  let result: SqliteTriggerResult | null = null;
+  if (isOutdated(primary)) {
+    result = await triggerSqliteAutoUpdate(db, policy, trackUpdateInfo(primary), options);
+    if (!result.success) return result;
+  }
+  if (!isOutdated(updateOnly)) {
+    return result ?? { success: true };
+  }
+  if (!updateOnly.job) {
+    const secondaryTrackError = 'The last Update Only deployment has no saved configuration';
+    return result ? { ...result, secondaryTrackError } : { success: false, error: secondaryTrackError };
+  }
+
+  const secondary = await triggerSqliteAutoUpdate(
+    db,
+    { ...policy, deployment_config: assembleDeploymentConfigFromJob(updateOnly.job, updateInfo.latestVersion) },
+    trackUpdateInfo(updateOnly),
+    { ...options, skipRateLimits: true, skipPriorDeploymentCheck: true }
+  );
+  if (!result) return secondary;
+  return {
+    ...result,
+    secondaryTrackError: secondary.success
+      ? undefined
+      : secondary.error || secondary.skipReason || 'The Update Only app was not updated',
+  };
 }
 
 /**
@@ -403,7 +468,7 @@ export async function runSqliteUpdateCheck(
       continue;
     }
 
-    const result = await triggerSqliteAutoUpdate(db, policy, {
+    const result = await triggerSqliteTrackedAutoUpdate(db, policy, {
       sourceType: resolution.info.sourceType,
       curatedReleaseId: resolution.info.curatedReleaseId,
       wingetId: policy.winget_id,
@@ -422,8 +487,13 @@ export async function runSqliteUpdateCheck(
       installerSuccessCodes: resolution.info.installerSuccessCodes,
     });
 
-    if (result.success) triggered += 1;
-    else if (result.skipped) {
+    if (result.success) {
+      triggered += 1;
+      if (result.secondaryTrackError) {
+        errors += 1;
+        console.warn(`[auto-update] Update Only app of ${policy.winget_id} was not updated for tenant ${policy.tenant_id}: ${result.secondaryTrackError}`);
+      }
+    } else if (result.skipped) {
       skipped += 1;
       if (result.code) console.warn(`[auto-update] ${policy.winget_id} skipped for tenant ${policy.tenant_id}: ${result.skipReason}`);
     } else errors += 1;
@@ -432,3 +502,9 @@ export async function runSqliteUpdateCheck(
   return { available, triggered, skipped, errors };
 }
 import { customDetectionUpdateHold } from '@/lib/custom-detection';
+import { assembleDeploymentConfigFromJob } from '@/lib/update-policies/build-deployment-config';
+import {
+  classifyDeploymentTrack,
+  findTrackDeployments,
+  type TrackDeployment,
+} from '@/lib/update-policies/deployment-tracks';

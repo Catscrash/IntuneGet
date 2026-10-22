@@ -65,6 +65,28 @@ vi.mock('@/lib/catalog', () => ({
 vi.mock('@/lib/auto-update/trigger', () => ({
   AutoUpdateTrigger: class {
     triggerAutoUpdate = triggerAutoUpdateMock;
+    // A single deployment track: the real method then forwards to
+    // triggerAutoUpdate and reports its job.
+    triggerTrackedAutoUpdate = async (
+      policy: AppUpdatePolicy,
+      updateInfo: { currentIntuneAppId?: string },
+      options: unknown
+    ) => {
+      const result = await triggerAutoUpdateMock(policy, updateInfo, options);
+      return {
+        ...result,
+        jobs: result?.success && result.packagingJobId
+          ? [{
+              track: 'primary',
+              packagingJobId: result.packagingJobId,
+              historyId: result.historyId,
+              packageProfileSha256: result.packageProfileSha256,
+              deploymentConfig: policy.deployment_config,
+              sourceIntuneAppId: updateInfo.currentIntuneAppId,
+            }]
+          : [],
+      };
+    };
   },
   getLatestInstallerInfo: getLatestInstallerInfoMock,
   // The Supabase-less path reuses these so both paths write the same

@@ -105,4 +105,42 @@ describe('buildDeploymentConfigForApp', () => {
 
     expect(result.status).toBe('orphaned_job');
   });
+
+  it('builds from the Company Portal deployment even when the Update Only app was deployed after it', async () => {
+    getByTenantIdMock.mockResolvedValue([
+      { id: 'history-update', winget_id: 'Git.Git', packaging_job_id: 'job-update', intune_app_id: 'app-update' },
+      { id: 'history-portal', winget_id: 'Git.Git', packaging_job_id: 'job-portal', intune_app_id: 'app-portal' },
+    ]);
+    const jobs: Record<string, unknown> = {
+      'job-update': {
+        display_name: 'Git (Update)',
+        package_config: {
+          assignments: [{ type: 'allDevices', intent: 'updateOnly' }],
+          requirementRules: [REQUIREMENT_RULE],
+        },
+      },
+      'job-portal': {
+        display_name: 'Git',
+        package_config: { assignments: [{ type: 'allUsers', intent: 'available' }] },
+      },
+    };
+    getJobByIdMock.mockImplementation(async (id: string) => jobs[id] ?? null);
+
+    const primary = await buildDeploymentConfigForApp(null, { tenantId: 't', wingetId: 'Git.Git', latestVersion: '2.0.0' });
+    const updateOnly = await buildDeploymentConfigForApp(null, {
+      tenantId: 't', wingetId: 'Git.Git', latestVersion: '2.0.0', track: 'update_only',
+    });
+
+    expect(primary).toMatchObject({
+      status: 'ok',
+      originalUploadHistoryId: 'history-portal',
+      deploymentConfig: { displayName: 'Git', assignments: [{ type: 'allUsers', intent: 'available' }] },
+    });
+    expect(primary.status === 'ok' && primary.deploymentConfig.requirementRules).toBeFalsy();
+    expect(updateOnly).toMatchObject({
+      status: 'ok',
+      originalUploadHistoryId: 'history-update',
+      deploymentConfig: { displayName: 'Git (Update)', requirementRules: [REQUIREMENT_RULE] },
+    });
+  });
 });

@@ -218,6 +218,9 @@ export interface TriggerUpdateResponse {
   results: {
     winget_id: string;
     tenant_id: string;
+    // Set when the app has a Company Portal and an Update Only app; each
+    // track then reports its own result.
+    track?: 'primary' | 'update_only';
     success: boolean;
     skipped?: boolean;
     code?:

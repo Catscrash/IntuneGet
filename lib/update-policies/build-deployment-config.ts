@@ -10,6 +10,11 @@
 import { createServerClient } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import type { DatabaseAdapter } from '@/lib/db/types';
+import {
+  findTrackDeployments,
+  selectRepresentativeDeployment,
+  type DeploymentTrack,
+} from '@/lib/update-policies/deployment-tracks';
 import { getCatalogSource } from '@/lib/catalog';
 import { isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
 import { getApprovedCuratedRelease } from '@/lib/curated-catalog/server';
@@ -373,7 +378,7 @@ export type BuildDeploymentConfigResult =
  * Assemble a deployment config from a stored packaging job. Shared by the
  * Supabase and adapter-backed builders so both produce identical configs.
  */
-function assembleDeploymentConfigFromJob(job: {
+export function assembleDeploymentConfigFromJob(job: {
   display_name: string;
   publisher: string | null;
   architecture: string | null;
@@ -425,6 +430,39 @@ function assembleDeploymentConfigFromJob(job: {
 }
 
 /**
+ * Config from the newest deployment of a track, or null when the app has no
+ * prior deployment (of that track). Without a track the primary deployment
+ * wins over a newer update-only one: the update-only app carries a Required
+ * assignment and requirement rules that must never leak into the app users
+ * install from Company Portal.
+ */
+async function buildConfigFromPriorDeployment(
+  db: DatabaseAdapter,
+  tenantId: string,
+  wingetId: string,
+  latestVersion: string,
+  track: DeploymentTrack | undefined
+): Promise<BuildDeploymentConfigResult | null> {
+  const deployments = await findTrackDeployments(db, tenantId, wingetId);
+  const deployment = track
+    ? deployments.find((candidate) => candidate.track === track) ?? null
+    : selectRepresentativeDeployment(deployments);
+
+  if (!deployment?.uploadHistory.packaging_job_id) {
+    return null;
+  }
+  if (!deployment.job) {
+    // Prior deployment exists but its packaging job is gone.
+    return { status: 'orphaned_job' };
+  }
+  return {
+    status: 'ok',
+    deploymentConfig: assembleDeploymentConfigFromJob(deployment.job, latestVersion),
+    originalUploadHistoryId: deployment.uploadHistory.id,
+  };
+}
+
+/**
  * Orchestrator: build a deployment config for an app, replicating the
  * trigger route's "no policy yet" branch.
  */
@@ -438,6 +476,8 @@ export async function buildDeploymentConfigForApp(
     tenantId: string;
     wingetId: string;
     latestVersion: string;
+    /** Defaults to the primary track, or the only track there is. */
+    track?: DeploymentTrack;
   }
 ): Promise<BuildDeploymentConfigResult> {
   const { tenantId, wingetId, latestVersion } = args;
@@ -454,22 +494,9 @@ export async function buildDeploymentConfigForApp(
   // nothing and carries no requirement rules - so a second administrator's
   // update silently stripped the app's configuration. The caller has already
   // proved this user may act on the tenant.
-  const db = getDatabase();
-  const tenantHistory = await db.uploadHistory.getByTenantId(tenantId);
-  const uploadHistory = tenantHistory.find((row) => row.winget_id === wingetId) || null;
-
-  if (uploadHistory?.packaging_job_id) {
-    // Has prior deployment: extract config from packaging job
-    const packagingJob = await db.jobs.getById(uploadHistory.packaging_job_id);
-
-    if (!packagingJob) {
-      // Prior deployment exists but its packaging job is gone.
-      return { status: 'orphaned_job' };
-    }
-
-    const deploymentConfig = assembleDeploymentConfigFromJob(packagingJob, latestVersion);
-
-    return { status: 'ok', deploymentConfig, originalUploadHistoryId: uploadHistory.id };
+  const prior = await buildConfigFromPriorDeployment(getDatabase(), tenantId, wingetId, latestVersion, args.track);
+  if (prior) {
+    return prior;
   }
 
   // No prior deployment: build config from curated catalog data
@@ -498,25 +525,17 @@ export async function buildDeploymentConfigFromAdapter(
     tenantId: string;
     wingetId: string;
     latestVersion: string;
+    /** Defaults to the primary track, or the only track there is. */
+    track?: DeploymentTrack;
   }
 ): Promise<BuildDeploymentConfigResult> {
   const { tenantId, wingetId, latestVersion } = args;
 
   // Tenant-wide, like buildDeploymentConfigForApp: the previous deployment's
   // configuration belongs to the app, not to whoever deployed it.
-  const tenantHistory = await db.uploadHistory.getByTenantId(tenantId);
-  const uploadHistory = tenantHistory.find((row) => row.winget_id === wingetId) || null;
-
-  if (uploadHistory?.packaging_job_id) {
-    const packagingJob = await db.jobs.getById(uploadHistory.packaging_job_id);
-    if (!packagingJob) {
-      return { status: 'orphaned_job' };
-    }
-    return {
-      status: 'ok',
-      deploymentConfig: assembleDeploymentConfigFromJob(packagingJob, latestVersion),
-      originalUploadHistoryId: uploadHistory.id,
-    };
+  const prior = await buildConfigFromPriorDeployment(db, tenantId, wingetId, latestVersion, args.track);
+  if (prior) {
+    return prior;
   }
 
   const defaultConfig = await buildDefaultDeploymentConfig(

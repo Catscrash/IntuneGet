@@ -42,6 +42,14 @@ import {
   normalizeManifestInstallers,
 } from '@/lib/manifest-api';
 import { upgradeLegacyPackageDefaults } from '@/lib/update-policies/upgrade-legacy-package-defaults';
+import { assembleDeploymentConfigFromJob } from '@/lib/update-policies/build-deployment-config';
+import {
+  classifyDeploymentTrack,
+  findTrackDeployments,
+  type DeploymentTrack,
+  type TrackDeployment,
+} from '@/lib/update-policies/deployment-tracks';
+import { compareVersions } from '@/lib/version-compare';
 import {
   applyApplicationPackagingAdapter,
   resolveApplicationInstallScope,
@@ -50,6 +58,19 @@ import type { NormalizedInstaller, WingetInstaller, WingetScope } from '@/types/
 import { DEFAULT_PSADT_CONFIG, type DetectionRule } from '@/types/psadt';
 import { QA_PRIORITY_DEMAND } from '@/lib/qa/constants';
 import { findPendingApprovalBlocks } from '@/lib/intune-approval-guard';
+
+interface TriggerOptions {
+  skipRateLimits?: boolean;
+  skipPriorDeploymentCheck?: boolean;
+  bypassUpdateScope?: boolean;
+  /**
+   * The policy carries the config of a second track built from that track's
+   * own deployment. Nothing is backfilled into it from other deployments and
+   * nothing is written back to the policy, whose saved config belongs to the
+   * primary track.
+   */
+  secondaryTrack?: boolean;
+}
 
 interface TriggerResult {
   success: boolean;
@@ -71,6 +92,24 @@ interface TriggerResult {
     | 'UPDATE_SCOPE_HELD'
     | 'RATE_LIMIT_UNVERIFIED'
     | 'PSADT_BACKFILL_UNAVAILABLE';
+}
+
+/** One packaging job queued by triggerTrackedAutoUpdate. */
+export interface TrackJob {
+  track: DeploymentTrack;
+  packagingJobId: string;
+  historyId?: string;
+  packageProfileSha256?: string;
+  /** The effective config the job was created from, for workflow dispatch. */
+  deploymentConfig: DeploymentConfig;
+  sourceIntuneAppId?: string;
+}
+
+export interface TrackedTriggerResult extends TriggerResult {
+  /** Every job queued, primary track first. */
+  jobs: TrackJob[];
+  /** Why the update-only track was not queued while the primary track was. */
+  secondaryTrackError?: string;
 }
 
 export interface UpdateInfo {
@@ -225,7 +264,7 @@ export class AutoUpdateTrigger {
   async triggerAutoUpdate(
     policy: AppUpdatePolicy,
     updateInfo: UpdateInfo,
-    options?: { skipRateLimits?: boolean; skipPriorDeploymentCheck?: boolean; bypassUpdateScope?: boolean }
+    options?: TriggerOptions
   ): Promise<TriggerResult> {
     try {
       // Safety check 1: Verify policy allows auto-update
@@ -296,7 +335,7 @@ export class AutoUpdateTrigger {
 
       // Backfill PSADT settings from the original deployment for policies
       // created before psadtConfig was stored on deployment_config
-      if (!(await this.ensurePsadtConfig(policy))) {
+      if (!options?.secondaryTrack && !(await this.ensurePsadtConfig(policy))) {
         return {
           success: false,
           skipped: true,
@@ -313,7 +352,7 @@ export class AutoUpdateTrigger {
       // {PRODUCT_CODE} token and a guessed installation folder). Upgrade only
       // those exact legacy shapes before QA so the same corrected profile is
       // later used by both GitHub Actions and the self-hosted packager.
-      await this.ensureCurrentPackageDefaults(policy, updateInfo);
+      await this.ensureCurrentPackageDefaults(policy, updateInfo, !options?.secondaryTrack);
 
       const storedDeploymentConfig = policy.deployment_config as DeploymentConfig;
       const effectiveInstallScope = resolveApplicationInstallScope(
@@ -471,6 +510,127 @@ export class AutoUpdateTrigger {
         error: errorMessage,
       };
     }
+  }
+
+  /**
+   * Trigger an update for every deployment track of the app. With a single
+   * track this is triggerAutoUpdate against that track's Intune app. With a
+   * Company Portal app and an Update Only app, the primary track is queued
+   * first and the update-only track follows from its own last deployment, so
+   * each new app supersedes and takes the assignments of its own predecessor.
+   * The update-only track is only queued once the primary track was, so the
+   * two never drift apart because one of them was held.
+   */
+  async triggerTrackedAutoUpdate(
+    policy: AppUpdatePolicy,
+    updateInfo: UpdateInfo,
+    options?: Omit<TriggerOptions, 'secondaryTrack'>
+  ): Promise<TrackedTriggerResult> {
+    let deployments: TrackDeployment[] = [];
+    try {
+      deployments = await findTrackDeployments(supabaseDb, policy.tenant_id, updateInfo.wingetId);
+    } catch {
+      return { success: false, error: 'Could not read the deployment history of this app', jobs: [] };
+    }
+
+    const primary = deployments.find((deployment) => deployment.track === 'primary');
+    const updateOnly = deployments.find((deployment) => deployment.track === 'update_only');
+
+    if (!primary || !updateOnly) {
+      const result = await this.triggerAutoUpdate(policy, updateInfo, options);
+      return { ...result, jobs: this.toTrackJobs(result, deployments[0]?.track ?? 'primary', policy, updateInfo) };
+    }
+
+    // Policies saved before tracks were told apart can hold the update-only
+    // app's config, because it was the last deployment. Restore the primary
+    // track's config before it is used to rebuild the Company Portal app.
+    if (classifyDeploymentTrack(policy.deployment_config) === 'update_only' && primary.job) {
+      policy.deployment_config = assembleDeploymentConfigFromJob(primary.job, updateInfo.latestVersion);
+      const { error } = await this.supabase
+        .from('app_update_policies')
+        .update({ deployment_config: policy.deployment_config, updated_at: new Date().toISOString() })
+        .eq('id', policy.id);
+      if (error) {
+        console.warn(`Could not save the restored primary deployment config of policy ${policy.id}: ${error.message}`);
+      }
+    }
+
+    const isOutdated = (deployment: TrackDeployment) =>
+      compareVersions(deployment.uploadHistory.version, updateInfo.latestVersion) < 0;
+    const trackUpdateInfo = (deployment: TrackDeployment): UpdateInfo => ({
+      ...updateInfo,
+      currentVersion: deployment.uploadHistory.version,
+      currentIntuneAppId: deployment.uploadHistory.intune_app_id,
+    });
+
+    const jobs: TrackJob[] = [];
+    let result: TriggerResult = { success: true };
+
+    // A primary track that is already current (an earlier run queued it and
+    // only the update-only track failed) is not deployed a second time.
+    if (isOutdated(primary)) {
+      result = await this.triggerAutoUpdate(policy, trackUpdateInfo(primary), options);
+      if (!result.success) {
+        return { ...result, jobs };
+      }
+      jobs.push(...this.toTrackJobs(result, 'primary', policy, trackUpdateInfo(primary)));
+    }
+
+    if (!isOutdated(updateOnly)) {
+      return { ...result, jobs };
+    }
+    if (!updateOnly.job) {
+      return { ...result, jobs, secondaryTrackError: 'The last Update Only deployment has no saved configuration' };
+    }
+
+    // The rate limit was checked for this update already; the second app is
+    // part of the same update and must not wait out the policy cooldown.
+    const secondaryPolicy: AppUpdatePolicy = {
+      ...policy,
+      deployment_config: assembleDeploymentConfigFromJob(updateOnly.job, updateInfo.latestVersion),
+    };
+    const secondary = await this.triggerAutoUpdate(secondaryPolicy, trackUpdateInfo(updateOnly), {
+      ...options,
+      skipRateLimits: true,
+      skipPriorDeploymentCheck: true,
+      secondaryTrack: true,
+    });
+    jobs.push(...this.toTrackJobs(secondary, 'update_only', secondaryPolicy, trackUpdateInfo(updateOnly)));
+
+    if (jobs.length === 0) {
+      // Only the update-only track was outdated, so its result is the result.
+      return { ...secondary, jobs };
+    }
+    return {
+      ...result,
+      packagingJobId: jobs[0].packagingJobId,
+      historyId: jobs[0].historyId,
+      packageProfileSha256: jobs[0].packageProfileSha256,
+      jobs,
+      secondaryTrackError: secondary.success
+        ? undefined
+        : secondary.error || secondary.skipReason || 'The Update Only app was not updated',
+    };
+  }
+
+  private toTrackJobs(
+    result: TriggerResult,
+    track: DeploymentTrack,
+    policy: AppUpdatePolicy,
+    updateInfo: UpdateInfo
+  ): TrackJob[] {
+    if (!result.success || !result.packagingJobId || !policy.deployment_config) {
+      return [];
+    }
+    return [{
+      track,
+      packagingJobId: result.packagingJobId,
+      historyId: result.historyId,
+      packageProfileSha256: result.packageProfileSha256,
+      // triggerAutoUpdate leaves the effective config of this attempt here.
+      deploymentConfig: policy.deployment_config,
+      sourceIntuneAppId: updateInfo.currentIntuneAppId,
+    }];
   }
 
   /**
@@ -799,7 +959,8 @@ export class AutoUpdateTrigger {
 
   private async ensureCurrentPackageDefaults(
     policy: AppUpdatePolicy,
-    updateInfo: UpdateInfo
+    updateInfo: UpdateInfo,
+    persist = true
   ): Promise<void> {
     const current = policy.deployment_config as DeploymentConfig | null;
     if (!current) return;
@@ -815,6 +976,10 @@ export class AutoUpdateTrigger {
         (current.installScope === 'user' ? 'user' : 'machine'),
     });
     if (!upgraded.changed) return;
+    if (!persist) {
+      policy.deployment_config = upgraded.config;
+      return;
+    }
 
     const { error } = await this.supabase
       .from('app_update_policies')
@@ -896,6 +1061,7 @@ export class AutoUpdateTrigger {
         // App relationships (dependencies/supersedence) from the original
         // deployment are read from package_config by the packager
         relationships: config.relationships,
+        deploymentTrack: classifyDeploymentTrack(config),
         // PSADT settings and nested installer info are read from
         // package_config by the local packager (job-processor.ts)
         psadtConfig: config.psadtConfig,

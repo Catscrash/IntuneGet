@@ -129,6 +129,8 @@ vi.mock('@/lib/auto-update/sqlite', () => ({ runSqliteUpdateCheck: vi.fn() }));
 vi.mock('@/lib/auto-update/trigger', () => ({
   AutoUpdateTrigger: class {
     triggerAutoUpdate = state.triggerAutoUpdate;
+    // A single deployment track forwards to triggerAutoUpdate.
+    triggerTrackedAutoUpdate = state.triggerAutoUpdate;
   },
   getLatestInstallerInfo: state.getLatestInstallerInfo,
 }));

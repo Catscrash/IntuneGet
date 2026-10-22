@@ -26,6 +26,12 @@ import { getFeatureFlags } from '@/lib/features';
 import { extractSilentSwitches } from '@/lib/msp/silent-switches';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
+import {
+  classifyDeploymentTrack,
+  findTrackDeployments,
+  type DeploymentTrack,
+} from '@/lib/update-policies/deployment-tracks';
+import { compareVersions } from '@/lib/version-compare';
 import type { WorkflowInputs } from '@/lib/github-actions';
 import { shouldSkipUpdate } from '@/types/update-policies';
 import { resolveAppDescriptionSuffix } from '@/types/user-settings';
@@ -333,151 +339,169 @@ export async function POST(request: NextRequest) {
         installerInfo.currentIntuneAppId =
           latestUpload?.intune_app_id || updateResult.intune_app_id;
 
-        // Trigger the update (creates packaging job + history record in DB)
+        // Trigger the update (creates packaging job + history record in DB),
+        // one job per deployment track: a Company Portal app and its Update
+        // Only companion are both rebuilt, each from its own last deployment.
         // Manual triggers skip rate limits since the user explicitly confirmed
-        const triggerResult = await autoUpdateTrigger.triggerAutoUpdate(
+        const triggerResult = await autoUpdateTrigger.triggerTrackedAutoUpdate(
           policy as AppUpdatePolicy,
           installerInfo,
           { skipRateLimits: true, skipPriorDeploymentCheck: true, bypassUpdateScope: true }
         );
 
-        if (triggerResult.success && triggerResult.packagingJobId) {
+        if (triggerResult.success && triggerResult.jobs.length > 0) {
           // Dispatch the GitHub Actions workflow to actually run the packaging
           const features = getFeatureFlags();
           const isLocalPackagerMode = features.localPackager;
+          const dispatchWorkflows = !isLocalPackagerMode && isGitHubActionsConfigured();
 
-          if (!isLocalPackagerMode && isGitHubActionsConfigured()) {
-            const appConfig = getAppConfig();
-            const baseUrl = appConfig.app.url || (process.env.VERCEL_URL
-              ? `https://${process.env.VERCEL_URL}`
-              : 'http://localhost:3000');
-            const callbackUrl = `${baseUrl}/api/package/callback`;
+          for (const trackJob of triggerResult.jobs) {
+            if (dispatchWorkflows) {
+              const appConfig = getAppConfig();
+              const baseUrl = appConfig.app.url || (process.env.VERCEL_URL
+                ? `https://${process.env.VERCEL_URL}`
+                : 'http://localhost:3000');
+              const callbackUrl = `${baseUrl}/api/package/callback`;
 
-            const deploymentConfig = policy.deployment_config as unknown as DeploymentConfig;
+              const deploymentConfig = trackJob.deploymentConfig;
 
-            // Global settings were read once before the loop; the stored
-            // policy value may be stale, so the current setting wins
-            const currentCarryOver = globalCarryOver;
+              // Global settings were read once before the loop; the stored
+              // policy value may be stale, so the current setting wins
+              const currentCarryOver = globalCarryOver;
 
-            const workflowInputs: WorkflowInputs = {
-              sourceType: installerInfo.sourceType,
-              curatedReleaseId: installerInfo.curatedReleaseId,
-              jobId: triggerResult.packagingJobId,
-              tenantId: req.tenant_id,
-              wingetId: req.winget_id,
-              displayName: deploymentConfig.displayName || installerInfo.displayName,
-              description: buildIntuneAppDescription({
-                description: deploymentConfig.description,
-                fallback: deploymentConfig.displayName,
+              const workflowInputs: WorkflowInputs = {
+                sourceType: installerInfo.sourceType,
+                curatedReleaseId: installerInfo.curatedReleaseId,
+                jobId: trackJob.packagingJobId,
+                tenantId: req.tenant_id,
                 wingetId: req.winget_id,
-                sourceText: appDescriptionSuffix,
-              }),
-              publisher: deploymentConfig.publisher || 'Unknown Publisher',
-              version: installerInfo.latestVersion,
-              architecture: deploymentConfig.architecture || 'x64',
-              installerUrl: installerInfo.installerUrl,
-              installerSha256: installerInfo.installerSha256 || '',
-              installerType: installerInfo.installerType || deploymentConfig.installerType || 'exe',
-              nestedInstallerType: installerInfo.nestedInstallerType,
-              nestedInstallerPath: installerInfo.nestedInstallerPath,
-              silentSwitches: extractSilentSwitches(
-                deploymentConfig.installCommand || '',
-                installerInfo.installerType || deploymentConfig.installerType || 'exe',
-                installerInfo.nestedInstallerType
-              ),
-              uninstallCommand: deploymentConfig.uninstallCommand || '',
-              callbackUrl,
-              detectionRules: deploymentConfig.detectionRules
-                ? JSON.stringify(deploymentConfig.detectionRules)
-                : undefined,
-              // PSADT settings from the original deployment; triggerAutoUpdate
-              // backfills them onto the policy for pre-existing policies
-              psadtConfig: deploymentConfig.psadtConfig
-                ? JSON.stringify(deploymentConfig.psadtConfig)
-                : undefined,
-              assignments: deploymentConfig.assignments
-                ? JSON.stringify(
-                    sanitizeAssignmentsForDispatch(
-                      deploymentConfig.assignments,
-                      Boolean(deploymentConfig.requirementRules?.length)
+                displayName: deploymentConfig.displayName || installerInfo.displayName,
+                description: buildIntuneAppDescription({
+                  description: deploymentConfig.description,
+                  fallback: deploymentConfig.displayName,
+                  wingetId: req.winget_id,
+                  sourceText: appDescriptionSuffix,
+                }),
+                publisher: deploymentConfig.publisher || 'Unknown Publisher',
+                version: installerInfo.latestVersion,
+                architecture: deploymentConfig.architecture || 'x64',
+                installerUrl: installerInfo.installerUrl,
+                installerSha256: installerInfo.installerSha256 || '',
+                installerType: installerInfo.installerType || deploymentConfig.installerType || 'exe',
+                nestedInstallerType: installerInfo.nestedInstallerType,
+                nestedInstallerPath: installerInfo.nestedInstallerPath,
+                silentSwitches: extractSilentSwitches(
+                  deploymentConfig.installCommand || '',
+                  installerInfo.installerType || deploymentConfig.installerType || 'exe',
+                  installerInfo.nestedInstallerType
+                ),
+                uninstallCommand: deploymentConfig.uninstallCommand || '',
+                callbackUrl,
+                detectionRules: deploymentConfig.detectionRules
+                  ? JSON.stringify(deploymentConfig.detectionRules)
+                  : undefined,
+                // PSADT settings from the original deployment; triggerAutoUpdate
+                // backfills them onto the policy for pre-existing policies
+                psadtConfig: deploymentConfig.psadtConfig
+                  ? JSON.stringify(deploymentConfig.psadtConfig)
+                  : undefined,
+                assignments: deploymentConfig.assignments
+                  ? JSON.stringify(
+                      sanitizeAssignmentsForDispatch(
+                        deploymentConfig.assignments,
+                        Boolean(deploymentConfig.requirementRules?.length)
+                      )
                     )
-                  )
-                : undefined,
-              categories: deploymentConfig.categories
-                ? JSON.stringify(deploymentConfig.categories)
-                : undefined,
-              requirementRules: deploymentConfig.requirementRules
-                ? JSON.stringify(deploymentConfig.requirementRules)
-                : undefined,
-              relationships: deploymentConfig.relationships && deploymentConfig.relationships.length > 0
-                ? JSON.stringify(deploymentConfig.relationships)
-                : undefined,
-              installScope: (deploymentConfig.installScope === 'user' ? 'user' : 'machine') as 'machine' | 'user',
-              forceCreate: deploymentConfig.forceCreateNewApp !== false,
-              sourceIntuneAppId: installerInfo.currentIntuneAppId || undefined,
-              carryOverAssignments: currentCarryOver,
-              removeAssignmentsFromPreviousApp: currentCarryOver,
-              autoSupersede: supersedePrevious,
-              supersedenceType: supersedePrevious ? 'update' : undefined,
-              packageProfileSha256: triggerResult.packageProfileSha256,
-            };
+                  : undefined,
+                categories: deploymentConfig.categories
+                  ? JSON.stringify(deploymentConfig.categories)
+                  : undefined,
+                requirementRules: deploymentConfig.requirementRules
+                  ? JSON.stringify(deploymentConfig.requirementRules)
+                  : undefined,
+                relationships: deploymentConfig.relationships && deploymentConfig.relationships.length > 0
+                  ? JSON.stringify(deploymentConfig.relationships)
+                  : undefined,
+                installScope: (deploymentConfig.installScope === 'user' ? 'user' : 'machine') as 'machine' | 'user',
+                forceCreate: deploymentConfig.forceCreateNewApp !== false,
+                sourceIntuneAppId: trackJob.sourceIntuneAppId || undefined,
+                carryOverAssignments: currentCarryOver,
+                removeAssignmentsFromPreviousApp: currentCarryOver,
+                autoSupersede: supersedePrevious,
+                supersedenceType: supersedePrevious ? 'update' : undefined,
+                packageProfileSha256: trackJob.packageProfileSha256,
+              };
 
-            const isBatch = updateRequests.length > 1;
-            try {
-              await triggerPackagingWorkflow(workflowInputs, undefined, {
-                skipRunCapture: isBatch,
-                requireQaPass: true,
-              });
-            } catch (error) {
-              if (!isQaGateError(error)) throw error;
+              const isBatch = updateRequests.length > 1 || triggerResult.jobs.length > 1;
+              try {
+                await triggerPackagingWorkflow(workflowInputs, undefined, {
+                  skipRunCapture: isBatch,
+                  requireQaPass: true,
+                });
+              } catch (error) {
+                if (!isQaGateError(error)) throw error;
 
-              // The status can change between the pre-job auto-update gate and
-              // the final dispatch gate. Make that race an explicit safety
-              // cancellation rather than leaving a queued/failed mystery job.
-              const message = describeQaGateError(error);
-              const completedAt = new Date().toISOString();
-              await supabase
-                .from('packaging_jobs')
-                .update({
-                  status: 'cancelled',
-                  status_message: 'Waiting for the installation test to finish',
-                  error_message: message,
-                  cancelled_at: completedAt,
-                  completed_at: completedAt,
-                })
-                .eq('id', triggerResult.packagingJobId);
-              if (triggerResult.historyId) {
+                // The status can change between the pre-job auto-update gate and
+                // the final dispatch gate. Make that race an explicit safety
+                // cancellation rather than leaving a queued/failed mystery job.
+                const message = describeQaGateError(error);
+                const completedAt = new Date().toISOString();
                 await supabase
-                  .from('auto_update_history')
+                  .from('packaging_jobs')
                   .update({
                     status: 'cancelled',
+                    status_message: 'Waiting for the installation test to finish',
                     error_message: message,
+                    cancelled_at: completedAt,
                     completed_at: completedAt,
                   })
-                  .eq('id', triggerResult.historyId);
+                  .eq('id', trackJob.packagingJobId);
+                if (trackJob.historyId) {
+                  await supabase
+                    .from('auto_update_history')
+                    .update({
+                      status: 'cancelled',
+                      error_message: message,
+                      completed_at: completedAt,
+                    })
+                    .eq('id', trackJob.historyId);
+                }
+
+                response.failed++;
+                response.results.push({
+                  winget_id: req.winget_id,
+                  tenant_id: req.tenant_id,
+                  track: trackJob.track,
+                  success: false,
+                  skipped: true,
+                  code: error.code,
+                  error: message,
+                });
+                continue;
               }
-
-              response.failed++;
-              response.results.push({
-                winget_id: req.winget_id,
-                tenant_id: req.tenant_id,
-                success: false,
-                skipped: true,
-                code: error.code,
-                error: message,
-              });
-              continue;
             }
-          }
-          // If local packager mode, the job stays in 'queued'/'packaging' for local pickup
+            // If local packager mode, the job stays in 'queued'/'packaging' for local pickup
 
-          response.triggered++;
-          response.results.push({
-            winget_id: req.winget_id,
-            tenant_id: req.tenant_id,
-            success: true,
-            packaging_job_id: triggerResult.packagingJobId,
-          });
+            response.triggered++;
+            response.results.push({
+              winget_id: req.winget_id,
+              tenant_id: req.tenant_id,
+              track: trackJob.track,
+              success: true,
+              packaging_job_id: trackJob.packagingJobId,
+            });
+          }
+
+          if (triggerResult.secondaryTrackError) {
+            response.failed++;
+            response.results.push({
+              winget_id: req.winget_id,
+              tenant_id: req.tenant_id,
+              track: 'update_only',
+              success: false,
+              error: `The Update Only app was not updated: ${triggerResult.secondaryTrackError}`,
+            });
+          }
         } else if (!triggerResult.success) {
           response.failed++;
           response.results.push({
@@ -626,112 +650,137 @@ async function triggerWithoutSupabase(
         continue;
       }
 
-      const built = await buildDeploymentConfigForApp(null, {
-        tenantId: req.tenant_id,
-        wingetId: req.winget_id,
-        latestVersion: updateResult.latest_version,
-      });
-
-      if (built.status === 'orphaned_job') {
-        fail('Could not retrieve deployment configuration');
-        continue;
-      }
-
-      if (built.status === 'unavailable') {
-        const inCatalog = await getCatalogSource().appExists(req.winget_id);
-        fail(
-          inCatalog
-            ? `No installer data is available for ${req.winget_id} ${updateResult.latest_version} yet - the catalog snapshot has not synced this version's manifest. Try again after the next catalog refresh.`
-            : `${req.winget_id} is not in the app catalog, so a deployment configuration cannot be built for it.`
-        );
-        continue;
-      }
-
-      const config = built.deploymentConfig;
-      const installerResolution = await getLatestInstallerInfo(
-        null as never,
-        req.winget_id,
-        config.architecture,
-        config.installScope
-      );
-
-      if (!installerResolution.ok) {
-        fail(installerResolution.failure.message);
-        continue;
-      }
-      const installerInfo = installerResolution.info;
-
       // The detected result's intune_app_id can be stale if the app was
       // redeployed since the last check, so prefer the newest deployment into
-      // this tenant - by whichever administrator made it.
-      const tenantHistory = await db.uploadHistory.getByTenantId(req.tenant_id);
-      const latestUpload = tenantHistory.find((row) => row.winget_id === req.winget_id);
-      const sourceIntuneAppId =
-        latestUpload?.intune_app_id || updateResult.intune_app_id || null;
+      // this tenant - by whichever administrator made it. An app kept as a
+      // Company Portal app plus an Update Only app gets one job per track,
+      // primary first, each from its own last deployment and Intune app.
+      const deployments = await findTrackDeployments(db, req.tenant_id, req.winget_id);
+      const targets: Array<{ track?: DeploymentTrack; sourceIntuneAppId: string | null }> =
+        deployments.length === 2
+          ? deployments
+              .filter((deployment) =>
+                compareVersions(deployment.uploadHistory.version, updateResult.latest_version) < 0
+              )
+              .map((deployment) => ({
+                track: deployment.track,
+                sourceIntuneAppId: deployment.uploadHistory.intune_app_id,
+              }))
+          : [{
+              sourceIntuneAppId:
+                (await db.uploadHistory.getByTenantId(req.tenant_id))
+                  .find((row) => row.winget_id === req.winget_id)?.intune_app_id ||
+                updateResult.intune_app_id ||
+                null,
+            }];
 
-      // Supersedence needs something to supersede; without a source app id
-      // Intune has no previous version to point at.
-      const autoSupersede = supersedePrevious && Boolean(sourceIntuneAppId);
+      for (const target of targets) {
+        const built = await buildDeploymentConfigForApp(null, {
+          tenantId: req.tenant_id,
+          wingetId: req.winget_id,
+          latestVersion: updateResult.latest_version,
+          track: target.track,
+        });
 
-      const job = await db.jobs.create({
-        user_id: user.userId,
-        user_email: user.userEmail || null,
-        tenant_id: req.tenant_id,
-        winget_id: req.winget_id,
-        version: installerInfo.latestVersion,
-        display_name: config.displayName || installerInfo.displayName,
-        publisher: config.publisher,
-        architecture: config.architecture,
-        installer_type: installerInfo.installerType || config.installerType,
-        installer_url: installerInfo.installerUrl,
-        installer_sha256: installerInfo.installerSha256,
-        install_command: config.installCommand,
-        uninstall_command: config.uninstallCommand,
-        install_scope: config.installScope,
-        detection_rules: config.detectionRules as unknown as Json,
-        package_config: {
-          assignments: normalizeAssignments(config),
-          categories: normalizeCategories(config),
-          assignedGroups: config.assignedGroups,
-          requirementRules: config.requirementRules,
-          relationships: config.relationships,
-          psadtConfig: config.psadtConfig,
-          nestedInstallerType: installerInfo.nestedInstallerType,
-          nestedInstallerPath: installerInfo.nestedInstallerPath,
-          forceCreate: config.forceCreateNewApp !== false,
-          sourceIntuneAppId,
-          autoSupersede,
-          supersedenceType: autoSupersede ? 'update' : undefined,
-          allowAvailableUninstall,
-          // An explicit per-app choice stored with the original deployment
-          // wins; otherwise the user's current global setting applies, read
-          // per run rather than frozen. Same precedence as the Supabase path
-          // in AutoUpdateTrigger.
-          assignmentMigration: config.assignmentMigration ?? {
-            carryOverAssignments: globalCarryOver,
-            removeAssignmentsFromPreviousApp: globalCarryOver,
-          },
-          // Composed here, not at dispatch: the local packager reads this
-          // field straight out of package_config. The package-id marker is
-          // not part of it - the packager writes that to the app's `notes`.
-          description: buildIntuneAppDescription({
-            description: config.description,
-            fallback: config.displayName,
-            sourceText: appDescriptionSuffix,
-          }),
-          notes: config.notes,
-        } as unknown as Json,
-        status: 'queued',
-        progress_percent: 0,
-      });
+        if (built.status === 'orphaned_job') {
+          fail('Could not retrieve deployment configuration');
+          // A failed track stops the ones after it, so the Update Only app
+          // never moves ahead of the Company Portal app.
+          break;
+        }
 
-      response.triggered++;
-      response.results.push({
-        winget_id: req.winget_id,
-        tenant_id: req.tenant_id,
-        success: true,
-        packaging_job_id: job.id,
-      });
+        if (built.status === 'unavailable') {
+          const inCatalog = await getCatalogSource().appExists(req.winget_id);
+          fail(
+            inCatalog
+              ? `No installer data is available for ${req.winget_id} ${updateResult.latest_version} yet - the catalog snapshot has not synced this version's manifest. Try again after the next catalog refresh.`
+              : `${req.winget_id} is not in the app catalog, so a deployment configuration cannot be built for it.`
+          );
+          break;
+        }
+
+        const config = built.deploymentConfig;
+        const installerResolution = await getLatestInstallerInfo(
+          null as never,
+          req.winget_id,
+          config.architecture,
+          config.installScope
+        );
+
+        if (!installerResolution.ok) {
+          fail(installerResolution.failure.message);
+          break;
+        }
+        const installerInfo = installerResolution.info;
+
+        const sourceIntuneAppId = target.sourceIntuneAppId;
+
+        // Supersedence needs something to supersede; without a source app id
+        // Intune has no previous version to point at.
+        const autoSupersede = supersedePrevious && Boolean(sourceIntuneAppId);
+
+        const job = await db.jobs.create({
+          user_id: user.userId,
+          user_email: user.userEmail || null,
+          tenant_id: req.tenant_id,
+          winget_id: req.winget_id,
+          version: installerInfo.latestVersion,
+          display_name: config.displayName || installerInfo.displayName,
+          publisher: config.publisher,
+          architecture: config.architecture,
+          installer_type: installerInfo.installerType || config.installerType,
+          installer_url: installerInfo.installerUrl,
+          installer_sha256: installerInfo.installerSha256,
+          install_command: config.installCommand,
+          uninstall_command: config.uninstallCommand,
+          install_scope: config.installScope,
+          detection_rules: config.detectionRules as unknown as Json,
+          package_config: {
+            assignments: normalizeAssignments(config),
+            categories: normalizeCategories(config),
+            assignedGroups: config.assignedGroups,
+            requirementRules: config.requirementRules,
+            relationships: config.relationships,
+            deploymentTrack: classifyDeploymentTrack(config),
+            psadtConfig: config.psadtConfig,
+            nestedInstallerType: installerInfo.nestedInstallerType,
+            nestedInstallerPath: installerInfo.nestedInstallerPath,
+            forceCreate: config.forceCreateNewApp !== false,
+            sourceIntuneAppId,
+            autoSupersede,
+            supersedenceType: autoSupersede ? 'update' : undefined,
+            allowAvailableUninstall,
+            // An explicit per-app choice stored with the original deployment
+            // wins; otherwise the user's current global setting applies, read
+            // per run rather than frozen. Same precedence as the Supabase path
+            // in AutoUpdateTrigger.
+            assignmentMigration: config.assignmentMigration ?? {
+              carryOverAssignments: globalCarryOver,
+              removeAssignmentsFromPreviousApp: globalCarryOver,
+            },
+            // Composed here, not at dispatch: the local packager reads this
+            // field straight out of package_config. The package-id marker is
+            // not part of it - the packager writes that to the app's `notes`.
+            description: buildIntuneAppDescription({
+              description: config.description,
+              fallback: config.displayName,
+              sourceText: appDescriptionSuffix,
+            }),
+            notes: config.notes,
+          } as unknown as Json,
+          status: 'queued',
+          progress_percent: 0,
+        });
+
+        response.triggered++;
+        response.results.push({
+          winget_id: req.winget_id,
+          tenant_id: req.tenant_id,
+          track: target.track,
+          success: true,
+          packaging_job_id: job.id,
+        });
+      }
     } catch (error) {
       fail(error instanceof Error ? error.message : 'Unknown error');
     }
