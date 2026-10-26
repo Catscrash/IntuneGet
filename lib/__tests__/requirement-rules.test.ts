@@ -1,6 +1,9 @@
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
-import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
+import {
+  buildCartItemRequirementRules,
+  effectiveCustomRequirementScript,
+} from '@/lib/requirement-rules';
 import type { RequirementRule } from '@/types/intune';
 import type { PackageAssignment } from '@/types/upload';
 
@@ -130,5 +133,20 @@ describe('buildCartItemRequirementRules', () => {
         { type: 'allDevices', intent: 'required' },
       ])
     ).toBeUndefined();
+  });
+});
+
+describe('effectiveCustomRequirementScript', () => {
+  it('keeps a script only while an assignment is updateOnly', () => {
+    expect(effectiveCustomRequirementScript(updateOnlyAssignments, customScript)).toBe(customScript);
+    expect(
+      effectiveCustomRequirementScript([{ type: 'allDevices', intent: 'available' }], customScript)
+    ).toBeUndefined();
+    expect(effectiveCustomRequirementScript(undefined, customScript)).toBeUndefined();
+  });
+
+  it('drops a blank script', () => {
+    expect(effectiveCustomRequirementScript(updateOnlyAssignments, ' \r\n ')).toBeUndefined();
+    expect(effectiveCustomRequirementScript(updateOnlyAssignments, undefined)).toBeUndefined();
   });
 });

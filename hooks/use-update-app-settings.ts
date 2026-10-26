@@ -10,6 +10,7 @@ interface UpdateAppSettingsRequest {
   wingetId: string;
   assignments?: PackageAssignment[];
   categories?: IntuneAppCategorySelection[];
+  customRequirementScript?: string;
 }
 
 export function useUpdateAppSettings() {
@@ -19,7 +20,7 @@ export function useUpdateAppSettings() {
   const tenantKey = isMspUser ? selectedTenantId || 'primary' : 'self';
 
   const mutation = useMutation<{ success: boolean }, Error, UpdateAppSettingsRequest>({
-    mutationFn: async ({ intuneAppId, wingetId, assignments, categories }) => {
+    mutationFn: async ({ intuneAppId, wingetId, assignments, categories, customRequirementScript }) => {
       const token = await getAccessToken();
       if (!token) {
         throw new Error('Not authenticated');
@@ -36,7 +37,7 @@ export function useUpdateAppSettings() {
               ? { 'X-MSP-Tenant-Id': selectedTenantId }
               : {}),
           },
-          body: JSON.stringify({ assignments, categories, wingetId }),
+          body: JSON.stringify({ assignments, categories, customRequirementScript, wingetId }),
         }
       );
 

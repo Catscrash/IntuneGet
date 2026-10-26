@@ -237,6 +237,7 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
           categories: config.categories ?? [],
           assignedGroups: config.assignedGroups,
           requirementRules: config.requirementRules,
+          customRequirementScript: config.customRequirementScript,
           relationships: config.relationships,
           deploymentTrack: classifyDeploymentTrack(config),
           psadtConfig: config.psadtConfig,

@@ -42,6 +42,7 @@ export interface PackageConfigWithAssignments {
     assignmentType?: 'required' | 'available' | 'uninstall' | 'updateOnly';
   }>;
   requirementRules?: RequirementRule[];
+  customRequirementScript?: string;
   relationships?: AppRelationship[];
   assignmentMigration?: {
     carryOverAssignments?: boolean;
@@ -422,6 +423,8 @@ export function assembleDeploymentConfigFromJob(job: {
     assignments: parsedAssignments,
     categories: parsedCategories,
     requirementRules: parsedRequirementRules,
+    customRequirementScript: isObject(packageConfig) && typeof packageConfig.customRequirementScript === 'string'
+      ? packageConfig.customRequirementScript : undefined,
     relationships: parsedRelationships.length > 0 ? parsedRelationships : undefined,
     psadtConfig,
     forceCreateNewApp: true,

@@ -60,7 +60,12 @@ import type {
 import type { WingetScope } from '@/types/winget';
 import { useCartStore } from '@/stores/cart-store';
 import { useUserSettings } from '@/components/providers/UserSettingsProvider';
-import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
+import {
+  buildCartItemRequirementRules,
+  effectiveCustomRequirementScript,
+  hasUpdateOnlyAssignment,
+} from '@/lib/requirement-rules';
+import { CustomRequirementScriptEditor } from '@/components/CustomRequirementScriptEditor';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
 
 interface CartItemConfigProps {
@@ -110,6 +115,9 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   const [assignments, setAssignments] = useState<PackageAssignment[]>(
     item.assignments || []
   );
+  const [customRequirementScript, setCustomRequirementScript] = useState(
+    isWin32 ? item.customRequirementScript ?? '' : ''
+  );
   const [categories, setCategories] = useState<IntuneAppCategorySelection[]>(
     item.categories || []
   );
@@ -147,6 +155,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
   const configSnapshot = JSON.stringify({
     storeInstallExperience, selectedScope, config, assignments, categories,
     espProfiles, relationships, installCommand, uninstallCommand, description,
+    customRequirementScript,
     updatePolicy: updatePolicy ?? null,
     carryOverAssignments,
     curatedSettingsMode,
@@ -298,7 +307,8 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
               item.displayName,
               item.installerType,
               msiProductCode,
-              assignments
+              assignments,
+              customRequirementScript
             )
           : undefined;
 
@@ -312,6 +322,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
           espProfiles: espProfiles.length > 0 ? espProfiles : undefined,
           relationships: relationships.length > 0 ? relationships : undefined,
           requirementRules,
+          customRequirementScript: effectiveCustomRequirementScript(assignments, customRequirementScript),
           installCommand,
           uninstallCommand,
           description: description.trim() || item.description,
@@ -1293,6 +1304,13 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
                   onChange={setAssignments}
                   supportsAutoUpdateSuperseded={!isStore}
                 />
+                {isWin32 && hasUpdateOnlyAssignment(assignments) && (
+                  <CustomRequirementScriptEditor
+                    displayName={item.displayName}
+                    value={customRequirementScript}
+                    onChange={setCustomRequirementScript}
+                  />
+                )}
               </ConfigSection>
 
               {/* Category Configuration */}

@@ -55,6 +55,9 @@ export interface DeploymentConfig {
 
   // Requirement rules for "Update Only" mode (optional)
   requirementRules?: RequirementRule[];
+  // Administrator script the requirement rules were built from, kept so the
+  // next deployment's settings show it again
+  customRequirementScript?: string;
 
   // App relationships (dependencies / supersedence) carried over from the
   // original deployment (optional)

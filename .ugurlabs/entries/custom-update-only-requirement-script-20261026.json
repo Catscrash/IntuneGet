@@ -1,0 +1,5 @@
+{
+  "title": "Custom requirement scripts for Update Only deployments",
+  "summary": "When an assignment uses Update Only, you can now replace the generated check that limits the install to devices that already have the app with your own PowerShell script. Start from the generated script or write a new one; it must output True when the app is installed. Automatic updates keep the script for later versions.",
+  "type": "new"
+}

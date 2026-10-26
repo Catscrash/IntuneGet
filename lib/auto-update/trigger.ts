@@ -1058,6 +1058,7 @@ export class AutoUpdateTrigger {
         categories,
         assignedGroups: config.assignedGroups,
         requirementRules: config.requirementRules,
+        customRequirementScript: config.customRequirementScript,
         // App relationships (dependencies/supersedence) from the original
         // deployment are read from package_config by the packager
         relationships: config.relationships,

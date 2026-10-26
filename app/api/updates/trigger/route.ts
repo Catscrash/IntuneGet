@@ -740,6 +740,7 @@ async function triggerWithoutSupabase(
             categories: normalizeCategories(config),
             assignedGroups: config.assignedGroups,
             requirementRules: config.requirementRules,
+            customRequirementScript: config.customRequirementScript,
             relationships: config.relationships,
             deploymentTrack: classifyDeploymentTrack(config),
             psadtConfig: config.psadtConfig,

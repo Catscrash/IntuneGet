@@ -70,7 +70,12 @@ import { useUpdateAppSettings } from '@/hooks/use-update-app-settings';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { generateDetectionRules, generateInstallCommand, generateUninstallCommand } from '@/lib/detection-rules';
 import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
-import { buildCartItemRequirementRules } from '@/lib/requirement-rules';
+import {
+  buildCartItemRequirementRules,
+  effectiveCustomRequirementScript,
+  hasUpdateOnlyAssignment,
+} from '@/lib/requirement-rules';
+import { CustomRequirementScriptEditor } from '@/components/CustomRequirementScriptEditor';
 import { canUseCustomDetection, validateCustomDetectionRules } from '@/lib/custom-detection';
 import { CustomDetectionEditor, createEmptyDetectionRule } from '@/components/CustomDetectionEditor';
 
@@ -224,6 +229,9 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   const [assignments, setAssignments] = useState<PackageAssignment[]>(
     deployedConfig?.assignments || []
   );
+  const [customRequirementScript, setCustomRequirementScript] = useState<string>(
+    () => (deployedConfig && 'customRequirementScript' in deployedConfig ? deployedConfig.customRequirementScript : undefined) ?? ''
+  );
   const [categories, setCategories] = useState<IntuneAppCategorySelection[]>(
     deployedConfig?.categories || []
   );
@@ -297,12 +305,19 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
     // so a change to it requires a redeploy rather than a Graph settings patch.
     const deployedDescription = stripSourceMarker(deployedConfig.description ?? pkg.description ?? '');
     const hasDescriptionChange = description.trim() !== deployedDescription.trim();
+    // The settings patch adds requirement rules but never replaces them, so a
+    // different script only reaches Intune with a new deployment.
+    const hasRequirementScriptChange = win32Deployed && hasUpdateOnlyAssignment(assignments)
+      ? customRequirementScript.trim() !== (win32Deployed.customRequirementScript ?? '').trim()
+      : false;
     const hasRedeployChanges =
-      hasVersionChange || hasArchChange || hasScopeChange || hasLocaleChange || hasPsadtChange || hasDescriptionChange;
+      hasVersionChange || hasArchChange || hasScopeChange || hasLocaleChange || hasPsadtChange || hasDescriptionChange
+      || hasRequirementScriptChange;
 
     return { hasGraphChanges, hasRedeployChanges };
   }, [isDeployed, deployedConfig, assignments, categories, espProfiles,
-      selectedVersion, selectedArch, selectedScope, selectedLocale, config, description, pkg.description]);
+      selectedVersion, selectedArch, selectedScope, selectedLocale, config, description, pkg.description,
+      customRequirementScript]);
 
   // Installers always arrive for the package's default (latest) version. When the
   // user selects a different version we must re-fetch so the installer URL/SHA
@@ -371,7 +386,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
   const configSnapshot = JSON.stringify({
     storeInstallExperience, selectedVersion, selectedArch, selectedScope,
     selectedLocale, config, description, assignments, categories,
-    espProfiles, relationships,
+    espProfiles, relationships, customRequirementScript,
   });
   const latestSnapshotRef = useRef(configSnapshot);
   latestSnapshotRef.current = configSnapshot;
@@ -561,8 +576,10 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
             displayName,
             selectedInstaller!.type,
             selectedInstaller!.productCode,
-            assignments
+            assignments,
+            customRequirementScript
           ),
+          customRequirementScript: effectiveCustomRequirementScript(assignments, customRequirementScript),
           categories: categories.length > 0 ? categories : undefined,
           espProfiles: espProfiles.length > 0 ? espProfiles : undefined,
           relationships: relationships.length > 0 ? relationships : undefined,
@@ -597,6 +614,9 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
         wingetId: effectiveWingetId,
         assignments,
         categories,
+        customRequirementScript: isStoreApp
+          ? undefined
+          : effectiveCustomRequirementScript(assignments, customRequirementScript),
       });
       setSettingsSuccess(true);
       setTimeout(() => onClose(), 1200);
@@ -1895,6 +1915,13 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
                   onChange={setAssignments}
                   supportsAutoUpdateSuperseded={!isStoreApp}
                 />
+                {!isStoreApp && hasUpdateOnlyAssignment(assignments) && (
+                  <CustomRequirementScriptEditor
+                    displayName={pkg.name}
+                    value={customRequirementScript}
+                    onChange={setCustomRequirementScript}
+                  />
+                )}
               </ConfigSection>}
 
               {/* Category Configuration (quick + advanced, all app types) */}

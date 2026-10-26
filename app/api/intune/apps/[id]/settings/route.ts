@@ -93,10 +93,12 @@ export async function PATCH(
     const {
       assignments,
       categories,
+      customRequirementScript,
       wingetId,
     } = body as {
       assignments?: PackageAssignment[];
       categories?: IntuneAppCategorySelection[];
+      customRequirementScript?: unknown;
       wingetId?: string;
     };
 
@@ -120,7 +122,8 @@ export async function PATCH(
         existingApp.displayName,
         productCode ? 'msi' : 'exe',
         productCode,
-        assignments
+        assignments,
+        typeof customRequirementScript === 'string' ? customRequirementScript : undefined
       );
       // Skip when the app already carries requirement rules so repeated
       // settings updates do not stack duplicates onto the rules array.

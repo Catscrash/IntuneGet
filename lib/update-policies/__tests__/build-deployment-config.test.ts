@@ -72,6 +72,7 @@ describe('buildDeploymentConfigForApp', () => {
       package_config: {
         assignments: [{ type: 'group', groupId: 'group-1', intent: 'required' }],
         requirementRules: [REQUIREMENT_RULE],
+        customRequirementScript: 'Write-Output "ok"',
       },
     });
 
@@ -89,6 +90,7 @@ describe('buildDeploymentConfigForApp', () => {
       { type: 'group', groupId: 'group-1', intent: 'required' },
     ]);
     expect(result.deploymentConfig.requirementRules).toEqual([REQUIREMENT_RULE]);
+    expect(result.deploymentConfig.customRequirementScript).toBe('Write-Output "ok"');
   });
 
   it('reports an orphaned job rather than silently falling back to defaults', async () => {

@@ -29,16 +29,33 @@ export function buildCartItemRequirementRules(
   assignments: PackageAssignment[] | undefined,
   customScript?: string
 ): RequirementRule[] | undefined {
-  if (!assignments?.some((assignment) => assignment.intent === 'updateOnly')) {
+  if (!hasUpdateOnlyAssignment(assignments)) {
     return undefined;
   }
 
   // An administrator's own script replaces the generated existence check.
-  if (customScript?.trim()) {
-    return [generateCustomScriptRequirementRule(displayName, customScript)];
+  const script = effectiveCustomRequirementScript(assignments, customScript);
+  if (script) {
+    return [generateCustomScriptRequirementRule(displayName, script)];
   }
 
   return generateRequirementRules(displayName, installerType, productCode);
+}
+
+export function hasUpdateOnlyAssignment(assignments: PackageAssignment[] | undefined): boolean {
+  return Boolean(assignments?.some((assignment) => assignment.intent === 'updateOnly'));
+}
+
+/**
+ * The custom requirement script a cart item keeps: only one that is not blank
+ * and only while an Update Only assignment uses it, so it never leaks into an
+ * Available deployment of the same app.
+ */
+export function effectiveCustomRequirementScript(
+  assignments: PackageAssignment[] | undefined,
+  customScript: string | undefined
+): string | undefined {
+  return hasUpdateOnlyAssignment(assignments) && customScript?.trim() ? customScript : undefined;
 }
 
 /**
@@ -96,6 +113,25 @@ function generateMsiRegistryRequirementRule(
 function generateUninstallRegistryScriptRule(
   displayName: string
 ): ScriptRequirementRule {
+  return {
+    '@odata.type': '#microsoft.graph.win32LobAppPowerShellScriptRule',
+    ruleType: 'requirement',
+    displayName: `Check if ${displayName} is installed`,
+    scriptContent: Buffer.from(generateUninstallRegistryScript(displayName), 'utf-8').toString('base64'),
+    enforceSignatureCheck: false,
+    runAs32Bit: false,
+    runAsAccount: 'system',
+    operationType: 'boolean',
+    operator: 'equal',
+    comparisonValue: 'True',
+  };
+}
+
+/**
+ * The PowerShell source of the generated uninstall-registry check, also
+ * offered as a starting point for a custom requirement script.
+ */
+export function generateUninstallRegistryScript(displayName: string): string {
   // Encode the display name for PowerShell. The pattern source text is ASCII
   // only, so it reads the same whether the script is decoded as UTF-8 or ANSI.
   const namePattern = psAsciiStringExpression(`*${displayName}*`);
@@ -125,21 +161,7 @@ function generateUninstallRegistryScriptRule(
     'exit 0',
   ];
 
-  const scriptContent = scriptLines.join('\r\n');
-  const base64Script = Buffer.from(scriptContent, 'utf-8').toString('base64');
-
-  return {
-    '@odata.type': '#microsoft.graph.win32LobAppPowerShellScriptRule',
-    ruleType: 'requirement',
-    displayName: `Check if ${displayName} is installed`,
-    scriptContent: base64Script,
-    enforceSignatureCheck: false,
-    runAs32Bit: false,
-    runAsAccount: 'system',
-    operationType: 'boolean',
-    operator: 'equal',
-    comparisonValue: 'True',
-  };
+  return scriptLines.join('\r\n');
 }
 
 /**
