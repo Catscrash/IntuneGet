@@ -208,6 +208,9 @@ export interface Win32CartItem extends CartItemBase {
   uninstallCommand: string;
   detectionRules: DetectionRule[];
   requirementRules?: RequirementRule[];
+  // PowerShell requirement script that replaces the generated "Update Only"
+  // existence check. It must write "True" when the app is installed.
+  customRequirementScript?: string;
   psadtConfig: PSADTConfig;
   // Package dependencies declared in the winget manifest (hints for DependencyConfig)
   manifestDependencies?: Array<{ packageIdentifier: string; minimumVersion?: string }>;

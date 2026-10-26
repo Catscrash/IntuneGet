@@ -26,10 +26,16 @@ export function buildCartItemRequirementRules(
   displayName: string,
   installerType: WingetInstallerType,
   productCode: string | undefined,
-  assignments: PackageAssignment[] | undefined
+  assignments: PackageAssignment[] | undefined,
+  customScript?: string
 ): RequirementRule[] | undefined {
   if (!assignments?.some((assignment) => assignment.intent === 'updateOnly')) {
     return undefined;
+  }
+
+  // An administrator's own script replaces the generated existence check.
+  if (customScript?.trim()) {
+    return [generateCustomScriptRequirementRule(displayName, customScript)];
   }
 
   return generateRequirementRules(displayName, installerType, productCode);
@@ -127,6 +133,29 @@ function generateUninstallRegistryScriptRule(
     ruleType: 'requirement',
     displayName: `Check if ${displayName} is installed`,
     scriptContent: base64Script,
+    enforceSignatureCheck: false,
+    runAs32Bit: false,
+    runAsAccount: 'system',
+    operationType: 'boolean',
+    operator: 'equal',
+    comparisonValue: 'True',
+  };
+}
+
+/**
+ * Wrap an administrator-supplied PowerShell script as a requirement rule.
+ * The script must write "True" when the app is installed, like the
+ * generated uninstall-registry script.
+ */
+function generateCustomScriptRequirementRule(
+  displayName: string,
+  script: string
+): ScriptRequirementRule {
+  return {
+    '@odata.type': '#microsoft.graph.win32LobAppPowerShellScriptRule',
+    ruleType: 'requirement',
+    displayName: `Check if ${displayName} is installed (custom script)`,
+    scriptContent: Buffer.from(script, 'utf-8').toString('base64'),
     enforceSignatureCheck: false,
     runAs32Bit: false,
     runAsAccount: 'system',
