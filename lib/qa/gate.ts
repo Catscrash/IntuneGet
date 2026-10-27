@@ -1,4 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { resolveWingetPackageDependencies, type PackagedWingetDependency } from '@/lib/winget-dependencies';
+import { arePackageDependenciesCovered } from '@/lib/qa/dependency-reputation';
 import { getCatalogSource } from '@/lib/catalog';
 import { CuratedEvidenceMismatchError, isCuratedPackageId } from '@/lib/curated-catalog/core.mjs';
 import { getApprovedCuratedRelease } from '@/lib/curated-catalog/server';
@@ -175,6 +177,8 @@ export async function enforceQaGate(input: {
   architecture?: string;
   installerSha256?: string;
   packageProfileSha256?: string;
+  /** The trusted resolver's bundle, when the caller already prepares dispatch. */
+  resolvedPackageDependencies?: readonly Pick<PackagedWingetDependency, 'installerSha256'>[];
   requirePassed?: boolean;
   qaOverride?: boolean;
   sourceType?: 'winget' | 'custom' | 'curated';
@@ -267,6 +271,19 @@ export async function enforceQaGate(input: {
   const { data: reputationRow, error: reputationError } = reputationResult;
   if (reputationError) throw reputationHold(reputationError);
   if (!isCoveredCleanReputation(reputationRow)) throw reputationHold();
+
+  // Check the bundle being dispatched. Callers that only have a payload tuple
+  // must resolve it first; a primary pass never covers stale prerequisites.
+  let dependenciesCovered: boolean;
+  try {
+    const dependencies = input.resolvedPackageDependencies ?? await resolveWingetPackageDependencies({
+      wingetId: input.wingetId, version: input.version, architecture, installerSha256,
+    });
+    dependenciesCovered = await arePackageDependenciesCovered(createServerClient(), dependencies);
+  } catch (error) {
+    throw reputationHold(error);
+  }
+  if (!dependenciesCovered) throw reputationHold();
 
   if (!input.requirePassed && input.qaOverride) return;
 
