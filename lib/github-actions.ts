@@ -298,6 +298,7 @@ export async function triggerPackagingWorkflow(
     architecture: inputs.architecture,
     installerSha256: inputs.installerSha256,
     packageProfileSha256,
+    resolvedPackageDependencies: packageDependencies,
     requirePassed: options?.requireQaPass,
     qaOverride: inputs.qaOverride,
     securityOverride: inputs.securityOverride,

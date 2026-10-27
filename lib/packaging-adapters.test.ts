@@ -9,6 +9,32 @@ import {
   resolveApplicationUninstallCommand,
 } from './packaging-adapters';
 
+describe('OneKey exact registry identity', () => {
+  const expected = 'REGISTRY_UNINSTALL_KEY:c63242f1-2b62-5725-b853-31b79889ccf8:OneKey';
+
+  it('maps only the generated OneKey identities to the vendor NSIS key', () => {
+    for (const command of [
+      'REGISTRY_UNINSTALL:OneKey Wallet',
+      'REGISTRY_UNINSTALL_PRODUCT:{C63242F1-2B62-5725-B853-31B79889CCF8}:OneKey Wallet',
+      expected,
+    ]) {
+      expect(resolveApplicationUninstallCommand(' OneKey.OneKey ', command)).toBe(expected);
+    }
+  });
+
+  it('preserves custom identities and other applications', () => {
+    for (const command of [
+      'custom.exe /remove',
+      'REGISTRY_UNINSTALL_PRODUCT:{00000000-0000-0000-0000-000000000000}:OneKey Wallet',
+      'REGISTRY_UNINSTALL_KEY:other:OneKey Wallet',
+    ]) {
+      expect(resolveApplicationUninstallCommand('OneKey.OneKey', command)).toBe(command);
+    }
+    expect(resolveApplicationUninstallCommand('OneKey.Other', 'REGISTRY_UNINSTALL:OneKey Wallet'))
+      .toBe('REGISTRY_UNINSTALL:OneKey Wallet');
+  });
+});
+
 describe('application packaging adapters', () => {
   it('binds ZDisk to its observed exact NSIS key without changing custom identities', () => {
     const exact = 'REGISTRY_UNINSTALL_KEY:ZDiskCleanerPro:ZDiskCleanerPro';
@@ -600,6 +626,51 @@ describe('application packaging adapters', () => {
     expect(resolveApplicationInstallScope(' torproject.torbrowser ', undefined)).toBe('user');
     expect(resolveApplicationInstallScope('Example.App', 'user')).toBe('user');
     expect(resolveApplicationInstallScope('Example.App', 'machine')).toBe('machine');
+  });
+
+  it('keeps Equibop assisted NSIS in the signed-in user context', () => {
+    for (const id of ['Equicord.Equibop', ' equicord.equibop ']) {
+      expect(resolveApplicationInstallScope(id, undefined)).toBe('user');
+      expect(resolveApplicationInstallScope(id, 'machine')).toBe('user');
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedInstallArguments).toEqual(['/currentuser']);
+      expect(adapted.reviewedInstallArguments).not.toContain('/allusers');
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+      expect(resolveApplicationInstallerSelectionScope(id, 'user')).toBe('user');
+    }
+  });
+
+  it('keeps Numara assisted NSIS installations machine-wide', () => {
+    for (const id of ['bornova.numara', ' BORNOVA.NUMARA ']) {
+      expect(resolveApplicationInstallScope(id, undefined)).toBe('machine');
+      expect(resolveApplicationInstallScope(id, 'user')).toBe('machine');
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedInstallArguments).toEqual(['/allusers']);
+      expect(
+        applyApplicationPackagingAdapter(id, adapted).reviewedInstallArguments
+      ).toEqual(['/allusers']);
+    }
+  });
+
+  it('keeps OneKey assisted NSIS installations in the declared machine scope', () => {
+    for (const id of ['OneKey.OneKey', ' ONEKEY.ONEKEY ']) {
+      expect(resolveApplicationInstallScope(id, undefined)).toBe('machine');
+      expect(resolveApplicationInstallScope(id, 'user')).toBe('machine');
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedInstallArguments).toEqual(['/allusers']);
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+  });
+
+  it('selects SPlayer assisted NSIS all-users for its machine installation', () => {
+    expect(resolveApplicationInstallScope('imsyy.SPlayer', undefined)).toBe('machine');
+    expect(resolveApplicationInstallScope('imsyy.SPlayer', 'user')).toBe('machine');
+    expect(
+      applyApplicationPackagingAdapter('imsyy.SPlayer', DEFAULT_PSADT_CONFIG)
+    ).toMatchObject({ reviewedInstallArguments: ['/allusers'] });
+    expect(
+      applyApplicationPackagingAdapter(' imsyy.splayer ', DEFAULT_PSADT_CONFIG)
+    ).toMatchObject({ reviewedInstallArguments: ['/allusers'] });
   });
 
   it('runs zyfun assisted NSIS all-users so its VC++ prerequisite can complete', () => {

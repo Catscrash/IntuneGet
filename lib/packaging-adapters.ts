@@ -252,6 +252,32 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     requiredInstallScope: 'user',
   },
   {
+    // Numara's assisted NSIS installer defaults to per-user mode. Select its
+    // supported all-users mode explicitly for the machine installation profile.
+    // https://github.com/bornova/numara-calculator/blob/v7.6.3/electron-builder.yml
+    wingetId: 'bornova.numara',
+    requiredInstallScope: 'machine',
+    reviewedInstallArguments: ['/allusers'],
+  },
+  {
+    // OneKey 6.6.3 uses Electron Builder 26.4.0 assisted NSIS, which defaults
+    // to per-user installation. Select its supported all-users mode explicitly
+    // so the machine profile installs and captures the same vendor identity.
+    // https://github.com/OneKeyHQ/app-monorepo/blob/v6.6.3/apps/desktop/electron-builder-win.config.js
+    wingetId: 'OneKey.OneKey',
+    requiredInstallScope: 'machine',
+    reviewedInstallArguments: ['/allusers'],
+  },
+  {
+    // SPlayer 3.1.1 uses Electron Builder 26.8.1 assisted NSIS, whose silent
+    // default is per-user. Select its supported all-users mode so the declared
+    // machine scope does not register a remover below LocalSystem's profile.
+    // https://github.com/SPlayer-Dev/SPlayer/blob/v3.1.1/electron-builder.config.ts
+    wingetId: 'imsyy.SPlayer',
+    requiredInstallScope: 'machine',
+    reviewedInstallArguments: ['/allusers'],
+  },
+  {
     // zyfun 3.4.7 uses Electron Builder's assisted NSIS mode and a custom
     // installer hook that installs the machine-wide VC++ runtime when missing.
     // Its default current-user silent path can therefore wait indefinitely on
@@ -413,6 +439,15 @@ export const APPLICATION_PACKAGING_ADAPTERS: readonly ApplicationPackagingAdapte
     // Intune packages in the intended signed-in user context instead.
     wingetId: 'UltimateGadgetLaboratories.UHKAgent',
     requiredInstallScope: 'user',
+  },
+  {
+    // Equibop's assisted NSIS hook seeds both scopes with LocalAppData.
+    // Select the signed-in user and explicit current-user mode together so
+    // the seeded HKLM value cannot force a silent machine installation.
+    // https://github.com/Equicord/Equibop/blob/v3.3.2/build/installer.nsh
+    wingetId: 'Equicord.Equibop',
+    requiredInstallScope: 'user',
+    reviewedInstallArguments: ['/currentuser'],
   },
   {
     // SeaMeet Snap Recorder's Nullsoft installer writes its application and
@@ -1915,6 +1950,16 @@ const REVIEWED_REGISTRY_UNINSTALL_IDENTITIES: Readonly<Record<string, Readonly<{
   registeredDisplayName: string;
   registeredRegistryKey?: string;
 }>>> = {
+  // OneKey's electron-builder installer registers the bare NSIS key, while
+  // WinGet publishes a braced ProductCode and the catalog title OneKey Wallet.
+  // Bind capture and removal to the vendor key so unrelated Edge servicing
+  // cannot become the selected uninstall identity.
+  'onekey.onekey': {
+    generatedDisplayName: 'OneKey Wallet',
+    manifestRegistryKey: '{C63242F1-2B62-5725-B853-31B79889CCF8}',
+    registeredDisplayName: 'OneKey',
+    registeredRegistryKey: 'c63242f1-2b62-5725-b853-31b79889ccf8',
+  },
   // WinGet 3.14.0 and isolated run 35536993050 identify this bare NSIS key.
   // The generated braced product code does not match it; Edge servicing must
   // never become the uninstall target when the catalog title also differs.

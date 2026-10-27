@@ -449,6 +449,50 @@ def contracts():
     assert untouched == value("select jsonb_agg(pg_get_functiondef(oid) order by proname) from pg_proc where oid in ('public.claim_qa_vt_dependency_recheck(text)'::regprocedure,'public.complete_qa_vt_dependency_recheck(text,uuid,integer,timestamp with time zone,integer,integer,integer,timestamp with time zone)'::regprocedure)")
     print('PASS receipt-bound admission, zero unreceipted calls, latest attempt, full lookup contracts and unchanged ACL/claim/complete')
 
+    cadence = (ROOT/'supabase/tests/qa_installer_recheck_customer_cadence.sql').read_text()
+    denied(cadence, 'No-demand hash rechecked before seven days', role='fixture_owner')
+    sql(migration('20261022132553_qa_installer_recheck_customer_cadence'))
+    sql(cadence)
+    print('PASS weekly no-demand cadence and next-pass daily customer restoration')
+    active = (ROOT/'supabase/tests/qa_vt_active_candidate_completion.sql').read_text()
+    legacy = migration('20260910224600_correct_virustotal_engine_counts')
+    legacy = 'CREATE OR REPLACE FUNCTION public.cache_qa_file_reputation' + legacy.split('CREATE OR REPLACE FUNCTION public.cache_qa_file_reputation', 1)[1].split('REVOKE ALL ON FUNCTION public.cache_qa_file_reputation', 1)[0]
+    prefix = """begin;
+      alter table public.catalog_file_reputation add column if not exists queued_at timestamptz, add column if not exists priority integer,
+        add column if not exists lease_token uuid, add column if not exists lease_expires_at timestamptz, add column if not exists attempts integer;
+      create temporary table qa_result_publication_fixture(installer_sha256 text,virustotal_status text,
+        virustotal_malicious integer,virustotal_suspicious integer,virustotal_scanned_at_utc timestamptz,tested_at_utc timestamptz);
+      """ + legacy + """
+      create trigger cache_fixture after insert on qa_result_publication_fixture
+        for each row execute function public.cache_qa_file_reputation();
+      """
+    active = active.replace('begin;', prefix, 1)
+    before = sql(active, check=False)
+    assert before.returncode != 0 and 'QA terminal response identity rejected' in before.stderr
+    print('PASS old source rejects active same-lookup persistence regression')
+    completion_acl = value("select jsonb_build_array(proowner,proacl::text) from pg_proc where oid='public.complete_qa_vt_metadata_recheck(text,uuid,integer,timestamptz,integer,integer,integer,timestamptz)'::regprocedure")
+    sql(migration('20261023022120_qa_vt_active_candidate_completion'))
+    assert completion_acl == value("select jsonb_build_array(proowner,proacl::text) from pg_proc where oid='public.complete_qa_vt_metadata_recheck(text,uuid,integer,timestamptz,integer,integer,integer,timestamptz)'::regprocedure")
+    sql(active)
+    sql((ROOT/'supabase/tests/qa_vt_analysis_record_refresh.sql').read_text())
+    admission = (ROOT/'supabase/tests/qa_vt_terminal_metadata_admission.sql').read_text()
+    needle = 'truncate public.qa_vt_requests,'
+    assert admission.count(needle) == 1
+    sql(admission.replace(needle, 'truncate public.qa_vt_upload_url_recovery_grants,public.qa_vt_requests,', 1))
+    print('PASS post-migration terminal and metadata completion regression fixtures')
+    print('PASS active exact lookup, replay/binding refusals, monotonic evidence, publication trigger, holds and unchanged ACL')
+    capability = (ROOT/'supabase/tests/qa_vt_metadata_public_capability.sql').read_text()
+    before = sql(capability, check=False)
+    assert before.returncode != 0 and 'does not exist' in before.stderr
+    original_claim = value("select jsonb_build_array(prosrc,proacl::text) from pg_proc where oid='public.claim_qa_vt_metadata_recheck(text)'::regprocedure")
+    sql(migration('20261024002955_qa_vt_metadata_public_capability'))
+    assert original_claim == value("select jsonb_build_array(prosrc,proacl::text) from pg_proc where oid='public.claim_qa_vt_metadata_recheck(text)'::regprocedure")
+    sql(capability)
+    for role in ('anon','authenticated','service_role'):
+        assert value("select has_function_privilege('"+role+"','public.claim_qa_vt_metadata_recheck(text)','EXECUTE') = has_function_privilege('"+role+"','public.claim_qa_vt_metadata_recheck(text,boolean)','EXECUTE')")
+    denied("select claim_qa_vt_metadata_recheck('wrong-fixture',false)", 'authentication|secret|Unauthorized|unauthorized|invalid|Invalid')
+    denied("select claim_qa_vt_metadata_recheck('local-fixture-only',null)", 'QA VT capability required')
+    print('PASS unsupported public work consumes no attempt/lease/reservation and cannot block hash work; legacy body/ACL retained')
     print("LIMIT: CI cannot observe unmetered production callers; fresh live S3 caller-drain proof remains required.")
 
 
