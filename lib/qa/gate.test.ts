@@ -30,7 +30,12 @@ vi.mock('@/lib/supabase', () => ({
   // The gate falls back to the catalog snapshot when there is no server
   // client, so "not configured" follows whether the mock hands one out.
   isSupabaseServerConfigured: () => serverClientMock() !== null,
-  createServerClient: () => serverClientMock(),
+  // Like the real factory, this throws when Supabase is not configured.
+  createServerClient: () => {
+    const client = serverClientMock();
+    if (client === null) throw new Error('Supabase URL and service role key are required for server-side operations');
+    return client;
+  },
 }));
 
 function supabaseStub() {
@@ -1046,6 +1051,21 @@ describe('enforceQaGate', () => {
     // those checks simply do not run rather than crashing the deployment.
     beforeEach(() => {
       serverClientMock.mockReturnValue(null);
+    });
+
+    it('deploys without reading prerequisite reputation', async () => {
+      getQaResultMock.mockResolvedValue({ ...failedRow, outcome: 'Passed' });
+      resolveDependenciesMock.mockResolvedValue([{ installerSha256: 'C'.repeat(64) }]);
+
+      await expect(
+        enforceQaGate({
+          wingetId: 'OpenJS.NodeJS',
+          version: '26.7.0',
+          architecture: 'x64',
+          installerSha256,
+        })
+      ).resolves.toBeUndefined();
+      expect(dependencyCoverageMock).not.toHaveBeenCalled();
     });
 
     it('still blocks a build the catalog reports as failed', async () => {

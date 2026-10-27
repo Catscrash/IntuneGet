@@ -339,16 +339,22 @@ export async function enforceQaGate(input: {
 
   // Check the bundle being dispatched. Callers that only have a payload tuple
   // must resolve it first; a primary pass never covers stale prerequisites.
-  let dependenciesCovered: boolean;
-  try {
-    const dependencies = input.resolvedPackageDependencies ?? await resolveWingetPackageDependencies({
-      wingetId: input.wingetId, version: input.version, architecture, installerSha256,
-    });
-    dependenciesCovered = await arePackageDependenciesCovered(createServerClient(), dependencies);
-  } catch (error) {
-    throw reputationHold(error);
+  // Prerequisite reputation is read from catalog_file_reputation, so like the
+  // exact-payload checks above it is Supabase's alone and follows the same
+  // operator threshold and waiver. Asking for a server client without Supabase
+  // throws, which held every self-hosted deployment for reputation.
+  if (checksReputation && supabase) {
+    let dependenciesCovered: boolean;
+    try {
+      const dependencies = input.resolvedPackageDependencies ?? await resolveWingetPackageDependencies({
+        wingetId: input.wingetId, version: input.version, architecture, installerSha256,
+      });
+      dependenciesCovered = await arePackageDependenciesCovered(supabase, dependencies);
+    } catch (error) {
+      throw reputationHold(error);
+    }
+    if (!dependenciesCovered) throw reputationHold();
   }
-  if (!dependenciesCovered) throw reputationHold();
 
   if (!input.requirePassed && input.qaOverride) return;
 
