@@ -209,6 +209,21 @@ interface GraphAssignmentResponse {
   }>;
 }
 
+// Attempts per block (and for the block list commit) before the upload fails.
+const UPLOAD_ATTEMPTS = 4;
+const UPLOAD_RETRY_DELAY_MS = 1000;
+
+/**
+ * The detail Azure Storage puts in an error body, e.g. the
+ * AuthenticationErrorDetail of a rejected signature. The body never holds
+ * the SAS token itself.
+ */
+function azureErrorDetail(body: string): string {
+  const match = body.match(/<AuthenticationErrorDetail>([\s\S]*?)<\/AuthenticationErrorDetail>/)
+    ?? body.match(/<Code>([\s\S]*?)<\/Code>/);
+  return match ? ` (${match[1].trim().slice(0, 300)})` : '';
+}
+
 export class IntuneUploader {
   private config: PackagerConfig;
   private logger: Logger;
@@ -285,7 +300,8 @@ export class IntuneUploader {
         // Map chunk upload progress (0-100) to overall (25-80)
         const mappedPercent = 25 + Math.floor(percent * 0.55);
         await onProgress?.(mappedPercent, `Uploading package (${percent}%)...`);
-      }
+      },
+      () => this.renewAzureStorageUri(graphClient, app.id, contentVersion.id, contentFile.id)
     );
     this.logger.info('File chunks uploaded');
 
@@ -591,14 +607,75 @@ export class IntuneUploader {
   }
 
   /**
+   * Ask Intune for a fresh upload URI for the same content file. Azure
+   * occasionally rejects a block with 403 although earlier blocks with the
+   * same URI went through; a renewed URI lets the upload continue.
+   */
+  private async renewAzureStorageUri(
+    graphClient: GraphClient,
+    appId: string,
+    contentVersionId: string,
+    contentFileId: string
+  ): Promise<string> {
+    const filePath = `/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions/${contentVersionId}/files/${contentFileId}`;
+    await graphClient.post(`${filePath}/renewUpload`, {});
+
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const file = await graphClient.get<{ azureStorageUri?: string; uploadState?: string }>(filePath);
+      if (file.uploadState === 'azureStorageUriRenewalSuccess' && file.azureStorageUri) {
+        return file.azureStorageUri;
+      }
+      if (file.uploadState === 'azureStorageUriRenewalFailed' || file.uploadState === 'azureStorageUriRenewalTimedOut') {
+        throw new Error(`Azure Storage URI renewal failed (${file.uploadState})`);
+      }
+      await this.sleep(2000);
+    }
+
+    throw new Error('Timeout waiting for a renewed Azure Storage URI');
+  }
+
+  /**
    * Upload file in chunks to Azure Storage
    */
   private async uploadFileChunks(
     filePath: string,
     azureStorageUri: string,
-    onProgress?: (percent: number) => Promise<void>
+    onProgress?: (percent: number) => Promise<void>,
+    renewUri?: () => Promise<string>
   ): Promise<void> {
     const fetch = this.config.proxy?.fetch.bind(this.config.proxy) ?? (await import('node-fetch')).default;
+    let uploadUri = azureStorageUri;
+
+    // A single rejected block used to fail the whole deployment. Retry
+    // transient answers, and renew the upload URI when Azure refuses the
+    // signature, before giving up with Azure's own error detail.
+    const putWithRetry = async (what: string, buildUrl: (uri: string) => string, init: { headers: Record<string, string>; body: Buffer | string }) => {
+      for (let attempt = 1; ; attempt++) {
+        let failure: string;
+        let status: number | null = null;
+        try {
+          const response = await fetch(buildUrl(uploadUri), { method: 'PUT', ...init });
+          if (response.ok) {
+            return;
+          }
+          status = response.status;
+          failure = `${response.status} ${response.statusText}${azureErrorDetail(await response.text().catch(() => ''))}`;
+        } catch (error) {
+          failure = error instanceof Error ? error.message : String(error);
+        }
+
+        const retryable = status === null || status === 403 || status === 408 || status === 429 || status >= 500;
+        if (!retryable || attempt >= UPLOAD_ATTEMPTS) {
+          throw new Error(`Failed to ${what}: ${failure}`);
+        }
+        this.logger.warn(`Retrying after failure to ${what}`, { attempt, failure });
+        await this.sleep(UPLOAD_RETRY_DELAY_MS * attempt);
+        if (status === 403 && renewUri) {
+          uploadUri = await renewUri();
+          this.logger.info('Renewed Azure Storage URI');
+        }
+      }
+    };
     const fileHandle = await fs.promises.open(filePath, 'r');
     const stats = await fileHandle.stat();
     const fileSize = stats.size;
@@ -620,19 +697,17 @@ export class IntuneUploader {
         blockIds.push(blockId);
 
         // Upload block
-        const blockUrl = `${azureStorageUri}&comp=block&blockid=${encodeURIComponent(blockId)}`;
-        const response = await fetch(blockUrl, {
-          method: 'PUT',
-          headers: {
-            'Content-Length': chunk.length.toString(),
-            'x-ms-blob-type': 'BlockBlob',
-          },
-          body: chunk,
-        });
-
-        if (!response.ok) {
-          throw new Error(`Failed to upload block ${chunkIndex}: ${response.statusText}`);
-        }
+        await putWithRetry(
+          `upload block ${chunkIndex}`,
+          (uri) => `${uri}&comp=block&blockid=${encodeURIComponent(blockId)}`,
+          {
+            headers: {
+              'Content-Length': chunk.length.toString(),
+              'x-ms-blob-type': 'BlockBlob',
+            },
+            body: chunk,
+          }
+        );
 
         const percent = Math.floor(((chunkIndex + 1) / totalChunks) * 100);
         await onProgress?.(percent);
@@ -640,18 +715,12 @@ export class IntuneUploader {
 
       // Commit blocks
       const blockListXml = this.createBlockListXml(blockIds);
-      const commitUrl = `${azureStorageUri}&comp=blocklist`;
-      const commitResponse = await fetch(commitUrl, {
-        method: 'PUT',
+      await putWithRetry('commit blocks', (uri) => `${uri}&comp=blocklist`, {
         headers: {
           'Content-Type': 'application/xml',
         },
         body: blockListXml,
       });
-
-      if (!commitResponse.ok) {
-        throw new Error(`Failed to commit blocks: ${commitResponse.statusText}`);
-      }
     } finally {
       await fileHandle.close();
     }

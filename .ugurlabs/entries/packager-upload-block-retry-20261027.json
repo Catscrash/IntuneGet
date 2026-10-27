@@ -1,0 +1,5 @@
+{
+  "title": "Package uploads recover from rejected blocks",
+  "summary": "The local packager now retries a package block that Azure Storage rejects or drops during the upload to Intune, and requests a fresh upload location when Azure refuses the signature. A single transient failure no longer fails the deployment, and a lasting failure reports Azure's own error detail.",
+  "type": "fixed"
+}
