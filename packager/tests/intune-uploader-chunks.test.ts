@@ -38,6 +38,11 @@ interface ChunkUploader {
     onProgress?: (percent: number) => Promise<void>,
     renewUri?: () => Promise<string>
   ): Promise<void>;
+  commitContentVersion(
+    graphClient: { patch: FetchMock; get: FetchMock },
+    appId: string,
+    contentVersionId: string
+  ): Promise<void>;
   renewAzureStorageUri(
     graphClient: { post: FetchMock; get: FetchMock },
     appId: string,
@@ -155,5 +160,41 @@ describe('renewAzureStorageUri', () => {
     await expect(uploader(vi.fn()).renewAzureStorageUri(graph, 'app', 'version', 'file'))
       .rejects.toThrow('Azure Storage URI renewal failed (azureStorageUriRenewalFailed)');
     expect(graph.post).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('commitContentVersion', () => {
+  const serverError = new Error('Graph API PATCH failed: 500 - {"error":{"code":"InternalServerError"}}');
+
+  it('commits again after Intune keeps answering 500', async () => {
+    const graph = {
+      patch: vi.fn().mockRejectedValueOnce(serverError).mockRejectedValueOnce(serverError).mockResolvedValue({}),
+      get: vi.fn(async () => ({ committedContentVersion: null })),
+    };
+    const instance = uploader(vi.fn());
+
+    await expect(instance.commitContentVersion(graph, 'app', '1')).resolves.toBeUndefined();
+    expect(graph.patch).toHaveBeenCalledTimes(3);
+    expect(instance.sleep).toHaveBeenCalledWith(30000);
+  });
+
+  it('accepts a commit that Intune applied although it answered 500', async () => {
+    const graph = {
+      patch: vi.fn().mockRejectedValue(serverError),
+      get: vi.fn(async () => ({ committedContentVersion: '1' })),
+    };
+
+    await expect(uploader(vi.fn()).commitContentVersion(graph, 'app', '1')).resolves.toBeUndefined();
+    expect(graph.patch).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after six rounds with the last error', async () => {
+    const graph = {
+      patch: vi.fn().mockRejectedValue(serverError),
+      get: vi.fn(async () => ({ committedContentVersion: null })),
+    };
+
+    await expect(uploader(vi.fn()).commitContentVersion(graph, 'app', '1')).rejects.toBe(serverError);
+    expect(graph.patch).toHaveBeenCalledTimes(6);
   });
 });

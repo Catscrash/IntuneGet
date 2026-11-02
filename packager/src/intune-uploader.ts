@@ -215,6 +215,10 @@ const UPLOAD_RETRY_DELAY_MS = 1000;
 // Renewal requests for one upload URI before the renewal counts as failed.
 const RENEWAL_REQUESTS = 3;
 const RENEWAL_RETRY_DELAY_MS = 5000;
+// Rounds of the content version commit, each with the Graph client's own
+// retries, and the pause between them: about five minutes in all.
+const COMMIT_ROUNDS = 6;
+const COMMIT_RETRY_DELAY_MS = 30000;
 
 /**
  * The detail Azure Storage puts in an error body, e.g. the
@@ -821,17 +825,45 @@ export class IntuneUploader {
   }
 
   /**
-   * Commit the content version
+   * Commit the content version.
+   *
+   * Under load Intune answers this PATCH with 500 InternalServerError for
+   * longer than the Graph client's own retries wait, although the uploaded
+   * file is complete. The PATCH is idempotent, so it is repeated over a few
+   * minutes; before each repeat the app is read, since a 500 can arrive for a
+   * commit Intune did apply.
    */
   private async commitContentVersion(
     graphClient: GraphClient,
     appId: string,
     contentVersionId: string
   ): Promise<void> {
-    await graphClient.patch(`/deviceAppManagement/mobileApps/${appId}`, {
-      '@odata.type': '#microsoft.graph.win32LobApp',
-      committedContentVersion: contentVersionId,
-    });
+    for (let round = 1; ; round++) {
+      try {
+        await graphClient.patch(`/deviceAppManagement/mobileApps/${appId}`, {
+          '@odata.type': '#microsoft.graph.win32LobApp',
+          committedContentVersion: contentVersionId,
+        });
+        return;
+      } catch (error) {
+        const app = await graphClient
+          .get<{ committedContentVersion?: string | null }>(`/deviceAppManagement/mobileApps/${appId}`)
+          .catch(() => null);
+        if (app?.committedContentVersion === contentVersionId) {
+          this.logger.info('Content version was committed despite the error', { appId, contentVersionId });
+          return;
+        }
+        if (round >= COMMIT_ROUNDS) {
+          throw error;
+        }
+        this.logger.warn('Committing the content version failed; trying again', {
+          appId,
+          round,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await this.sleep(COMMIT_RETRY_DELAY_MS);
+      }
+    }
   }
 
   /**
