@@ -212,6 +212,9 @@ interface GraphAssignmentResponse {
 // Attempts per block (and for the block list commit) before the upload fails.
 const UPLOAD_ATTEMPTS = 4;
 const UPLOAD_RETRY_DELAY_MS = 1000;
+// Renewal requests for one upload URI before the renewal counts as failed.
+const RENEWAL_REQUESTS = 3;
+const RENEWAL_RETRY_DELAY_MS = 5000;
 
 /**
  * The detail Azure Storage puts in an error body, e.g. the
@@ -618,20 +621,34 @@ export class IntuneUploader {
     contentFileId: string
   ): Promise<string> {
     const filePath = `/deviceAppManagement/mobileApps/${appId}/microsoft.graph.win32LobApp/contentVersions/${contentVersionId}/files/${contentFileId}`;
-    await graphClient.post(`${filePath}/renewUpload`, {});
 
-    for (let attempt = 0; attempt < 30; attempt++) {
-      const file = await graphClient.get<{ azureStorageUri?: string; uploadState?: string }>(filePath);
-      if (file.uploadState === 'azureStorageUriRenewalSuccess' && file.azureStorageUri) {
-        return file.azureStorageUri;
+    // Intune itself sometimes fails a renewal under load; a later request for
+    // the same file usually succeeds.
+    for (let request = 1; ; request++) {
+      await graphClient.post(`${filePath}/renewUpload`, {});
+
+      let failedState: string | undefined;
+      for (let attempt = 0; attempt < 30 && !failedState; attempt++) {
+        const file = await graphClient.get<{ azureStorageUri?: string; uploadState?: string }>(filePath);
+        if (file.uploadState === 'azureStorageUriRenewalSuccess' && file.azureStorageUri) {
+          return file.azureStorageUri;
+        }
+        if (file.uploadState === 'azureStorageUriRenewalFailed' || file.uploadState === 'azureStorageUriRenewalTimedOut') {
+          failedState = file.uploadState;
+        } else {
+          await this.sleep(2000);
+        }
       }
-      if (file.uploadState === 'azureStorageUriRenewalFailed' || file.uploadState === 'azureStorageUriRenewalTimedOut') {
-        throw new Error(`Azure Storage URI renewal failed (${file.uploadState})`);
+
+      const failure = failedState
+        ? `Azure Storage URI renewal failed (${failedState})`
+        : 'Timeout waiting for a renewed Azure Storage URI';
+      if (request >= RENEWAL_REQUESTS) {
+        throw new Error(failure);
       }
-      await this.sleep(2000);
+      this.logger.warn('Requesting the Azure Storage URI renewal again', { request, failure });
+      await this.sleep(RENEWAL_RETRY_DELAY_MS * request);
     }
-
-    throw new Error('Timeout waiting for a renewed Azure Storage URI');
   }
 
   /**
@@ -671,8 +688,16 @@ export class IntuneUploader {
         this.logger.warn(`Retrying after failure to ${what}`, { attempt, failure });
         await this.sleep(UPLOAD_RETRY_DELAY_MS * attempt);
         if (status === 403 && renewUri) {
-          uploadUri = await renewUri();
-          this.logger.info('Renewed Azure Storage URI');
+          // A renewal that fails does not end the upload: the 403 may have
+          // been transient, so the next attempt goes out with the current URI.
+          try {
+            uploadUri = await renewUri();
+            this.logger.info('Renewed Azure Storage URI');
+          } catch (error) {
+            this.logger.warn('Could not renew the Azure Storage URI; retrying with the current one', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       }
     };

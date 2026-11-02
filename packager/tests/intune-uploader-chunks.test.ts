@@ -38,6 +38,12 @@ interface ChunkUploader {
     onProgress?: (percent: number) => Promise<void>,
     renewUri?: () => Promise<string>
   ): Promise<void>;
+  renewAzureStorageUri(
+    graphClient: { post: FetchMock; get: FetchMock },
+    appId: string,
+    contentVersionId: string,
+    contentFileId: string
+  ): Promise<string>;
   sleep(ms: number): Promise<void>;
 }
 
@@ -110,5 +116,44 @@ describe('uploadFileChunks', () => {
       uploader(fetch).uploadFileChunks(file, 'https://blob.example/app?sig=first')
     ).rejects.toThrow('Failed to upload block 0: 400 Bad Request (InvalidBlockId)');
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps uploading with the current URI when the renewal fails', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(AUTH_FAILURE)
+      .mockResolvedValue(reply(201));
+    const renewUri = vi.fn(async () => {
+      throw new Error('Azure Storage URI renewal failed (azureStorageUriRenewalFailed)');
+    });
+
+    await uploader(fetch).uploadFileChunks(file, 'https://blob.example/app?sig=first', undefined, renewUri);
+
+    expect(renewUri).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls.map(([url]) => String(url)).every((url) => url.includes('sig=first'))).toBe(true);
+  });
+});
+
+describe('renewAzureStorageUri', () => {
+  const pending = { uploadState: 'azureStorageUriRenewalPending' };
+  const failed = { uploadState: 'azureStorageUriRenewalFailed' };
+  const renewed = { uploadState: 'azureStorageUriRenewalSuccess', azureStorageUri: 'https://blob.example/app?sig=renewed' };
+
+  it('requests the renewal again after Intune reports it failed', async () => {
+    const graph = {
+      post: vi.fn(async () => ({})),
+      get: vi.fn().mockResolvedValueOnce(pending).mockResolvedValueOnce(failed).mockResolvedValueOnce(renewed),
+    };
+
+    await expect(uploader(vi.fn()).renewAzureStorageUri(graph, 'app', 'version', 'file'))
+      .resolves.toBe('https://blob.example/app?sig=renewed');
+    expect(graph.post).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives up after three failed renewal requests', async () => {
+    const graph = { post: vi.fn(async () => ({})), get: vi.fn(async () => failed) };
+
+    await expect(uploader(vi.fn()).renewAzureStorageUri(graph, 'app', 'version', 'file'))
+      .rejects.toThrow('Azure Storage URI renewal failed (azureStorageUriRenewalFailed)');
+    expect(graph.post).toHaveBeenCalledTimes(3);
   });
 });

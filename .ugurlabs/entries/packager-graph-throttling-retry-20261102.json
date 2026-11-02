@@ -1,0 +1,5 @@
+{
+  "title": "Local packager rides out Intune throttling",
+  "summary": "The local packager now retries Microsoft Graph requests that Intune turns away with 429 or 503 ServerBusy, honouring Retry-After, which is common when many apps update at once. A failed upload location renewal is requested again and no longer ends the upload on its own. Requests that may already have created an app are not repeated, so retries never add duplicate apps.",
+  "type": "fixed"
+}
