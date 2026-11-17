@@ -5,6 +5,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
+import { isSuccessfulDeployment } from '@/lib/analytics/dashboard-stats';
 import { parseAccessToken } from '@/lib/auth-utils';
 
 interface DailyDeployment {
@@ -66,17 +67,15 @@ export async function GET(request: NextRequest) {
       completed_at: string | null;
     }
 
-    // Get all jobs in date range. getAllByUserId() rather than getByUserId(),
-    // which caps at 50 rows: a report over a 30-365 day window must count every
-    // job in it, not just the newest page.
-    const jobs = (await database.jobs.getAllByUserId(user.userId)).filter(
+    // Get all jobs in date range
+    const jobs = (await database.jobs.getAnalyticsJobs({ userId: user.userId })).filter(
       (job) => new Date(job.created_at) >= startDate
     );
 
     const allJobs = (jobs || []) as PackagingJobAnalytics[];
 
     // Calculate success rate
-    const completedJobs = allJobs.filter((j) => j.status === 'completed').length;
+    const completedJobs = allJobs.filter((j) => isSuccessfulDeployment(j.status)).length;
     const failedJobs = allJobs.filter((j) => j.status === 'failed').length;
     const totalFinished = completedJobs + failedJobs;
     const successRate = totalFinished > 0 ? Math.round((completedJobs / totalFinished) * 100) : 0;
@@ -86,8 +85,7 @@ export async function GET(request: NextRequest) {
 
     // Initialize all days in range
     for (let i = 0; i < days; i++) {
-      const date = new Date();
-      date.setDate(date.getDate() - i);
+      const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
       const dateStr = date.toISOString().split('T')[0];
       dailyMap.set(dateStr, { completed: 0, failed: 0 });
     }
@@ -100,7 +98,7 @@ export async function GET(request: NextRequest) {
 
       const existing = dailyMap.get(date);
       if (existing) {
-        if (job.status === 'completed') {
+        if (isSuccessfulDeployment(job.status)) {
           existing.completed++;
         } else if (job.status === 'failed') {
           existing.failed++;
@@ -120,7 +118,7 @@ export async function GET(request: NextRequest) {
     const appCounts = new Map<string, { displayName: string; publisher: string; count: number }>();
 
     allJobs
-      .filter((j) => j.status === 'completed')
+      .filter((j) => isSuccessfulDeployment(j.status))
       .forEach((job) => {
         const existing = appCounts.get(job.winget_id);
         if (existing) {

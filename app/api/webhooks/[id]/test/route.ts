@@ -62,6 +62,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     await db.webhooks.update(id, user.userId, statusUpdate);
 
+    // result.error is a short server authored reason (for example "HTTP 404").
+    // Text returned by the destination is never passed back to the caller.
     return NextResponse.json({
       success: result.success,
       statusCode: result.statusCode,

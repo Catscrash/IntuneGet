@@ -1,3 +1,6 @@
+import React, { type ReactNode } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import AppDetailPage from '@/app/(marketing)/apps/[wingetId]/page';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -8,6 +11,7 @@ const {
   resolveManifestMock,
   resolveDependenciesMock,
   adoptRepairMock,
+  adoptCorrectedRepairMock,
 } = vi.hoisted(() => ({
   getPackageCompatibilityBlockMock: vi.fn(),
   createServerClientMock: vi.fn(),
@@ -16,6 +20,7 @@ const {
   resolveManifestMock: vi.fn(),
   resolveDependenciesMock: vi.fn().mockResolvedValue([]),
   adoptRepairMock: vi.fn(),
+  adoptCorrectedRepairMock: vi.fn(),
 }));
 
 vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock }));
@@ -24,6 +29,10 @@ vi.mock('@/lib/qa/repair-adoption', async importOriginal => ({
   adoptRepairCurrentCandidate: adoptRepairMock,
 }));
 vi.mock('@/lib/package-eligibility', () => ({ getPackageCompatibilityBlock: getPackageCompatibilityBlockMock }));
+vi.mock('@/lib/qa/repair-correction',async original=>({
+  ...await original<typeof import('@/lib/qa/repair-correction')>(),
+  adoptRepairCorrectedCandidate:adoptCorrectedRepairMock,
+}));
 vi.mock('@/lib/qa/winget-changes', () => ({ detectWingetChanges: detectWingetChangesMock }));
 vi.mock('@/lib/winget-sync-resolution.mjs', () => ({
   createWingetManifestClient: createManifestClientMock,
@@ -37,7 +46,7 @@ vi.mock('@/lib/winget-dependencies', async (importOriginal) => {
   };
 });
 
-import { GET } from './route';
+import { GET, POST } from './route';
 import { shouldReactivateSupersededCandidate } from '@/lib/qa/candidate-reactivation';
 import { prioritizeToolchainBackfill } from '@/lib/qa/toolchain-backfill';
 import {
@@ -48,6 +57,35 @@ import {
 } from '@/lib/qa/package-profile';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 import { WingetDependencyCompatibilityError } from '@/lib/winget-dependencies';
+
+const source = vi.hoisted(() => ({
+  getAppByWingetId: vi.fn(),
+  getQaResult: vi.fn(),
+  getInstallationChangelog: vi.fn(),
+  getVersionInstallerInfo: vi.fn(),
+  getPopularApps: vi.fn(),
+}));
+
+vi.mock('@/lib/catalog', () => ({ getCatalogSource: () => source }));
+vi.mock('gt-next', () => ({
+  T: ({ children }: { children: ReactNode }) => children,
+  Var: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock('next/navigation', () => ({
+  notFound: () => { throw new Error('Unexpected not found'); },
+  permanentRedirect: () => { throw new Error('Unexpected redirect'); },
+}));
+vi.mock('next/link', () => ({
+  default: ({ href, children }: { href: string; children: ReactNode }) =>
+    React.createElement('a', { href }, children),
+}));
+vi.mock('@/components/landing/Header', () => ({ Header: () => null }));
+vi.mock('@/components/landing/sections/Footer', () => ({ Footer: () => null }));
+vi.mock('@/components/AppIcon', () => ({ AppIcon: () => null }));
+vi.mock('@/components/catalog/CatalogAppCard', () => ({ CatalogAppCard: () => null }));
+vi.mock('@/components/catalog/CatalogCta', () => ({ CatalogCta: () => null }));
+vi.mock('@/components/qa/QaReportButton', () => ({ QaReportButton: () => null }));
+
 
 type QueryResult = {
   data: unknown;
@@ -67,6 +105,7 @@ function query(result: QueryResult) {
     'limit',
     'or',
     'contains',
+    'abortSignal',
   ]) {
     builder[method] = vi.fn(() => builder);
   }
@@ -91,6 +130,14 @@ function createSupabaseStub(options: {
   backfillCheckpoint?: { after: string; pending: string[] };
   backfillError?: string;
   demandBackfillApps?: string[];
+  demandError?: boolean;
+  slowDemand?: boolean;
+  demandDelayMs?: number;
+  privateDemandError?: boolean;
+  transportDemandError?: boolean;
+  optionalSkip?: boolean;
+  slowSkipRead?: boolean;
+  slowSkipWrite?: boolean;
   catalogBackfillApps?: string[];
   deployedApps?: string[];
   customerQaJobs?: string[];
@@ -132,6 +179,11 @@ function createSupabaseStub(options: {
           error: null,
         });
       }
+      if (name === 'qa_missing_demand_backfill_ids' && options.slowDemand) return new Promise<{data: null; error: null}>(() => {});
+      if (name === 'qa_missing_demand_backfill_ids' && options.demandDelayMs) return new Promise<{data: unknown[]; error: null}>(resolve => setTimeout(() => resolve({data: [{winget_id: 'SECRET_ROW'}], error: null}), options.demandDelayMs));
+      if (name === 'qa_missing_demand_backfill_ids' && options.privateDemandError) return Promise.resolve({data: null, error: {code: '57014', message: 'statement timeout SECRET_ERROR'}, status: 500, headers: {secret: 'SECRET_HEADER'}});
+      if (name === 'qa_missing_demand_backfill_ids' && options.transportDemandError) return Promise.resolve({data: null, error: {code: '', message: 'TypeError: fetch failed SECRET_ERROR'}, status: 0, headers: {secret: 'SECRET_HEADER'}});
+      if (name === 'qa_missing_demand_backfill_ids' && options.demandError) return Promise.resolve({data: null, error: {code: '57014', message: 'canceling statement due to statement timeout'}});
       if (name !== 'qa_missing_demand_backfill_ids') {
         throw new Error(`Unexpected RPC: ${name}`);
       }
@@ -142,9 +194,11 @@ function createSupabaseStub(options: {
     }),
     from: vi.fn((table: string) => {
       if (table === 'qa_automation_state') {
-        const builder = query({ data: { value: options.backfillCheckpoint || {} }, error: null });
+        const builder = query({ data: { value: options.optionalSkip ? {skipNext: true} : options.backfillCheckpoint || {} }, error: null });
+        if (options.slowSkipRead) builder.maybeSingle = vi.fn(() => new Promise<QueryResult>(() => {}));
         builder.upsert = vi.fn((value: Record<string, unknown>) => {
           checkpoints.push(value);
+          if (options.slowSkipWrite && value.id === 'qa-optional-backfill-skip') { const pending = query({data: null, error: null}); pending.then = () => new Promise(() => {}); return pending; }
           return query({ data: null, error: null });
         });
         return builder;
@@ -271,6 +325,8 @@ function createSupabaseStub(options: {
       throw new Error(`Unexpected table: ${table}`);
     }),
   };
+  const originalRpc = client.rpc;
+  client.rpc = vi.fn((name: string, args: Record<string, unknown>) => { const result = originalRpc(name,args); return Object.assign(result, {abortSignal: () => result}); });
   return {
     client,
     pollRunInserts,
@@ -412,6 +468,32 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('POST corrected profile preparation',()=>{
+  const body={repairId:'22222222-2222-4222-8222-222222222222',expectedOldProfile:'A'.repeat(64),expectedNewProfile:'B'.repeat(64),contract:'exe-embedded-msi-target@1779'};
+  const request=(data:unknown=body,authorized=true,query='')=>new Request('https://intuneget.com/api/cron/qa-enqueue'+query,{method:'POST',headers:authorized?{authorization:'Bearer test-cron-secret'}:{},body:JSON.stringify(data)});
+  it('authenticates and validates exact fields before any database or manifest access',async()=>{
+    expect((await POST(request(body,false))).status).toBe(401);
+    expect((await POST(request({...body,silentArgs:'/override'}))).status).toBe(400);
+    expect((await POST(request(body,true,'?id=Example.App'))).status).toBe(400);
+    expect(createServerClientMock).not.toHaveBeenCalled();expect(createManifestClientMock).not.toHaveBeenCalled();
+  });
+  it('prepares one exact request without starting a scheduler scan or a heartbeat write',async()=>{
+    const f=createSupabaseStub({requiredPackagerCommit:QA_PSADT_TOOLCHAIN.packagerCommit});
+    createServerClientMock.mockReturnValue(f.client);
+    adoptCorrectedRepairMock.mockResolvedValueOnce({outcome:'adopted',candidateId:'prepared'});
+    const response=await POST(request());expect(response.status).toBe(200);
+    expect(adoptCorrectedRepairMock).toHaveBeenCalledOnce();expect(f.pollRunInserts).toEqual([]);
+    expect(f.candidateInserts).toEqual([]);expect(f.pipelineControlUpdates).toEqual([]);expect(detectWingetChangesMock).not.toHaveBeenCalled();
+  });
+  it('retains pipeline pause and release readiness guards',async()=>{
+    for(const options of [{paused:true},{requiredPackagerCommit:'f'.repeat(40)}]){
+      createServerClientMock.mockReturnValue(createSupabaseStub(options).client);
+      expect((await POST(request())).status).toBe(409);
+    }
+    expect(adoptCorrectedRepairMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('GET /api/cron/qa-enqueue', () => {
   it('adopts one repair before any poll or catalog scan', async () => {
     const { client,pollRunInserts,candidateInserts }=createSupabaseStub({requiredPackagerCommit:QA_PSADT_TOOLCHAIN.packagerCommit});
@@ -442,8 +524,8 @@ describe('GET /api/cron/qa-enqueue', () => {
     createServerClientMock.mockReturnValue(client);
     await GET(cronRequest());
     expect(rpcCalls.filter(call => call.name === 'qa_toolchain_backfill_page')).toEqual([
-      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Previous.App', p_limit: 100, p_terminal_retry_ids: expect.any(Array) }) },
-      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Page0.App099', p_limit: 100 }) },
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Previous.App', p_limit: 25, p_terminal_retry_ids: expect.any(Array) }) },
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: 'Page0.App099', p_limit: 25 }) },
     ]);
     expect(checkpoints.at(-1)).toMatchObject({ value: { after: 'Page1.App099', pending: [] } });
   });
@@ -611,9 +693,9 @@ describe('GET /api/cron/qa-enqueue', () => {
       }),
     ]);
     expect(rpcCalls).toEqual([
-      { name: 'qa_missing_demand_backfill_ids', args: { p_limit: 20 } },
-      { name: 'qa_idle_catalog_backfill_ids', args: { p_limit: 20 } },
-      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: '', p_limit: 100, p_terminal_retry_ids: expect.any(Array) }) },
+      { name: 'qa_missing_demand_backfill_ids', args: { p_limit: 5 } },
+      { name: 'qa_toolchain_backfill_page', args: expect.objectContaining({ p_after: '', p_limit: 25, p_terminal_retry_ids: expect.any(Array) }) },
+      { name: 'qa_idle_catalog_backfill_ids', args: { p_limit: 5 } },
     ]);
     expect(pollRunUpdates).toEqual([
       expect.objectContaining({
@@ -727,7 +809,7 @@ describe('GET /api/cron/qa-enqueue', () => {
     });
     expect(rpcCalls).toContainEqual({
       name: 'qa_idle_catalog_backfill_ids',
-      args: { p_limit: 20 },
+      args: { p_limit: 5 },
     });
     expect(candidateInserts[0]).toMatchObject({
       winget_id: 'Missing.App',
@@ -775,7 +857,7 @@ describe('GET /api/cron/qa-enqueue', () => {
     });
     expect(rpcCalls).toContainEqual({
       name: 'qa_idle_catalog_backfill_ids',
-      args: { p_limit: 20 },
+      args: { p_limit: 5 },
     });
     expect(candidateInserts).toEqual([
       expect.objectContaining({
@@ -1921,5 +2003,140 @@ describe('GET /api/cron/qa-enqueue', () => {
       'Error.App',
       'Newest.App',
     ]);
+  });
+});
+
+
+describe('optional backfill budget', () => {
+  const settleRecords = () => vi.mocked(console.log).mock.calls
+    .map(([line]) => JSON.parse(String(line)))
+    .filter(entry => entry.message === 'qa_backfill_rpc_settled');
+  const allowedKeys = ['level', 'message', 'route', 'lane', 'pollRequestId', 'deployment', 'region', 'startOffsetMs', 'elapsedMs', 'settledBy', 'httpStatus', 'pgCode', 'rowCount', 'wallStartIso'];
+  const checkRecord = (record: Record<string, unknown>) => {
+    expect(Object.keys(record).every(key => allowedKeys.includes(key))).toBe(true);
+    expect(record.elapsedMs).toEqual(expect.any(Number));
+    expect(Number.isFinite(record.elapsedMs)).toBe(true);
+    expect(Number(record.elapsedMs)).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(record.startOffsetMs)).toBe(true);
+    expect(Number(record.startOffsetMs)).toBeGreaterThanOrEqual(0);
+  };
+
+  it('records a delayed data winner once without serializing rows', async () => {
+    vi.useFakeTimers();
+    try {
+      const {client} = createSupabaseStub({demandDelayMs: 300});
+      createServerClientMock.mockReturnValue(client);
+      const pending = GET(cronRequest());
+      await vi.advanceTimersByTimeAsync(300);
+      await pending;
+      const records = settleRecords();
+      const demand = records.filter(r => r.lane === 'demand-backfill');
+      expect(demand).toHaveLength(1);
+      expect(demand[0]).toMatchObject({settledBy: 'data', rowCount: 1});
+      records.forEach(checkRecord);
+      expect(JSON.stringify(records)).not.toContain('SECRET_ROW');
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(settleRecords()).toHaveLength(records.length);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('whitelists an error record while preserving the error and skip flag', async () => {
+    const {client, checkpoints} = createSupabaseStub({privateDemandError: true});
+    createServerClientMock.mockReturnValue(client);
+    const response = await GET(cronRequest());
+    expect(response.status).toBe(207);
+    expect((await response.json()).errors.join(' ')).toContain('statement timeout SECRET_ERROR');
+    expect(checkpoints).toContainEqual(expect.objectContaining({id: 'qa-optional-backfill-skip', value: {skipNext: true}}));
+    const records = settleRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({settledBy: 'pg_error', pgCode: '57014', httpStatus: 500});
+    checkRecord(records[0]);
+    expect(JSON.stringify(records)).not.toMatch(/SECRET_ERROR|SECRET_HEADER/);
+  });
+  it.each([false, true])('classifies status zero with aborted signal %s without changing the result', async aborted => {
+    const signalMock = aborted ? vi.spyOn(AbortSignal, 'timeout').mockReturnValue(AbortSignal.abort()) : undefined;
+    try {
+      const {client, checkpoints} = createSupabaseStub({transportDemandError: true});
+      createServerClientMock.mockReturnValue(client);
+      const response = await GET(cronRequest());
+      expect(response.status).toBe(207);
+      expect((await response.json()).errors.join(' ')).toContain('TypeError: fetch failed SECRET_ERROR');
+      expect(checkpoints).not.toContainEqual(expect.objectContaining({id: 'qa-optional-backfill-skip', value: {skipNext: true}}));
+      const record = settleRecords().find(r => r.lane === 'demand-backfill');
+      expect(record).toMatchObject({settledBy: aborted ? 'abort_signal' : 'transport_error', httpStatus: 0});
+      checkRecord(record);
+      expect(record.pgCode).toBeUndefined();
+      expect(JSON.stringify(record)).not.toMatch(/SECRET_ERROR|SECRET_HEADER/);
+    } finally { signalMock?.mockRestore(); }
+  });
+
+  it('bounds waiting even if the SDK never settles after abort', async () => {
+    vi.useFakeTimers();
+    try {
+      const {client, rpcCalls, checkpoints} = createSupabaseStub({slowDemand: true});
+      createServerClientMock.mockReturnValue(client);
+      const request = GET(cronRequest());
+      source.getAppByWingetId.mockResolvedValue({app: {winget_id: 'Fixture.App', name: 'Fixture app', publisher: 'Fixture publisher', latest_version: '1.0', description: 'Fixture description', category: 'utilities', app_source: 'win32', is_verified: true, is_locale_variant: false}, versions: ['1.0']});
+      source.getQaResult.mockResolvedValue(null);
+      source.getInstallationChangelog.mockResolvedValue(null);
+      source.getPopularApps.mockResolvedValue({data: [], total: 0});
+      source.getVersionInstallerInfo.mockResolvedValue(null);
+      const started = performance.now();
+      const html = renderToStaticMarkup(await AppDetailPage({params: Promise.resolve({wingetId: 'Fixture.App'})}));
+      expect(html).toContain('Fixture app');
+      expect(performance.now() - started).toBeLessThan(1_000);
+      // The actual page renders while the independent backfill is still pending.
+      await vi.advanceTimersByTimeAsync(3_000);
+      const response = await request;
+      expect(response.status).toBe(207);
+      expect(rpcCalls.map(c => c.name)).toEqual(['qa_missing_demand_backfill_ids']);
+      expect(checkpoints).toContainEqual(expect.objectContaining({id: 'qa-optional-backfill-skip', value: expect.objectContaining({skipNext: true})}));
+      expect(settleRecords()).toHaveLength(1);
+      expect(settleRecords()[0]).toMatchObject({lane: 'demand-backfill', settledBy: 'race_timer'});
+      checkRecord(settleRecords()[0]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['read', 'write'] as const)('bounds a stalled optional checkpoint %s', async kind => {
+    vi.useFakeTimers();
+    try {
+      const {client, rpcCalls} = createSupabaseStub({slowSkipRead: kind === 'read', slowSkipWrite: kind === 'write', demandError: kind === 'write'});
+      createServerClientMock.mockReturnValue(client);
+      let settled = false;
+      const request = GET(cronRequest()).then(response => { settled = true; return response; });
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(settled).toBe(true);
+      const response = await request;
+      expect(response.status).toBe(207);
+      expect(detectWingetChangesMock).toHaveBeenCalled();
+      expect(rpcCalls.some(c => ['qa_idle_catalog_backfill_ids', 'qa_toolchain_backfill_page'].includes(c.name))).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not start other optional lanes after a demand timeout', async () => {
+    const {client, rpcCalls, checkpoints} = createSupabaseStub({demandError: true});
+    createServerClientMock.mockReturnValue(client);
+    const response = await GET(cronRequest());
+    expect(response.status).toBe(207);
+    const result = await response.json();
+    expect(result.errors.join(' ')).toContain('demand-backfill:');
+    expect(rpcCalls.some(c => c.name === 'qa_idle_catalog_backfill_ids' || c.name === 'qa_toolchain_backfill_page')).toBe(false);
+    expect(checkpoints).toContainEqual(expect.objectContaining({id: 'qa-optional-backfill-skip', value: expect.objectContaining({skipNext: true})}));
+  });
+  it('skips optional lanes on the next tick and clears the flag without an error', async () => {
+    const {client, rpcCalls, checkpoints} = createSupabaseStub({optionalSkip: true});
+    createServerClientMock.mockReturnValue(client);
+    const response = await GET(cronRequest());
+    expect(response.status).toBe(200);
+    expect(rpcCalls.some(c => ['qa_missing_demand_backfill_ids','qa_idle_catalog_backfill_ids','qa_toolchain_backfill_page'].includes(c.name))).toBe(false);
+    expect(checkpoints).toContainEqual(expect.objectContaining({id: 'qa-optional-backfill-skip', value: expect.objectContaining({skipNext: false})}));
+    expect(detectWingetChangesMock).toHaveBeenCalled();
+    expect(settleRecords()).toHaveLength(0);
+  });
+  it('keeps demand and idle pages at five rows', async () => {
+    const {client, rpcCalls} = createSupabaseStub({});
+    createServerClientMock.mockReturnValue(client);
+    await GET(cronRequest());
+    for (const name of ['qa_missing_demand_backfill_ids','qa_idle_catalog_backfill_ids']) expect(rpcCalls.find(c => c.name === name)?.args.p_limit).toBe(5);
   });
 });

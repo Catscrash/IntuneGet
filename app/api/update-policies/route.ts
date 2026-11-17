@@ -7,8 +7,10 @@
 import { isAutoUpdateScope } from '@/types/update-policies';
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { parseAccessToken } from '@/lib/auth-utils';
+import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
 import type { AppUpdatePolicyInput, DeploymentConfig } from '@/types/update-policies';
 import type { Json } from '@/types/database';
@@ -81,6 +83,28 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: `Invalid policy_type. Must be one of: ${validPolicyTypes.join(', ')}` },
         { status: 400 }
+      );
+    }
+
+    // tenant_id comes from the request body. It must be the caller's own
+    // tenant or a customer tenant their MSP role may set policies for. A
+    // self-hosted installation without Supabase serves one tenant: the
+    // caller's own.
+    if (isSupabaseServerConfigured()) {
+      const tenantResolution = await resolveTargetTenantId({
+        supabase: createServerClient(),
+        userId: user.userId,
+        tokenTenantId: user.tenantId,
+        requestedTenantId: body.tenant_id,
+        requiredPermission: 'manage_policies',
+      });
+      if (tenantResolution.errorResponse) {
+        return tenantResolution.errorResponse;
+      }
+    } else if (body.tenant_id !== user.tenantId) {
+      return NextResponse.json(
+        { error: 'This installation cannot manage another tenant' },
+        { status: 403 }
       );
     }
 
@@ -167,7 +191,7 @@ export async function POST(request: NextRequest) {
       body.tenant_id,
       body.winget_id
     );
-    const policy = await db.updatePolicies.upsert({
+    let policy = await db.updatePolicies.upsert({
       user_id: user.userId,
       tenant_id: body.tenant_id,
       winget_id: body.winget_id,
@@ -178,6 +202,20 @@ export async function POST(request: NextRequest) {
       original_upload_history_id: derivedOriginalUploadHistoryId,
       is_enabled: body.is_enabled ?? true,
     });
+
+    // Turning automatic updates (back) on clears the circuit breaker, so a
+    // policy paused after repeated failures can recover. The upsert keeps the
+    // stored count on conflict, so it is reset separately.
+    if (
+      body.policy_type === 'auto_update' &&
+      body.is_enabled !== false &&
+      policy.consecutive_failures !== 0
+    ) {
+      policy = (await db.updatePolicies.update(policy.id, user.userId, {
+        consecutive_failures: 0,
+        updated_at: new Date().toISOString(),
+      })) ?? policy;
+    }
 
     return NextResponse.json({ policy, created: !existing });
   } catch {

@@ -11,7 +11,7 @@ import { parseAccessToken } from '@/lib/auth-utils';
 import { hasPermission, type MspRole } from '@/lib/msp-permissions';
 import { createAuditLog } from '@/lib/audit-logger';
 import { generateWebhookSecret } from '@/lib/msp/webhook-signatures';
-import { validateWebhookTarget } from '@/lib/webhooks/egress';
+import { validateWebhookDestination } from '@/lib/webhooks/destination';
 import type { Database } from '@/types/database';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -201,10 +201,12 @@ export async function PUT(request: NextRequest, context: RouteContext) {
     }
 
     if (body.url !== undefined) {
-      const urlValidation = await validateWebhookTarget(body.url);
-      if (!urlValidation.valid) {
+      // HTTPS, no credentials, and a destination that resolves to public
+      // addresses only
+      const destination = await validateWebhookDestination(body.url);
+      if (!destination.valid) {
         return NextResponse.json(
-          { error: urlValidation.error || 'Invalid webhook URL' },
+          { error: destination.error || 'Invalid webhook URL' },
           { status: 400 }
         );
       }

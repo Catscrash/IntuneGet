@@ -267,7 +267,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
         espProfiles: espProfiles.length ? espProfiles : undefined,
         updatePolicy,
         assignmentMigration: updatePolicy === 'auto_update'
-          ? { carryOverAssignments, removeAssignmentsFromPreviousApp: carryOverAssignments } : undefined,
+          ? { carryOverAssignments, removeAssignmentsFromPreviousApp: false } : undefined,
       });
       onClose();
       return;
@@ -331,7 +331,7 @@ export function CartItemConfig({ item, onClose }: CartItemConfigProps) {
             updatePolicy === 'auto_update'
               ? {
                   carryOverAssignments,
-                  removeAssignmentsFromPreviousApp: carryOverAssignments,
+                  removeAssignmentsFromPreviousApp: false,
                 }
               : undefined,
         });

@@ -7,7 +7,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import { getMspCustomerConsentUrl } from '@/lib/msal-config';
 import { parseAccessToken, signConsentState, getBaseUrl } from '@/lib/auth-utils';
-import { hasPermission, type MspRole } from '@/lib/msp-permissions';
+import { hasPermission, parseRole, type MspRole } from '@/lib/msp-permissions';
 import type { MspManagedTenant, ConsentStatus } from '@/types/msp';
 
 /**
@@ -15,7 +15,7 @@ import type { MspManagedTenant, ConsentStatus } from '@/types/msp';
  */
 interface MspUserMembershipWithOrg {
   msp_organization_id: string;
-  role: MspRole;
+  role?: string | null;
   msp_organizations: {
     is_active: boolean;
   };
@@ -27,9 +27,9 @@ interface UserMspMembership {
 }
 
 /**
- * Get the user's MSP organization ID (only for active organizations)
+ * Get the user's MSP organization and role (only for active organizations)
  */
-async function getUserMspMembership(userId: string): Promise<UserMspMembership | null> {
+async function getUserMspMembership(userId: string): Promise<{ mspOrgId: string; role: MspRole } | null> {
   const supabase = createServerClient();
 
   const { data: membership } = await supabase
@@ -39,12 +39,9 @@ async function getUserMspMembership(userId: string): Promise<UserMspMembership |
     .eq('msp_organizations.is_active', true)
     .single<MspUserMembershipWithOrg>();
 
-  if (!membership) return null;
-
-  return {
-    mspOrgId: membership.msp_organization_id,
-    role: membership.role,
-  };
+  if (!membership?.msp_organization_id) return null;
+  // An unknown or missing role counts as the least privileged one.
+  return { mspOrgId: membership.msp_organization_id, role: parseRole(membership.role) };
 }
 
 // Allowed consent statuses for regenerating consent URL
@@ -74,14 +71,13 @@ export async function POST(
         { status: 403 }
       );
     }
-    const mspOrgId = membership.mspOrgId;
-
     if (!hasPermission(membership.role, 'manage_tenants')) {
       return NextResponse.json(
-        { error: 'You do not have permission to manage tenants' },
+        { error: 'Your MSP role does not allow managing customer tenants. Ask an owner or admin of your organization.' },
         { status: 403 }
       );
     }
+    const mspOrgId = membership.mspOrgId;
 
     const { id: tenantRecordId } = await params;
 

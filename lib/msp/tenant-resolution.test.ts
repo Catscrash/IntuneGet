@@ -33,19 +33,11 @@ const CUSTOMER = 'customer-tenant-id';
 
 const fullMembership = {
   access_mode: 'full',
-  role: 'admin',
   msp_organization_id: 'org-1',
   msp_organizations: { primary_tenant_id: PRIMARY },
 };
 const customerOnlyMembership = {
   access_mode: 'customer_only',
-  role: 'admin',
-  msp_organization_id: 'org-1',
-  msp_organizations: { primary_tenant_id: PRIMARY },
-};
-const viewerMembership = {
-  access_mode: 'full',
-  role: 'viewer',
   msp_organization_id: 'org-1',
   msp_organizations: { primary_tenant_id: PRIMARY },
 };
@@ -150,93 +142,6 @@ describe('resolveTargetTenantId', () => {
     expect(result.tenantId).toBe('solo-tenant');
   });
 
-  it('rejects a viewer membership when the caller requires deploy_apps', async () => {
-    const supabase = makeSupabase({
-      membership: viewerMembership,
-      managedTenant: { id: 'mt-1' },
-    });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: PRIMARY,
-      requestedTenantId: CUSTOMER,
-      requiredPermission: 'deploy_apps',
-    });
-    expect(result.errorResponse?.status).toBe(403);
-    expect(result.tenantId).toBe(PRIMARY);
-  });
-
-  it('rejects a viewer membership on its own tenant too', async () => {
-    const supabase = makeSupabase({ membership: viewerMembership });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: PRIMARY,
-      requestedTenantId: null,
-      requiredPermission: 'deploy_apps',
-    });
-    expect(result.errorResponse?.status).toBe(403);
-  });
-
-  it('rejects a membership row with no readable role', async () => {
-    const supabase = makeSupabase({
-      membership: { ...viewerMembership, role: null },
-      managedTenant: { id: 'mt-1' },
-    });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: PRIMARY,
-      requestedTenantId: CUSTOMER,
-      requiredPermission: 'deploy_apps',
-    });
-    expect(result.errorResponse?.status).toBe(403);
-  });
-
-  it('allows a viewer membership to read, where no permission is required', async () => {
-    const supabase = makeSupabase({
-      membership: viewerMembership,
-      managedTenant: { id: 'mt-1' },
-    });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: PRIMARY,
-      requestedTenantId: CUSTOMER,
-    });
-    expect(result.errorResponse).toBeNull();
-    expect(result.tenantId).toBe(CUSTOMER);
-  });
-
-  it('allows an operator membership to deploy into a granted customer tenant', async () => {
-    const supabase = makeSupabase({
-      membership: { ...viewerMembership, role: 'operator' },
-      managedTenant: { id: 'mt-1' },
-    });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: PRIMARY,
-      requestedTenantId: CUSTOMER,
-      requiredPermission: 'deploy_apps',
-    });
-    expect(result.errorResponse).toBeNull();
-    expect(result.tenantId).toBe(CUSTOMER);
-  });
-
-  it('leaves a user with no MSP membership alone when a permission is required', async () => {
-    const supabase = makeSupabase({ membership: null });
-    const result = await resolveTargetTenantId({
-      supabase,
-      userId: 'u1',
-      tokenTenantId: 'solo-tenant',
-      requestedTenantId: null,
-      requiredPermission: 'deploy_apps',
-    });
-    expect(result.errorResponse).toBeNull();
-    expect(result.tenantId).toBe('solo-tenant');
-  });
-
   it('rejects a non-MSP user trying to target a different tenant', async () => {
     const supabase = makeSupabase({ membership: null });
     const result = await resolveTargetTenantId({
@@ -247,5 +152,74 @@ describe('resolveTargetTenantId', () => {
     });
     expect(result.errorResponse).not.toBeNull();
     expect(result.errorResponse?.status).toBe(403);
+  });
+});
+
+describe('resolveTargetTenantId role enforcement in customer tenants', () => {
+  const withRole = (role: string | null | undefined) => ({ ...fullMembership, role });
+  const target = (role: string | null | undefined, requiredPermission?: 'deploy_apps' | 'manage_policies' | 'view_dashboard') =>
+    resolveTargetTenantId({
+      supabase: makeSupabase({ membership: withRole(role), managedTenant: { id: 'mt-1' } }),
+      userId: 'u1',
+      tokenTenantId: PRIMARY,
+      requestedTenantId: CUSTOMER,
+      requiredPermission,
+    });
+
+  it.each([
+    ['viewer', 'deploy_apps', 403],
+    ['viewer', 'manage_policies', 403],
+    ['operator', 'deploy_apps', 200],
+    ['operator', 'manage_policies', 403],
+    ['admin', 'deploy_apps', 200],
+    ['admin', 'manage_policies', 200],
+    ['owner', 'manage_policies', 200],
+  ] as const)('%s asking for %s gets %i', async (role, permission, status) => {
+    const result = await target(role, permission);
+    if (status === 200) {
+      expect(result.errorResponse).toBeNull();
+      expect(result.tenantId).toBe(CUSTOMER);
+      expect(result.mspRole).toBe(role);
+    } else {
+      expect(result.errorResponse?.status).toBe(403);
+      // A denied caller must never be handed the customer tenant id to act on.
+      expect(result.tenantId).toBe(PRIMARY);
+      expect(await result.errorResponse?.json()).toMatchObject({ required_permission: permission });
+    }
+  });
+
+  it.each([null, undefined, '', 'superuser'])('treats the role %j as viewer', async (role) => {
+    expect((await target(role, 'deploy_apps')).errorResponse?.status).toBe(403);
+    expect((await target(role, 'view_dashboard')).errorResponse).toBeNull();
+  });
+
+  it('keeps read routes open to every role when no permission is required', async () => {
+    const result = await target('viewer');
+    expect(result.errorResponse).toBeNull();
+    expect(result.tenantId).toBe(CUSTOMER);
+  });
+
+  it("does not apply the MSP role to work in the caller's own tenant", async () => {
+    const result = await resolveTargetTenantId({
+      supabase: makeSupabase({ membership: withRole('viewer') }),
+      userId: 'u1',
+      tokenTenantId: PRIMARY,
+      requestedTenantId: null,
+      requiredPermission: 'deploy_apps',
+    });
+    expect(result.errorResponse).toBeNull();
+    expect(result.tenantId).toBe(PRIMARY);
+  });
+
+  it('checks tenant access before the role, so an unmanaged tenant is refused for every role', async () => {
+    const result = await resolveTargetTenantId({
+      supabase: makeSupabase({ membership: withRole('owner'), managedTenant: null }),
+      userId: 'u1',
+      tokenTenantId: PRIMARY,
+      requestedTenantId: 'unmanaged-tenant',
+      requiredPermission: 'deploy_apps',
+    });
+    expect(result.errorResponse?.status).toBe(403);
+    expect(result.tenantId).toBe(PRIMARY);
   });
 });

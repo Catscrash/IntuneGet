@@ -19,8 +19,196 @@ import { buildCuratedCartItem, curatedWorkflowInput } from '@/lib/curated-catalo
 import { releaseFixture } from '@/lib/curated-catalog/test-fixtures';
 import { JobProcessor } from '@/packager/src/job-processor';
 import type { PackagingJob } from '@/packager/src/job-poller';
+import { buildQaPackageIdentity } from './package-profile';
 
 describe('bounded registration evidence', () => {
+  it.runIf(process.platform === 'win32')('selects SSMS from deployment profile metadata without selecting bundled products', () => {
+    const identity = buildQaPackageIdentity({
+      profileKind: 'deployment-config', wingetId: 'Microsoft.SQLServerManagementStudio.22',
+      displayName: 'Microsoft SQL Server Management Studio 22', publisher: 'Microsoft',
+      version: '22.12.0', architecture: 'x64', installerSha256: 'A'.repeat(64),
+      sourceInstallerType: 'exe', silentArgs: '--quiet --wait --campaign "winget"',
+      uninstallCommand: 'REGISTRY_UNINSTALL:Microsoft SQL Server Management Studio 22',
+      installScope: 'machine', nestedInstallerType: '', nestedInstallerFiles: [],
+      psadtConfig: DEFAULT_PSADT_CONFIG, detectionRules: [],
+    });
+    const profile = JSON.parse(identity.canonicalJson);
+    const generated = generateRegistryUninstallPackage('exe', profile.app.displayName, [], {}, [],
+      profile.app.wingetId, profile.app.displayName, profile.app.version,
+      profile.installer.uninstallCommand, profile.installer.silentArgs, 'machine', '', '',
+      undefined, false, profile.app.publisher).replace(/\r\n/g, '\n');
+    const identityLines = generated.split('\n').filter(line =>
+      /^\s*\$configuredUninstall(?:ProductCode|DisplayName|LocaleHint) =/.test(line)).join('\n');
+    const start = generated.indexOf('    # Capture the registry uninstall entry');
+    const end = generated.indexOf('\n    if ($selectedApplications.Count -eq 1) {\n', start) + 1;
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const selector = generated.slice(start, end);
+    const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command',
+      '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'], { encoding: 'utf8', timeout: 30_000, input: `
+$ErrorActionPreference = 'Stop'
+${identityLines}
+$adtSession = [pscustomobject]@{ AppVersion = '22.12.0' }
+$preInstallApplications = @()
+$multiProductInstallationVerified = $false
+function Get-ADTApplication { $fixtureApplications }
+function Start-Sleep { param($Seconds) }
+$ssms = [pscustomobject]@{ PSChildName = 'ssms'; PSPath = 'ssms'; DisplayName = 'SQL Server Management Studio 22'; DisplayVersion = '22.12.0'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $false }
+$helpers = @(
+  [pscustomobject]@{ PSChildName = 'installer'; PSPath = 'installer'; DisplayName = 'Microsoft Visual Studio Installer'; DisplayVersion = '4.12'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $false },
+  [pscustomobject]@{ PSChildName = 'vc'; PSPath = 'vc'; DisplayName = 'Microsoft Visual C++ 2022 X86 Runtime'; DisplayVersion = '14.52'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $false },
+  [pscustomobject]@{ PSChildName = 'msi'; PSPath = 'msi'; DisplayName = 'vs_minshellx64msi'; DisplayVersion = '18.12'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $true; SystemComponent = $true }
+)
+$fixtureApplications = @($ssms) + $helpers
+${selector}
+if ($selectedApplications.Count -ne 1 -or $selectedApplications[0].PSChildName -ne 'ssms') { throw 'SSMS identity not selected' }
+$fixtureApplications = $helpers
+${selector}
+if ($selectedApplications.Count -ne 0) { throw 'Bundled product selected' }
+$fixtureApplications = @($ssms, $ssms) + $helpers
+${selector}
+if ($selectedApplications.Count -ne 0) { throw 'Ambiguous SSMS identities selected' }
+` });
+    expect(result.status, result.stderr || result.error?.message).toBe(0);
+  }, 60_000);
+  for (const shell of ['pwsh', 'powershell']) {
+    it.runIf(process.platform === 'win32')(`captures only the exact Breitbandmessung key through the complete selector in ${shell}`, () => {
+      const key = '14607473-30db-509f-94f0-bb7c085c619e';
+      const command = resolveApplicationUninstallCommand('zafaco.Breitbandmessung',
+        'REGISTRY_UNINSTALL_PRODUCT:{14607473-30DB-509F-94F0-BB7C085C619E}:Breitbandmessung');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Breitbandmessung', [], {}, [],
+        'zafaco.Breitbandmessung', 'Breitbandmessung', '3.13.0', command, '/S').replace(/\r\n/g, '\n');
+      const identity = generated.split('\n').filter(line =>
+        /^\s*\$configuredUninstall(?:ProductCode|DisplayName|LocaleHint) =/.test(line)).join('\n');
+      const start = generated.indexOf('    # Capture the registry uninstall entry');
+      const end = generated.indexOf('\n    if ($selectedApplications.Count -eq 1) {\n', start) + 1;
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const selector = generated.slice(start, end);
+      const script = `
+$ErrorActionPreference = 'Stop'
+${identity}
+$adtSession = [pscustomobject]@{ AppVersion = '3.13.0' }
+$preInstallApplications = @()
+$multiProductInstallationVerified = $false
+function Get-ADTApplication { $fixtureApplications }
+function Start-Sleep { param($Seconds) }
+$application = [pscustomobject]@{ PSChildName = '${key}'; PSPath = 'application'; DisplayName = 'Festnetz-Check 3.13.0'; DisplayVersion = '3.13.0'; Publisher = 'Fixture Vendor'; WindowsInstaller = $false; SystemComponent = $false }
+$edge = [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; PSPath = 'edge'; DisplayName = 'Microsoft Edge WebView2 Runtime'; DisplayVersion = '156.0.4314.58'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $true }
+$fixtureApplications = @($application, $edge)
+${selector}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne '${key}') { throw 'Exact Tuta key not selected' }
+$fixtureApplications = @($edge)
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'WebView2 selected' }
+$fixtureApplications = @($application, $application)
+${selector}
+if (@($selectedApplications).Count -ne 2) { throw 'Duplicate key was collapsed' }
+$fixtureApplications = @([pscustomobject]@{ PSChildName = 'different-key'; PSPath = 'other'; DisplayName = 'Festnetz-Check 999.0.0'; DisplayVersion = '999.0.0'; Publisher = 'Fixture Vendor'; WindowsInstaller = $false; SystemComponent = $false })
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'Different-key renamed product was selected by fallback' }
+`;
+      const result = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command',
+        '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'],
+      { input: script, encoding: 'utf8', timeout: 30_000 });
+      expect(result.status, result.stderr || result.error?.message).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000);
+  }
+
+  for (const shell of ['pwsh', 'powershell']) {
+    it.runIf(process.platform === 'win32')(`captures only the exact Niko Home Control key through the complete selector in ${shell}`, () => {
+      const key = 'e0658ce6-6ecb-5ec8-ae2f-5a81c75fbcd6';
+      const command = resolveApplicationUninstallCommand('Niko.HomeControlProgrammingSoftware',
+        'REGISTRY_UNINSTALL_PRODUCT:{E0658CE6-6ECB-5EC8-AE2F-5A81C75FBCD6}:Niko Home Control programming software');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Niko Home Control programming software', [], {}, [],
+        'Niko.HomeControlProgrammingSoftware', 'Niko Home Control programming software', '2.28.16662', command, '/S').replace(/\r\n/g, '\n');
+      const identity = generated.split('\n').filter(line =>
+        /^\s*\$configuredUninstall(?:ProductCode|DisplayName|LocaleHint) =/.test(line)).join('\n');
+      const start = generated.indexOf('    # Capture the registry uninstall entry');
+      const end = generated.indexOf('\n    if ($selectedApplications.Count -eq 1) {\n', start) + 1;
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const selector = generated.slice(start, end);
+      const script = `
+$ErrorActionPreference = 'Stop'
+${identity}
+$adtSession = [pscustomobject]@{ AppVersion = '2.28.16662' }
+$preInstallApplications = @()
+$multiProductInstallationVerified = $false
+function Get-ADTApplication { $fixtureApplications }
+function Start-Sleep { param($Seconds) }
+$application = [pscustomobject]@{ PSChildName = '${key}'; PSPath = 'application'; DisplayName = 'MOTIV Building Control programming software 2.28.16662'; DisplayVersion = '2.28.16662'; Publisher = 'Fixture Vendor'; WindowsInstaller = $false; SystemComponent = $false }
+$edge = [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; PSPath = 'edge'; DisplayName = 'Microsoft Edge WebView2 Runtime'; DisplayVersion = '156.0.4314.58'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $true }
+$fixtureApplications = @($application, $edge)
+${selector}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne '${key}') { throw 'Exact Tuta key not selected' }
+$fixtureApplications = @($edge)
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'WebView2 selected' }
+$fixtureApplications = @($application, $application)
+${selector}
+if (@($selectedApplications).Count -ne 2) { throw 'Duplicate key was collapsed' }
+$fixtureApplications = @([pscustomobject]@{ PSChildName = 'different-key'; PSPath = 'other'; DisplayName = 'MOTIV Building Control programming software 999.0.0'; DisplayVersion = '999.0.0'; Publisher = 'Fixture Vendor'; WindowsInstaller = $false; SystemComponent = $false })
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'Different-key renamed product was selected by fallback' }
+`;
+      const result = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command',
+        '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'],
+      { input: script, encoding: 'utf8', timeout: 30_000 });
+      expect(result.status, result.stderr || result.error?.message).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000);
+  }
+
+  for (const shell of ['pwsh', 'powershell']) {
+    it.runIf(process.platform === 'win32')(`captures only the exact Tuta key through the complete selector in ${shell}`, () => {
+      const key = '450699d2-1c81-5ee5-aec6-08dddb7af9d7';
+      const command = resolveApplicationUninstallCommand('Tutanota.Tutanota',
+        'REGISTRY_UNINSTALL_PRODUCT:{450699D2-1C81-5EE5-AEC6-08DDDB7AF9D7}:Tuta Mail');
+      const generated = generateRegistryUninstallPackage('nullsoft', 'Tuta Mail', [], {}, [],
+        'Tutanota.Tutanota', 'Tuta Mail', '365.261030.0', command, '/S').replace(/\r\n/g, '\n');
+      const identity = generated.split('\n').filter(line =>
+        /^\s*\$configuredUninstall(?:ProductCode|DisplayName|LocaleHint) =/.test(line)).join('\n');
+      const start = generated.indexOf('    # Capture the registry uninstall entry');
+      const end = generated.indexOf('\n    if ($selectedApplications.Count -eq 1) {\n', start) + 1;
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const selector = generated.slice(start, end);
+      const script = `
+$ErrorActionPreference = 'Stop'
+${identity}
+$adtSession = [pscustomobject]@{ AppVersion = '365.261030.0' }
+$preInstallApplications = @()
+$multiProductInstallationVerified = $false
+function Get-ADTApplication { $fixtureApplications }
+function Start-Sleep { param($Seconds) }
+$tuta = [pscustomobject]@{ PSChildName = '${key}'; PSPath = 'tuta'; DisplayName = 'Tuta 365.261030.0'; DisplayVersion = '365.261030.0'; Publisher = 'Tutao GmbH'; WindowsInstaller = $false; SystemComponent = $false }
+$edge = [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; PSPath = 'edge'; DisplayName = 'Microsoft Edge WebView2 Runtime'; DisplayVersion = '156.0.4314.58'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $true }
+$fixtureApplications = @($tuta, $edge)
+${selector}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne '${key}') { throw 'Exact Tuta key not selected' }
+$fixtureApplications = @($edge)
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'WebView2 selected' }
+$fixtureApplications = @($tuta, $tuta)
+${selector}
+if (@($selectedApplications).Count -ne 2) { throw 'Duplicate key was collapsed' }
+$fixtureApplications = @([pscustomobject]@{ PSChildName = 'different-key'; PSPath = 'other'; DisplayName = 'Tuta 999.0.0'; DisplayVersion = '999.0.0'; Publisher = 'Tutao GmbH'; WindowsInstaller = $false; SystemComponent = $false })
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'Different-key Tuta was selected by fallback' }
+`;
+      const result = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command',
+        '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'],
+      { input: script, encoding: 'utf8', timeout: 30_000 });
+      expect(result.status, result.stderr || result.error?.message).toBe(0);
+      expect(generated).toContain("$configuredProductCode = '" + key + "'");
+      expect(generated).toContain("$registeredInstallerType = 'nullsoft'");
+    }, 30_000);
+  }
+
   for (const shell of ['pwsh', 'powershell']) {
     it.runIf(process.platform === 'win32')(`selects the ZDisk exact key and rejects WebView2 or duplicate keys in ${shell}`, () => {
       const command = resolveApplicationUninstallCommand('YushengBeep.ZDiskCleanerPro', 'REGISTRY_UNINSTALL:ZDiskCleaner Pro');
@@ -50,6 +238,42 @@ if (@($selectedApplications).Count -ne 2) { throw 'Duplicate identity was collap
       expect(control).toBe('REGISTRY_UNINSTALL:ZDiskCleaner Pro');
     }, 30_000);
   }
+  for (const shell of ['pwsh', 'powershell']) {
+    it.runIf(process.platform === 'win32')(`selects the exact UDS Client registration among bundled runtimes in ${shell}`, () => {
+      const config = applyApplicationPackagingAdapter('VirtualCable.UDSClient', DEFAULT_PSADT_CONFIG);
+      const generated = generateRegistryUninstallPackage(
+        'nullsoft', 'UDS Enterprise Client', [], config, [],
+        'VirtualCable.UDSClient', 'UDS Enterprise Client', '3.6.0.18670',
+        'REGISTRY_UNINSTALL:UDS Enterprise Client', '/S'
+      );
+      const identity = generated.split('\n').find(line => line.trimStart().startsWith('$configuredUninstallDisplayName ='));
+      const selection = generated.split('\n').find(line => line.includes('$selectedApplications = @($changedApplications | Where-Object { [string]$_.DisplayName -eq $configuredUninstallDisplayName })'));
+      expect(identity).toBeDefined();
+      expect(selection).toBeDefined();
+      const result = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', `
+${identity}
+$uds = [pscustomobject]@{ PSChildName = 'UDS Client'; DisplayName = 'UDS Client'; Publisher = 'Virtual Cable S.L.U.'; DisplayVersion = '3.6.0.18670'; WindowsInstaller = $false; SystemComponent = $false }
+$edge = [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; DisplayName = 'Microsoft Edge WebView2 Runtime'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $true }
+$vcAdditional = [pscustomobject]@{ PSChildName = 'vc-additional'; DisplayName = 'Microsoft Visual C++ 2019 X86 Additional Runtime - 14.28.29325'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $true; SystemComponent = $true }
+$vcBundle = [pscustomobject]@{ PSChildName = 'vc-bundle'; DisplayName = 'Microsoft Visual C++ 2015-2019 Redistributable (x86) - 14.28.29325'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $false; SystemComponent = $false }
+$vcMinimum = [pscustomobject]@{ PSChildName = 'vc-minimum'; DisplayName = 'Microsoft Visual C++ 2019 X86 Minimum Runtime - 14.28.29325'; Publisher = 'Microsoft Corporation'; WindowsInstaller = $true; SystemComponent = $true }
+$changedApplications = @($edge, $vcAdditional, $uds, $vcBundle, $vcMinimum)
+${selection}
+$selected = @($selectedApplications | ForEach-Object { $_.PSChildName })
+$changedApplications = @($edge, $vcAdditional, $vcBundle, $vcMinimum)
+${selection}
+$withoutProduct = @($selectedApplications).Count
+$changedApplications = @($uds, $edge, $uds)
+${selection}
+[pscustomobject]@{ selected = $selected; withoutProduct = $withoutProduct; duplicateCount = @($selectedApplications).Count } | ConvertTo-Json -Compress
+`], { encoding: 'utf8', timeout: 30_000 });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({ selected: ['UDS Client'], withoutProduct: 0, duplicateCount: 2 });
+      expect(generated).toContain("$configuredUninstallDisplayName = 'UDS Client'");
+      expect(generated).toContain('$_.PSChildName -eq $capturedUninstallKey');
+    }, 30_000);
+  }
+
   it('keeps the diagnostic calls and fail-closed guard on the shared generated route', () => {
     expect(packager).toContain('Write-IntuneGetRegistrationEvidence -Application $selectedApplications[0] -Stage install');
     expect(packager.match(/Write-IntuneGetRegistrationEvidence -Application \$registeredApplication -Stage uninstall/g)).toHaveLength(2);
@@ -282,7 +506,7 @@ describe('managed uninstall bounded diagnostics', () => {
 });
 
 function generateRegistryUninstallPackage(
-  installerType: 'exe' | 'inno' | 'burn' | 'nullsoft' | 'msi' | 'zip',
+  installerType: 'exe' | 'inno' | 'burn' | 'nullsoft' | 'msi' | 'wix' | 'zip',
   displayName = 'Contract Test App',
   installerSuccessCodes: number[] = [],
   psadtConfig: unknown = {},
@@ -296,7 +520,8 @@ function generateRegistryUninstallPackage(
   nestedInstallerType = '',
   nestedInstallerPath = '',
   verifyPackage?: (packageDirectory: string) => void,
-  divergeProcessDirectory = false
+  divergeProcessDirectory = false,
+  publisher = 'IntuneGet'
 ): string {
   const fixtureRoot = mkdtempSync(join(tmpdir(), 'intuneget-psadt-packager-'));
 
@@ -347,7 +572,7 @@ function generateRegistryUninstallPackage(
         INPUT_JOB_ID: 'contract-test',
         INPUT_CALLBACK_URL: 'https://example.invalid/callback',
         INPUT_DISPLAY_NAME: displayName,
-        INPUT_PUBLISHER: 'IntuneGet',
+        INPUT_PUBLISHER: publisher,
         INPUT_VERSION: version,
         INPUT_WINGET_ID: wingetId,
         INPUT_INSTALLER_TYPE: installerType,
@@ -477,6 +702,55 @@ if ($script:CapturedArgumentList -notlike '*REBOOT=ReallySuppress /QN /norestart
 }
 
 describe('PSADT Inno packaging contract', () => {
+  it.runIf(canRunWindowsPowerShellPackager)('captures the LegendCTL registration through the existing marker grammar', () => {
+    const command = resolveApplicationUninstallCommand('EvilHumphrey.LegendCTL', 'REGISTRY_UNINSTALL:LegendCTL');
+    const generated = generateRegistryUninstallPackage('inno', 'LegendCTL', [], {}, [],
+      'EvilHumphrey.LegendCTL', 'LegendCTL', '2.6.6', command);
+    expect(generated).toContain("$configuredUninstallDisplayName = 'ZD Ultimate Legend Wrapper'");
+    expect(generated).toContain('$capturedUninstallKey');
+    expect(generated).toContain('UninstallRegistryKey');
+    const processor = Object.create(JobProcessor.prototype) as {
+      getRegistryInstallSnapshotBlock(job: PackagingJob, name: string): string;
+    };
+    const snapshot = processor.getRegistryInstallSnapshotBlock({
+      winget_id: 'EvilHumphrey.LegendCTL', display_name: 'LegendCTL',
+      installer_type: 'inno', uninstall_command: command, install_scope: 'machine',
+    } as PackagingJob, 'LegendCTL');
+    expect(snapshot).toContain("$configuredUninstallDisplayName = 'ZD Ultimate Legend Wrapper'");
+    expect(snapshot).toContain("$configuredUninstallProductCode = ''");
+    const normalized = generated.replace(/\r\n/g, '\n');
+    const identity = normalized.split('\n').filter(line =>
+      /^\s*\$configuredUninstall(?:ProductCode|DisplayName|LocaleHint) =/.test(line)).join('\n');
+    const start = normalized.indexOf('    # Capture the registry uninstall entry');
+    const end = normalized.indexOf('\n    if ($selectedApplications.Count -eq 1) {\n', start) + 1;
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const selector = normalized.slice(start, end);
+    const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command',
+      '& ([scriptblock]::Create([Console]::In.ReadToEnd()))'], { encoding: 'utf8', timeout: 30_000,
+      input: `
+$ErrorActionPreference = 'Stop'
+${identity}
+$adtSession = [pscustomobject]@{ AppVersion = '2.6.6' }
+$preInstallApplications = @()
+$multiProductInstallationVerified = $false
+function Get-ADTApplication { $fixtureApplications }
+function Start-Sleep { param($Seconds) }
+$legend = [pscustomobject]@{ PSChildName = '{ZDUltimateLegend}_is1'; PSPath = 'legend'; DisplayName = 'ZD Ultimate Legend Wrapper version 2.6.6'; DisplayVersion = '2.6.6'; WindowsInstaller = $false; SystemComponent = $false }
+$edge = [pscustomobject]@{ PSChildName = 'Microsoft EdgeWebView'; PSPath = 'edge'; DisplayName = 'Microsoft Edge WebView2 Runtime'; DisplayVersion = '156.0.0'; WindowsInstaller = $false; SystemComponent = $true }
+$fixtureApplications = @($legend, $edge)
+${selector}
+if (@($selectedApplications).Count -ne 1 -or $selectedApplications[0].PSChildName -ne '{ZDUltimateLegend}_is1') { throw 'Suffixed Legend registration not selected' }
+$fixtureApplications = @($edge)
+${selector}
+if (@($selectedApplications).Count -ne 0) { throw 'Bundled runtime selected' }
+$fixtureApplications = @($legend, $legend, $edge)
+${selector}
+if (@($selectedApplications).Count -eq 1) { throw 'Ambiguous Legend registrations selected' }
+` });
+    expect(result.status, result.stderr || result.error?.message).toBe(0);
+  }, 30_000);
+
   it('does not inject diagnostic switches into the vendor command line', () => {
     const innoBlock = packager.slice(
       packager.indexOf("if ($installerTypeLower -eq 'inno')"),
@@ -2360,6 +2634,54 @@ ${merge}
       expect(generated).not.toContain(
         "-ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'"
       );
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'uses manifest MSI switches when a reviewed override belongs to an EXE',
+    () => {
+      for (const installerType of ['msi', 'wix'] as const) {
+        const generated = generateRegistryUninstallPackage(
+          installerType, 'Dropbox', [],
+          { reviewedInstallArgumentsOverride: '/NOLAUNCH', reviewedUninstallArguments: ['/S'] },
+          [], 'Dropbox.Dropbox', 'Dropbox', '270.3.3200',
+          'msiexec /x "{7E425BFB-1DEB-499F-8F3F-3522A6E98754}" /qn /norestart',
+          '/qn /norestart ALLUSERS=1'
+        );
+        expect(generated).toContain("Start-ADTMsiProcess -Action 'Install' -FilePath 'setup.exe' -AdditionalArgumentList '/norestart ALLUSERS=1'");
+        expect(generated).not.toMatch(/AdditionalArgumentList '[^']*NOLAUNCH/);
+      }
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'preserves a reviewed EXE override when its installer family remains executable',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'exe', 'Dropbox', [], { reviewedInstallArgumentsOverride: '/NOLAUNCH' }
+      );
+      expect(generated).toContain("-ArgumentList '/NOLAUNCH'");
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'preserves reviewed MSI properties and supported quiet options',
+    () => {
+      const generated = generateRegistryUninstallPackage(
+        'msi', 'MSI property contract', [],
+        { reviewedInstallArgumentsOverride: '/qb /norestart ALLUSERS=1 DESKTOPSHORTCUT=0' }
+      );
+      expect(generated).toContain("-AdditionalArgumentList '/norestart ALLUSERS=1 DESKTOPSHORTCUT=0'");
+    }
+  );
+
+  it.runIf(canRunWindowsPowerShellPackager)(
+    'refuses mixed MSI properties and unsupported reviewed arguments',
+    () => {
+      expect(() => generateRegistryUninstallPackage(
+        'msi', 'MSI property contract', [],
+        { reviewedInstallArgumentsOverride: 'ALLUSERS=2 /NOLAUNCH' }
+      )).toThrow(/reviewed Windows Installer argument override/);
     }
   );
 

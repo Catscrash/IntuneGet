@@ -4,7 +4,8 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { sanitizeAssignmentsForDispatch } from '@/lib/assignment-intents';
+import { DISPATCH_IDENTITY_KEY, dispatchRateLimitHold, WorkflowDispatchUnconfirmedError, WorkflowDispatchRateLimitError, WorkflowDispatchRetryStopped } from '@/lib/workflow-dispatch-rate-limit';
+import { buildStoredJobWorkflowInputs, storedJobItem } from '@/lib/auto-update/stored-job-workflow-inputs';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getCatalogSource } from '@/lib/catalog';
 import { getDatabase } from '@/lib/db';
@@ -23,8 +24,6 @@ import {
 } from '@/lib/github-actions';
 import { getAppConfig } from '@/lib/config';
 import { getFeatureFlags } from '@/lib/features';
-import { extractSilentSwitches } from '@/lib/msp/silent-switches';
-import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { buildDeploymentConfigForApp } from '@/lib/update-policies/build-deployment-config';
 import {
   classifyDeploymentTrack,
@@ -32,16 +31,16 @@ import {
   type DeploymentTrack,
 } from '@/lib/update-policies/deployment-tracks';
 import { compareVersions } from '@/lib/version-compare';
-import type { WorkflowInputs } from '@/lib/github-actions';
 import { shouldSkipUpdate } from '@/types/update-policies';
 import { resolveAppDescriptionSuffix } from '@/types/user-settings';
+import { buildIntuneAppDescription } from '@/lib/intune-description';
 import type {
   TriggerUpdateRequest,
   TriggerUpdateResponse,
   AppUpdatePolicy,
   DeploymentConfig,
 } from '@/types/update-policies';
-import type { Json } from '@/types/database';
+import type { Json, Database } from '@/types/database';
 import { isSelfUpdatingApp } from '@/lib/self-updating-apps';
 import { describeQaGateError, isQaGateError } from '@/lib/qa/gate';
 
@@ -99,6 +98,22 @@ export async function POST(request: NextRequest) {
 
     const supabase = createServerClient();
 
+    // The tenant ids come from the request body. Each one must be the
+    // caller's own tenant or a customer tenant their MSP role may deploy to.
+    // Rows stored earlier for a tenant are not proof of current access.
+    for (const tenantId of new Set(updateRequests.map((req) => req.tenant_id))) {
+      const tenantResolution = await resolveTargetTenantId({
+        supabase,
+        userId: user.userId,
+        tokenTenantId: user.tenantId,
+        requestedTenantId: tenantId,
+        requiredPermission: 'deploy_apps',
+      });
+      if (tenantResolution.errorResponse) {
+        return tenantResolution.errorResponse;
+      }
+    }
+
     // Get Supabase config for trigger
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -133,19 +148,13 @@ export async function POST(request: NextRequest) {
     }
     const userSettings = (userSettingsRow?.settings as Record<string, unknown> | null) || null;
     const globalCarryOver = Boolean(userSettings?.carryOverAssignments);
+    // The operator's description suffix is composed at dispatch, as for
+    // every other deployment.
     const appDescriptionSuffix = resolveAppDescriptionSuffix(
       userSettings?.appDescriptionSuffix
     );
-    const supersedePrevious = Boolean(userSettings?.supersedePreviousApp);
-    const allowAvailableUninstall = Boolean(userSettings?.allowAvailableUninstall);
 
     for (const req of updateRequests) {
-      let restorePolicyState: {
-        id: string;
-        policy_type: AppUpdatePolicy['policy_type'];
-        is_enabled: boolean;
-      } | null = null;
-
       try {
         // Self-updating apps are excluded from update detection; guard here
         // too in case a stale check result from before the exclusion remains
@@ -156,29 +165,6 @@ export async function POST(request: NextRequest) {
             tenant_id: req.tenant_id,
             success: false,
             error: `${req.winget_id} keeps itself up to date on the device (Click-to-Run); IntuneGet does not deploy updates for it. Refresh the updates list to remove it.`,
-          });
-          continue;
-        }
-
-        // The tenant comes from the request body, so it has to be proved
-        // before it decides where a deployment goes: a managed tenant of the
-        // caller's MSP organization, with a role that may deploy, or the
-        // caller's own. The lookups below filter on user_id as well, but a
-        // row existing is not the same as being allowed to act on it.
-        const { errorResponse: tenantError } = await resolveTargetTenantId({
-          supabase,
-          userId: user.userId,
-          tokenTenantId: user.tenantId,
-          requestedTenantId: req.tenant_id,
-          requiredPermission: 'deploy_apps',
-        });
-        if (tenantError) {
-          response.failed++;
-          response.results.push({
-            winget_id: req.winget_id,
-            tenant_id: req.tenant_id,
-            success: false,
-            error: 'Not authorized to deploy updates for this tenant',
           });
           continue;
         }
@@ -279,25 +265,11 @@ export async function POST(request: NextRequest) {
           policy = newPolicy;
         }
 
-        // Temporarily enable auto-update for manual trigger.
-        // We always restore this in finally if we changed it.
-        const shouldTemporarilyEnable =
-          policy.policy_type !== 'auto_update' || !policy.is_enabled;
-        if (shouldTemporarilyEnable) {
-          restorePolicyState = {
-            id: policy.id,
-            policy_type: policy.policy_type,
-            is_enabled: policy.is_enabled,
-          };
-
-          await supabase
-            .from('app_update_policies')
-            .update({ policy_type: 'auto_update', is_enabled: true })
-            .eq('id', policy.id);
-
-          policy.policy_type = 'auto_update';
-          policy.is_enabled = true;
-        }
+        // This explicit attempt does not resume the stored automatic policy.
+        // Keep the same attempt object through config backfills and dispatch.
+        policy.policy_type = 'auto_update';
+        policy.is_enabled = true;
+        policy.consecutive_failures = 0;
 
         // Get installer info
         const deploymentConfig = policy.deployment_config as unknown as DeploymentConfig | null;
@@ -346,17 +318,19 @@ export async function POST(request: NextRequest) {
         const triggerResult = await autoUpdateTrigger.triggerTrackedAutoUpdate(
           policy as AppUpdatePolicy,
           installerInfo,
-          { skipRateLimits: true, skipPriorDeploymentCheck: true, bypassUpdateScope: true }
+          { skipRateLimits: true, skipPriorDeploymentCheck: true, bypassUpdateScope: true,
+            assignmentMigrationOverride: { carryOverAssignments: globalCarryOver, removeAssignmentsFromPreviousApp: false } }
         );
 
         if (triggerResult.success && triggerResult.jobs.length > 0) {
           // Dispatch the GitHub Actions workflow to actually run the packaging
           const features = getFeatureFlags();
           const isLocalPackagerMode = features.localPackager;
-          const dispatchWorkflows = !isLocalPackagerMode && isGitHubActionsConfigured();
 
+
+          // One job per deployment track, each dispatched on its own.
           for (const trackJob of triggerResult.jobs) {
-            if (dispatchWorkflows) {
+            if (!isLocalPackagerMode && isGitHubActionsConfigured()) {
               const appConfig = getAppConfig();
               const baseUrl = appConfig.app.url || (process.env.VERCEL_URL
                 ? `https://${process.env.VERCEL_URL}`
@@ -365,98 +339,155 @@ export async function POST(request: NextRequest) {
 
               const deploymentConfig = trackJob.deploymentConfig;
 
-              // Global settings were read once before the loop; the stored
-              // policy value may be stale, so the current setting wins
-              const currentCarryOver = globalCarryOver;
-
-              const workflowInputs: WorkflowInputs = {
-                sourceType: installerInfo.sourceType,
-                curatedReleaseId: installerInfo.curatedReleaseId,
-                jobId: trackJob.packagingJobId,
-                tenantId: req.tenant_id,
-                wingetId: req.winget_id,
-                displayName: deploymentConfig.displayName || installerInfo.displayName,
-                description: buildIntuneAppDescription({
-                  description: deploymentConfig.description,
-                  fallback: deploymentConfig.displayName,
-                  wingetId: req.winget_id,
-                  sourceText: appDescriptionSuffix,
-                }),
-                publisher: deploymentConfig.publisher || 'Unknown Publisher',
-                version: installerInfo.latestVersion,
-                architecture: deploymentConfig.architecture || 'x64',
-                installerUrl: installerInfo.installerUrl,
-                installerSha256: installerInfo.installerSha256 || '',
-                installerType: installerInfo.installerType || deploymentConfig.installerType || 'exe',
-                nestedInstallerType: installerInfo.nestedInstallerType,
-                nestedInstallerPath: installerInfo.nestedInstallerPath,
-                silentSwitches: extractSilentSwitches(
-                  deploymentConfig.installCommand || '',
-                  installerInfo.installerType || deploymentConfig.installerType || 'exe',
-                  installerInfo.nestedInstallerType
-                ),
-                uninstallCommand: deploymentConfig.uninstallCommand || '',
-                callbackUrl,
-                detectionRules: deploymentConfig.detectionRules
-                  ? JSON.stringify(deploymentConfig.detectionRules)
-                  : undefined,
-                // PSADT settings from the original deployment; triggerAutoUpdate
-                // backfills them onto the policy for pre-existing policies
-                psadtConfig: deploymentConfig.psadtConfig
-                  ? JSON.stringify(deploymentConfig.psadtConfig)
-                  : undefined,
-                assignments: deploymentConfig.assignments
-                  ? JSON.stringify(
-                      sanitizeAssignmentsForDispatch(
-                        deploymentConfig.assignments,
-                        Boolean(deploymentConfig.requirementRules?.length)
-                      )
-                    )
-                  : undefined,
-                categories: deploymentConfig.categories
-                  ? JSON.stringify(deploymentConfig.categories)
-                  : undefined,
-                requirementRules: deploymentConfig.requirementRules
-                  ? JSON.stringify(deploymentConfig.requirementRules)
-                  : undefined,
-                relationships: deploymentConfig.relationships && deploymentConfig.relationships.length > 0
-                  ? JSON.stringify(deploymentConfig.relationships)
-                  : undefined,
-                installScope: (deploymentConfig.installScope === 'user' ? 'user' : 'machine') as 'machine' | 'user',
-                forceCreate: deploymentConfig.forceCreateNewApp !== false,
-                sourceIntuneAppId: trackJob.sourceIntuneAppId || undefined,
-                carryOverAssignments: currentCarryOver,
-                removeAssignmentsFromPreviousApp: currentCarryOver,
-                autoSupersede: supersedePrevious,
-                supersedenceType: supersedePrevious ? 'update' : undefined,
-                packageProfileSha256: trackJob.packageProfileSha256,
-              };
-
+              // First dispatch and resume must hash the same persisted execution input.
+              const { data: job, error: readError } = await supabase.from('packaging_jobs')
+                .select('*').eq('id', trackJob.packagingJobId)
+                .eq('user_id', user.userId).eq('tenant_id', req.tenant_id)
+                .eq('auto_update_policy_id', policy.id).eq('is_auto_update', true)
+                .in('status', ['queued', 'awaiting_qa'])
+                .is('github_run_id', null).is('callback_run_id', null)
+                .is('cancelled_at', null).is('archived_at', null).maybeSingle();
+              if (readError || !job) {
+                if (readError) {
+                  const message = 'Packaging could not start safely. Refresh the deployment status.';
+                  const { data: won, error: writeError } = await supabase.from('packaging_jobs')
+                    .update({ status: 'failed', error_message: message, completed_at: new Date().toISOString() })
+                    .eq('id', trackJob.packagingJobId).eq('user_id', user.userId)
+                    .eq('tenant_id', req.tenant_id).eq('auto_update_policy_id', policy.id)
+                    .eq('is_auto_update', true).in('status', ['queued', 'awaiting_qa'])
+                    .is('github_run_id', null).is('callback_run_id', null)
+                    .is('cancelled_at', null).is('archived_at', null).is('error_details', null)
+                    .select('id').maybeSingle();
+                  if (won && !writeError) {
+                    await supabase.from('app_update_policies').update({ last_auto_update_version: null, updated_at: new Date().toISOString() })
+                      .eq('id', policy.id).eq('user_id', user.userId).eq('tenant_id', req.tenant_id)
+                      .eq('last_auto_update_version', installerInfo.latestVersion);
+                    if (trackJob.historyId) {
+                      await supabase.from('auto_update_history').update({ status: 'failed',
+                        error_message: message, completed_at: new Date().toISOString(),
+                      }).eq('id', trackJob.historyId);
+                    }
+                  }
+                }
+                response.failed++;
+                response.results.push({ winget_id: req.winget_id, tenant_id: req.tenant_id, track: trackJob.track,
+                  success: false, packaging_job_id: trackJob.packagingJobId,
+                  error: readError ? 'Packaging could not start safely. Refresh the deployment status.'
+                    : 'Deployment status changed before packaging could start. Refresh the deployment status.',
+                });
+                continue;
+              }
+              const item = storedJobItem(job);
+              const workflowInputs = buildStoredJobWorkflowInputs(job, item, {
+                callbackUrl, qaOverride: false, sanitizeAssignments: true, descriptionSuffix: appDescriptionSuffix,
+              });
               const isBatch = updateRequests.length > 1 || triggerResult.jobs.length > 1;
+              const customSource = [deploymentConfig.sourceType, installerInfo.sourceType, item.sourceType].includes('custom');
+              let claimedAt: string | null = null;
+              const ownedWrite = (patch: Database['public']['Tables']['packaging_jobs']['Update'], afterClaim = false) => {
+                let query = supabase.from('packaging_jobs').update(patch)
+                  .eq('id', job.id).eq('user_id', user.userId).eq('tenant_id', req.tenant_id)
+                  .eq('auto_update_policy_id', policy.id).eq('is_auto_update', true)
+                  .eq('status', afterClaim ? 'packaging' : job.status)
+                  .is('github_run_id', null).is('callback_run_id', null)
+                  .is('cancelled_at', null).is('archived_at', null).is('error_details', null);
+                for (const field of ['qa_candidate_id', 'installer_sha256', 'architecture'] as const) {
+                  query = job[field] == null ? query.is(field, null) : query.eq(field, job[field]);
+                }
+                if (afterClaim) query = query.eq('packaging_started_at', claimedAt!);
+                else if (job.status === 'awaiting_qa') query = job.qa_resume_due_at == null
+                  ? query.is('qa_resume_due_at', null) : query.eq('qa_resume_due_at', job.qa_resume_due_at);
+                return query.select('id').maybeSingle();
+              };
               try {
                 await triggerPackagingWorkflow(workflowInputs, undefined, {
                   skipRunCapture: isBatch,
                   requireQaPass: true,
+                  newJobAdmission: !customSource,
+                  beforeDispatch: async () => {
+                    if (job.status !== 'awaiting_qa') return;
+                    const now = new Date().toISOString();
+                    const { data: won, error } = await ownedWrite({ status: 'packaging',
+                      status_message: 'Installation test passed; packaging started',
+                      packaging_started_at: now, qa_completed_at: job.qa_completed_at ?? now });
+                    if (error) throw new Error('Could not claim packaging safely. Refresh the deployment status.');
+                    if (!won) throw new WorkflowDispatchRetryStopped();
+                    claimedAt = now;
+                  },
                 });
               } catch (error) {
-                if (!isQaGateError(error)) throw error;
+                if (error instanceof WorkflowDispatchRetryStopped) {
+                  response.failed++;
+                  response.results.push({ winget_id: req.winget_id, tenant_id: req.tenant_id, track: trackJob.track,
+                    success: false, packaging_job_id: job.id,
+                    error: 'Deployment status changed before packaging could start. Refresh the deployment status.' });
+                  continue;
+                }
+                if (error instanceof WorkflowDispatchUnconfirmedError || error instanceof WorkflowDispatchRateLimitError) {
+                  // Only a fresh ownerless admission can be deferred. The resume
+                  // path checks the exact payload pin before claiming or posting.
+                  const hold = customSource ? null : error instanceof WorkflowDispatchRateLimitError
+                    ? error.dispatchIdentity === undefined ? null
+                      : dispatchRateLimitHold(error, { [DISPATCH_IDENTITY_KEY]: error.dispatchIdentity })
+                    : dispatchRateLimitHold(error, null);
+                  const patch: Database['public']['Tables']['packaging_jobs']['Update'] = hold ?? {
+                    status: 'failed', error_code: error.code, error_stage: 'authenticate',
+                    error_category: 'network', error_message: error.message,
+                    completed_at: new Date().toISOString(),
+                  };
+                  const { data: won, error: writeError } = claimedAt
+                    ? await ownedWrite(patch, true)
+                    : await supabase.from('packaging_jobs').update(patch)
+                      .eq('id', job.id).in('status', hold ? ['queued', 'awaiting_qa'] : ['queued'])
+                      .is('github_run_id', null).is('callback_run_id', null)
+                      .is('cancelled_at', null).is('archived_at', null).is('error_details', null)
+                      .select('id').maybeSingle();
+                  if (won && !writeError && hold) {
+                    response.triggered++;
+                    response.results.push({
+                      winget_id: req.winget_id, tenant_id: req.tenant_id, track: trackJob.track,
+                      success: true, packaging_job_id: trackJob.packagingJobId,
+                      code: error.code,
+                    });
+                    continue;
+                  }
+                  if (won && !writeError && trackJob.historyId) {
+                    await supabase.from('auto_update_history').update({
+                      status: 'failed', error_message: error.message,
+                      completed_at: new Date().toISOString(),
+                    }).eq('id', trackJob.historyId);
+                  }
+                  response.failed++;
+                  response.results.push({
+                    winget_id: req.winget_id, tenant_id: req.tenant_id, track: trackJob.track, success: false,
+                    packaging_job_id: trackJob.packagingJobId, code: error.code,
+                    error: writeError ? 'Could not schedule the automatic retry. Refresh the deployment status.'
+                      : won ? 'Packaging could not start safely. Refresh the deployment status.'
+                      : 'Deployment status changed before the retry could be scheduled. Refresh the deployment status.',
+                  });
+                  continue;
+                }
+                if (!isQaGateError(error)) {
+                  if (claimedAt) {
+                    await ownedWrite({ status: 'awaiting_qa', packaging_started_at: null,
+                      qa_resume_due_at: new Date(Date.now() + 60_000).toISOString() }, true);
+                  }
+                  throw error;
+                }
 
                 // The status can change between the pre-job auto-update gate and
                 // the final dispatch gate. Make that race an explicit safety
                 // cancellation rather than leaving a queued/failed mystery job.
                 const message = describeQaGateError(error);
                 const completedAt = new Date().toISOString();
-                await supabase
-                  .from('packaging_jobs')
-                  .update({
+                const { data: cancelled, error: cancelError } = await ownedWrite({
                     status: 'cancelled',
                     status_message: 'Waiting for the installation test to finish',
                     error_message: message,
                     cancelled_at: completedAt,
                     completed_at: completedAt,
-                  })
-                  .eq('id', trackJob.packagingJobId);
-                if (trackJob.historyId) {
+                  });
+                if (cancelled && !cancelError && trackJob.historyId) {
                   await supabase
                     .from('auto_update_history')
                     .update({
@@ -475,7 +506,7 @@ export async function POST(request: NextRequest) {
                   success: false,
                   skipped: true,
                   code: error.code,
-                  error: message,
+                  error: cancelled && !cancelError ? message : 'Deployment status changed before packaging could start. Refresh the deployment status.',
                 });
                 continue;
               }
@@ -521,23 +552,6 @@ export async function POST(request: NextRequest) {
           success: false,
           error: error instanceof Error ? error.message : 'Unknown error',
         });
-      } finally {
-        if (restorePolicyState) {
-          const { error: restoreError } = await supabase
-            .from('app_update_policies')
-            .update({
-              policy_type: restorePolicyState.policy_type,
-              is_enabled: restorePolicyState.is_enabled,
-            })
-            .eq('id', restorePolicyState.id);
-
-          if (restoreError) {
-            console.error(
-              `Failed to restore update policy ${restorePolicyState.id}:`,
-              restoreError.message
-            );
-          }
-        }
       }
     }
 

@@ -14,12 +14,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { catalogEntries, compareReleaseVersions, sha256, canonicalJson, signCatalog, validateRelease, verifyCatalog, verifyCatalogSignature } from '../lib/curated-catalog/core.mjs';
-import { discoverCandidate, discoverPreviousCandidate } from '../lib/curated-catalog/discovery.mjs';
+import { catalogEntries, compareReleaseVersions, releaseAlreadySigned, sha256, canonicalJson, signCatalog, validateRelease, verifyCatalog, verifyCatalogSignature } from '../lib/curated-catalog/core.mjs';
+import { discoverCandidate, discoverPreviousCandidate, upgradeBaselineFromApproved } from '../lib/curated-catalog/discovery.mjs';
 import { curatedMonitor } from '../lib/curated-catalog/monitor.mjs';
 import { createCuratedGitHubClient } from './curated-github.mjs';
 import { createCuratedGitRunner, prepareCuratedPublication } from './curated-publication.mjs';
-import { enqueueCuratedVerification, processConfigVerifications, supabaseConfigured, syncHistory } from './curated-qa-store.mjs';
+import { assertCuratedSecurityProject, curatedInstallerSecurityHeld, enqueueCuratedVerification, processConfigVerifications, supabaseConfigured, syncHistory } from './curated-qa-store.mjs';
 
 const WEBSITE = 'ugurkocde/IntuneGet';
 const QA = 'ugurkocde/IntuneGet-Workflows';
@@ -100,6 +100,11 @@ async function approvedRelease(runId, approvedAt) {
     websiteCommit: report.provenance.websiteCommit, artifactSha256, approvedBy: AUTOMATED_APPROVER, approvedAt, ...exceptions,
   });
   assertCuratedPackageProfile(app, release);
+  try {
+    if (await curatedInstallerSecurityHeld(release.installerSha256)) return null;
+  } catch (cause) {
+    throw Object.assign(new Error('Current curated installer security could not be verified.'), { code: 'CURATED_INSTALLER_SECURITY_UNAVAILABLE', cause });
+  }
   const evidence = { ...report, authenticatedArtifact: { id: artifact.id, sha256: artifactSha256 },
     automatedApproval: { approvedBy: AUTOMATED_APPROVER, approvedAt, unsignedException: exceptions.unsignedException ?? null, upgradeException: exceptions.upgradeException ?? null } };
   return { app, release, evidence };
@@ -190,6 +195,7 @@ async function syncAlertIssue(alerts, runUrl) {
 }
 
 async function plan() {
+  assertCuratedSecurityProject();
   const now = new Date();
   const runUrl = `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${process.env.GITHUB_REPOSITORY || WEBSITE}/actions/runs/${process.env.GITHUB_RUN_ID || 'local'}`;
   const alerts = []; const rows = []; const approvals = []; const configStates = [];
@@ -252,11 +258,13 @@ async function plan() {
     const success = mine.find(run => run.conclusion === 'success' && run.head_branch === 'main');
     if (success) {
       try {
-        await approvedRelease(success.id, now.toISOString());
+        const approval = await approvedRelease(success.id, now.toISOString());
+        if (!approval) { row.state = 'Held: installer security'; continue; }
         approvals.push(success.id);
         row.state = `Passed verification (run ${success.id}); publishing`;
         continue;
       } catch (error) {
+        if (error?.code === 'CURATED_INSTALLER_SECURITY_UNAVAILABLE') { row.state = 'Blocked: installer security check unavailable'; continue; }
         // A pass that no longer satisfies the policy (for example after an
         // incompatible packager release) counts as a failure and is retried.
         failures.push({ ...success, policyError: error.message });
@@ -285,7 +293,14 @@ async function plan() {
 
     // Prefer the last approved release for the upgrade test. Chrome's mutable
     // URL cannot serve an older build, so it falls through to the exemption.
-    let previous = latest && latest.candidate.installerUrl !== candidate.installerUrl ? latest.candidate : null;
+    let previous;
+    // Discovery stamps candidates after the plan's initial clock.
+    try { previous = upgradeBaselineFromApproved(app, latest, candidate, new Date()); }
+    catch {
+      row.state = 'Approved upgrade baseline is invalid';
+      alerts.push(`${app.name} ${candidate.version}: the approved upgrade baseline could not be bound to its verified installer hash.`);
+      continue;
+    }
     if (!previous && !latest) {
       try { previous = await discoverPreviousCandidate(app, candidate); } catch { previous = null; }
     }
@@ -346,6 +361,7 @@ async function plan() {
 }
 
 async function publish() {
+  assertCuratedSecurityProject();
   const now = new Date();
   const approvedAt = now.toISOString();
   const keys = await trustedKeys();
@@ -354,8 +370,10 @@ async function publish() {
   const withdrawnReleaseIds = [...catalog.payload.withdrawnReleaseIds];
   const evidenceFiles = [];
   for (const runId of JSON.parse(process.env.CURATED_APPROVALS || '[]')) {
-    const { app, release, evidence } = await approvedRelease(runId, approvedAt);
-    if (releases.some(item => item.id === release.id || (item.candidate.appId === app.id && compareReleaseVersions(item.candidate.version, release.candidate.version) === 0))) continue;
+    const approval = await approvedRelease(runId, approvedAt);
+    if (!approval) { console.log(`Skipping held curated verification run ${runId}.`); continue; }
+    const { app, release, evidence } = approval;
+    if (releaseAlreadySigned(releases, withdrawnReleaseIds, release)) continue;
     releases.push(release);
     evidenceFiles.push([`catalog/curated/evidence/${app.id}/${release.candidate.id}.json`, evidence]);
   }
@@ -366,6 +384,15 @@ async function publish() {
     if (!withdrawnReleaseIds.includes(withdraw)) withdrawnReleaseIds.push(withdraw);
   }
   if (!releases.length) { console.log('Nothing to sign.'); return; }
+
+  const securityWithdrawals = [];
+  for (const release of releases) {
+    if (withdrawnReleaseIds.includes(release.id)) continue;
+    if (await curatedInstallerSecurityHeld(release.installerSha256)) {
+      withdrawnReleaseIds.push(release.id);
+      securityWithdrawals.push(release.id);
+    }
+  }
 
   const privateKey = process.env.CURATED_CATALOG_SIGNING_KEY;
   if (!privateKey) throw new Error('The environment signing key is unavailable.');
@@ -383,10 +410,11 @@ async function publish() {
   }
 
   const added = evidenceFiles.map(([, evidence]) => `${appById(evidence.candidate.appId).name} ${evidence.candidate.version}`);
-  const title = added.length ? `Publish verified curated releases: ${added.join(', ')}` : withdraw ? 'Withdraw a curated release' : 'Renew the signed curated catalog';
+  const title = added.length ? `Publish verified curated releases: ${added.join(', ')}` : withdraw || securityWithdrawals.length ? 'Withdraw curated releases' : 'Renew the signed curated catalog';
   const details = [
     added.length ? `Adds ${added.join(', ')}. Each release passed the isolated VM lifecycle test (install, ${evidenceFiles.some(([, e]) => e.previous) ? 'upgrade, ' : ''}detection, uninstall and removal), a publisher signature check and a clean Defender scan of the exact installer hash.` : '',
     withdraw ? `Withdraws \`${withdraw}\`: ${process.env.CURATED_WITHDRAW_REASON.trim()}` : '',
+    securityWithdrawals.length ? `Withdraws releases with an active installer security hold: ${securityWithdrawals.join(', ')}. The security holds remain in place.` : '',
     catalog.dropped.length ? `Drops ${catalog.dropped.length} release(s) that no longer match the current definitions or packaging profile; they are verified again automatically.` : '',
     `Signed catalog valid until ${envelope.payload.expiresAt}.`,
     '', 'CI validates the signature and definitions. Publication requires independent final patch review of the exact revision.',

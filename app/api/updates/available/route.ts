@@ -8,7 +8,7 @@ import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { compareVersions, isCriticalUpdate } from '@/lib/version-compare';
 import { getCatalogSource } from '@/lib/catalog';
-import type { AvailableUpdate } from '@/types/update-policies';
+import { isAutoUpdatePaused, type AvailableUpdate } from '@/types/update-policies';
 
 /**
  * GET /api/updates/available
@@ -118,6 +118,24 @@ export async function GET(request: NextRequest) {
       tenantId
     );
 
+    // Paused policies show the most recent failure, so the card can say why
+    // automatic updates stopped.
+    const recentErrors = new Map<string, string>();
+    if (policies.some(isAutoUpdatePaused)) {
+      try {
+        const history = await getDatabase().autoUpdateHistory.list(user.userId, {
+          tenantId: tenantId ?? undefined, limit: 200, offset: 0,
+        });
+        for (const row of history) {
+          if (['failed', 'cancelled'].includes(row.status) && row.error_message && !recentErrors.has(row.policy_id)) {
+            recentErrors.set(row.policy_id, row.error_message.slice(0, 1000));
+          }
+        }
+      } catch {
+        // The card already has a fallback when recent detail is unavailable.
+      }
+    }
+
     // Deployment history tells us which apps went out through IntuneGet; it
     // exists in both backends. Query per tenant rather than fetching a capped
     // page of the whole history and filtering here - has_prior_deployment
@@ -152,6 +170,7 @@ export async function GET(request: NextRequest) {
         last_auto_update_at: policy.last_auto_update_at,
         last_auto_update_version: policy.last_auto_update_version,
         consecutive_failures: policy.consecutive_failures,
+        last_error: isAutoUpdatePaused(policy) ? recentErrors.get(policy.id) ?? null : null,
       });
     }
 

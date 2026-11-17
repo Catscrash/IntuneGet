@@ -1616,6 +1616,27 @@ $registeredInstallerTypeLower = if ($installerTypeLower -eq 'zip' -and
     $installerTypeLower
 }
 
+# Reviewed executable switches must not replace MSI properties after extension
+# or archive normalization selects Windows Installer. Keep supported MSI-form
+# overrides (including BlueJ and PDFsam), and never silently drop properties.
+$msiReviewedOverridePattern = '^(?:\s*(?:/(?:quiet|passive|norestart|promptrestart|forcerestart|q[nbrfu]?[+!-]?)|[A-Za-z_][A-Za-z0-9_.]*=(?:"[^"]*"|[^\s"]*)))+\s*$'
+if ($reviewedInstallArgumentsOverride -and
+    $registeredInstallerTypeLower -in @('msi', 'wix') -and
+    $reviewedInstallArgumentsOverride -notmatch $msiReviewedOverridePattern) {
+    if ($reviewedInstallArgumentsOverride -match '[A-Za-z_][A-Za-z0-9_.]*=') {
+        throw 'The reviewed Windows Installer argument override contains unsupported syntax; correct it rather than dropping its MSI properties.'
+    }
+    Write-Host 'WARNING: The reviewed install argument override is not a Windows Installer command line; using the manifest MSI switches.'
+    $effectiveSilentSwitches = $SilentSwitches.Trim()
+    foreach ($reviewedInstallArgument in $reviewedInstallArguments) {
+        if (-not [string]::IsNullOrWhiteSpace($effectiveSilentSwitches)) {
+            $effectiveSilentSwitches += ' '
+        }
+        $effectiveSilentSwitches += $reviewedInstallArgument
+    }
+    $silentSwitchesEscaped = ConvertTo-PSSingleQuotedContent $effectiveSilentSwitches
+}
+
 $isNestedPortable = $installerTypeLower -eq 'zip' -and
     -not [string]::IsNullOrWhiteSpace($NestedInstallerType) -and
     $NestedInstallerType.Trim().ToLowerInvariant() -eq 'portable' -and
@@ -4498,6 +4519,39 @@ if ($useManagedDirectoryLifecycle) {
             '    if ($remainingApplications.Count -gt 0 -and $uninstallProcessExitCode -in @(1641, 3010)) {'
             '        Write-ADTLogEntry -Message "The vendor uninstaller returned reboot-required exit code [$uninstallProcessExitCode]; the exact registration remains pending reboot." -Severity ''Warning'' -Source ''Uninstall-ADTDeployment'''
             '    } elseif ($remainingApplications.Count -gt 0) {'
+            '        # Fixed-field advisory evidence only; exact removal verification still fails below.'
+            '        $registeredTask = ''unknown'''
+            '        $registeredExit = ''none'''
+            '        $registeredExe = ''unknown'''
+            '        $registeredProcs = ''unknown'''
+            '        $registeredTemp = ''unknown'''
+            '        try {'
+            '            $registeredTask = [bool]$uninstallHandle.Task.IsCompleted'
+            '            if ($registeredTask) {'
+            '                $registeredExit = ''unknown'''
+            '                $registeredExitNumber = 0'
+            '                if ([int]::TryParse([string]$uninstallHandle.Task.GetAwaiter().GetResult().ExitCode, [ref]$registeredExitNumber)) {'
+            '                    $registeredExit = $registeredExitNumber.ToString([Globalization.CultureInfo]::InvariantCulture)'
+            '                }'
+            '            }'
+            '        } catch {}'
+            '        try { $registeredExe = Test-Path -LiteralPath $registeredUninstallFile -PathType Leaf -ErrorAction Stop } catch {}'
+            '        try {'
+            '            $registeredRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$registeredApplication.InstallLocation)).TrimEnd([char[]]''\/'')'
+            '            if ($registeredRoot -and $registeredRoot -ine [IO.Path]::GetPathRoot($registeredRoot).TrimEnd([char[]]''\/'')) {'
+            '                $registeredPrefix = $registeredRoot + [IO.Path]::DirectorySeparatorChar'
+            '                $registeredTempPrefix = [IO.Path]::GetTempPath().TrimEnd([char[]]''\/'') + [IO.Path]::DirectorySeparatorChar'
+            '                $registeredProcesses = @(Get-CimInstance Win32_Process -OperationTimeoutSec 15 -ErrorAction Stop)'
+            '                $registeredCount = @($registeredProcesses | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($registeredPrefix, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 101).Count'
+            '                $registeredProcs = if ($registeredCount -gt 100) { ''100+'' } else { [string]$registeredCount }'
+            '                # Generic temp-copy presence is advisory, not attribution to this uninstaller.'
+            '                $registeredTemp = [bool]@($registeredProcesses | Where-Object {'
+            '                    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($registeredTempPrefix, [StringComparison]::OrdinalIgnoreCase) -and'
+            '                    ([IO.Path]::GetFileName($_.ExecutablePath) -like ''_iu*.tmp'' -or [IO.Path]::GetFileName($_.ExecutablePath) -like ''unins*.exe'')'
+            '                }).Count'
+            '            }'
+            '        } catch {}'
+            '        try { Write-ADTLogEntry -Message "Registered uninstall deadline: task=$registeredTask exit=$registeredExit exe=$registeredExe procs=$registeredProcs tmp=$registeredTemp" -Severity 3 -Source ''Uninstall-ADTDeployment'' } catch {}'
             '        throw "The vendor uninstall command did not remove registration [$registeredUninstallRegistryKey] before the completion deadline."'
             '    }'
         )

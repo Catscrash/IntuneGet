@@ -5,6 +5,7 @@
  * regardless of how a job finishes (callback, timeout, or cancellation).
  */
 
+import { notifyAutoUpdatePaused } from '@/lib/notification-service';
 import { createClient } from '@supabase/supabase-js';
 import { DEFAULT_SAFETY_CONFIG } from '@/types/update-policies';
 import type { AutoUpdateStatus } from '@/types/update-policies';
@@ -131,12 +132,13 @@ export async function handleAutoUpdateJobCompletion(
     // and increment consecutive_failures for circuit breaker
     const { data: policy } = await supabase
       .from('app_update_policies')
-      .select('consecutive_failures')
+      .select('consecutive_failures, policy_type, is_enabled, user_id, winget_id, tenant_id')
       .eq('id', policyId)
       .single();
 
     const newFailureCount = (policy?.consecutive_failures ?? 0) + 1;
-    const shouldDisable = newFailureCount >= DEFAULT_SAFETY_CONFIG.maxConsecutiveFailures;
+    const shouldDisable = policy?.policy_type === 'auto_update' &&
+      newFailureCount >= DEFAULT_SAFETY_CONFIG.maxConsecutiveFailures;
 
     const updates: Record<string, unknown> = {
       last_auto_update_version: null,
@@ -151,7 +153,10 @@ export async function handleAutoUpdateJobCompletion(
       );
     }
 
-    await supabase.from('app_update_policies').update(updates).eq('id', policyId);
+    const { error: policyError } = await supabase.from('app_update_policies').update(updates).eq('id', policyId);
+    if (!policyError && policy?.is_enabled && shouldDisable) {
+      await notifyAutoUpdatePaused({ userId: policy.user_id, policyId, wingetId: policy.winget_id, tenantId: policy.tenant_id, failures: newFailureCount, lastError: errorMessage });
+    }
   }
 
   // Auto-dismiss failed/cancelled auto-update jobs from the dashboard.

@@ -13,7 +13,7 @@ interface NotificationCenterProps {
 
 export function NotificationCenter({ onClose }: NotificationCenterProps) {
   const router = useRouter();
-  const { data, isLoading } = useNotifications(20);
+  const { data, isLoading, isError, isFetching, refetch } = useNotifications(20);
   const markAsRead = useMarkAsRead();
   const markAllAsRead = useMarkAllAsRead();
 
@@ -33,6 +33,12 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
     const data = notification.data || {};
 
     switch (notification.type) {
+      case 'deployment_waiting': {
+        const jobId = typeof data.job_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(data.job_id)
+          ? data.job_id : null;
+        router.push(jobId ? `/dashboard/uploads?jobs=${encodeURIComponent(jobId)}` : '/dashboard/uploads');
+        break;
+      }
       case 'deployment_complete':
       case 'deployment_failed':
         if (data.intune_app_id) {
@@ -91,11 +97,28 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
 
       {/* Notification list */}
       <div className="max-h-96 overflow-y-auto">
+        {isError && (
+          <div role="alert" className="px-4 py-3 border-b border-amber-500/20 bg-amber-500/5">
+            <p className="text-sm text-text-primary">
+              {data ? 'Could not refresh notifications.' : 'Could not load notifications.'}
+            </p>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="mt-2"
+              disabled={isFetching}
+              onClick={() => { void refetch(); }}
+            >
+              {isFetching ? 'Retrying...' : 'Retry'}
+            </Button>
+          </div>
+        )}
         {isLoading ? (
           <div className="flex items-center justify-center py-8">
             <Loader2 className="w-6 h-6 text-text-muted animate-spin" />
           </div>
-        ) : notifications.length === 0 ? (
+        ) : isError && !data ? null : notifications.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-8 px-4 text-center">
             <Inbox className="w-10 h-10 text-text-muted mb-2" />
             <p className="text-sm text-text-muted">No notifications yet</p>

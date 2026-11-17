@@ -16,6 +16,8 @@ const {
   getAppsByWingetIdsMock: vi.fn(),
 }));
 
+vi.mock('@/lib/db', () => ({ isSqliteMode: sqliteModeMock, getDatabase: databaseMock }));
+
 vi.mock('@/lib/auth-utils', () => ({
   parseAccessToken: parseAccessTokenMock,
 }));
@@ -551,5 +553,62 @@ describe('GET /api/updates/available', () => {
     );
     shownReq.headers.set('Authorization', 'Bearer test-token');
     expect((await (await GET(shownReq)).json()).count).toBe(1);
+  });
+});
+
+
+describe('paused policy failure details', () => {
+  const update = { id: 'fixture-update', user_id: 'fixture-owner', winget_id: 'Fixture.App', tenant_id: 'fixture-tenant', intune_app_id: 'fixture-app', display_name: 'Fixture', current_version: '1.0', latest_version: '1.1', is_critical: false, is_managed: true, dismissed_at: null, notified_at: null };
+  const paused = { id: 'fixture-policy', winget_id: 'Fixture.App', tenant_id: 'fixture-tenant', policy_type: 'auto_update', is_enabled: false, consecutive_failures: 3 };
+  const history = [
+    { policy_id: 'fixture-policy', status: 'completed', error_message: 'Ignore completed' },
+    { policy_id: 'fixture-policy', status: 'cancelled', error_message: 'Latest fixture failure' },
+    { policy_id: 'fixture-policy', status: 'failed', error_message: 'Earlier fixture failure' },
+  ];
+
+  function database(policy: Record<string, unknown>, list: ReturnType<typeof vi.fn>) {
+    getAppsByWingetIdsMock.mockResolvedValue([]);
+    getDatabaseMock.mockReturnValue({
+      updateCheckResults: { getByUserId: vi.fn().mockResolvedValue([update]) },
+      uploadHistory: { getByUserIdAndTenantId: vi.fn().mockResolvedValue([]), getByTenantId: vi.fn().mockResolvedValue([]) },
+      updatePolicies: { getForWingetIds: vi.fn().mockResolvedValue([policy]) },
+      autoUpdateHistory: { list },
+    });
+  }
+
+  beforeEach(() => {
+    parseAccessTokenMock.mockResolvedValue({ userId: 'fixture-owner', tenantId: 'fixture-tenant' });
+  });
+
+  it('returns the latest failure of a paused policy and scopes the history read to its owner', async () => {
+    const list = vi.fn().mockResolvedValue(history);
+    database(paused, list);
+
+    const response = await GET(new NextRequest('http://localhost/api/updates/available?tenant_id=fixture-tenant'));
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).updates[0].policy.last_error).toBe('Latest fixture failure');
+    expect(list).toHaveBeenCalledWith('fixture-owner', { tenantId: 'fixture-tenant', limit: 200, offset: 0 });
+  });
+
+  it('skips history for active policies', async () => {
+    const list = vi.fn();
+    database({ ...paused, is_enabled: true, consecutive_failures: 0 }, list);
+
+    const body = await (await GET(new NextRequest('http://localhost/api/updates/available'))).json();
+
+    expect(body.updates[0].policy.last_error).toBeNull();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('preserves updates when supplementary history throws', async () => {
+    database(paused, vi.fn().mockRejectedValue(new Error('fixture history unavailable')));
+
+    const response = await GET(new NextRequest('http://localhost/api/updates/available'));
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.count).toBe(1);
+    expect(body.updates[0].policy.last_error).toBeNull();
   });
 });

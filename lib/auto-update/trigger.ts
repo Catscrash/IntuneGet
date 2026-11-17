@@ -4,6 +4,7 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { notifyAutoUpdatePaused } from '@/lib/notification-service';
 import { supabaseDb } from '@/lib/db/supabase-adapter';
 import {
   AppUpdatePolicy,
@@ -63,6 +64,8 @@ interface TriggerOptions {
   skipRateLimits?: boolean;
   skipPriorDeploymentCheck?: boolean;
   bypassUpdateScope?: boolean;
+  admitViaQaResume?: boolean;
+  assignmentMigrationOverride?: DeploymentConfig['assignmentMigration'];
   /**
    * The policy carries the config of a second track built from that track's
    * own deployment. Nothing is backfilled into it from other deployments and
@@ -266,6 +269,7 @@ export class AutoUpdateTrigger {
     updateInfo: UpdateInfo,
     options?: TriggerOptions
   ): Promise<TriggerResult> {
+    let historyId: string | undefined;
     try {
       // Safety check 1: Verify policy allows auto-update
       if (!canAutoUpdate(policy)) {
@@ -471,13 +475,16 @@ export class AutoUpdateTrigger {
 
       // Create auto-update history record
       const historyRecord = await this.createHistoryRecord(policy.id, updateInfo, updateType);
+      historyId = historyRecord.id;
 
       // Create packaging job
       const packagingJob = await this.createPackagingJob(
         policy,
         updateInfo,
         historyRecord.id,
-        qaDemand
+        qaDemand,
+        options?.admitViaQaResume === true,
+        options?.assignmentMigrationOverride
       );
 
       // Update history with job reference
@@ -502,8 +509,13 @@ export class AutoUpdateTrigger {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
+      if (historyId) {
+        try { await this.markUpdateFailed(historyId, errorMessage); } catch {
+          // Preserve the original failure even when its history cannot be saved.
+        }
+      }
       // Increment failure counter
-      await this.incrementFailureCount(policy.id);
+      await this.incrementFailureCount(policy.id, errorMessage);
 
       return {
         success: false,
@@ -1001,7 +1013,9 @@ export class AutoUpdateTrigger {
     policy: AppUpdatePolicy,
     updateInfo: UpdateInfo,
     historyId: string,
-    qaDemand?: QaDemandResult
+    qaDemand?: QaDemandResult,
+    admitViaQaResume = false,
+    assignmentMigrationOverride?: DeploymentConfig['assignmentMigration']
   ): Promise<{ id: string }> {
     const config = policy.deployment_config as DeploymentConfig;
     const assignments = normalizeAssignments(config);
@@ -1016,9 +1030,9 @@ export class AutoUpdateTrigger {
       supersedePreviousApp,
       allowAvailableUninstall,
     } = await this.getUserUpdateSettings(policy.user_id);
-    const assignmentMigration = config.assignmentMigration ?? {
+    const assignmentMigration = assignmentMigrationOverride ?? config.assignmentMigration ?? {
       carryOverAssignments: globalCarryOver,
-      removeAssignmentsFromPreviousApp: globalCarryOver,
+      removeAssignmentsFromPreviousApp: false,
     };
     const sourceIntuneAppId = updateInfo.currentIntuneAppId || null;
     const autoSupersede = supersedePreviousApp && Boolean(sourceIntuneAppId);
@@ -1076,16 +1090,15 @@ export class AutoUpdateTrigger {
         allowAvailableUninstall,
         assignmentMigration: {
           carryOverAssignments: Boolean(assignmentMigration.carryOverAssignments),
-          removeAssignmentsFromPreviousApp: Boolean(
-            assignmentMigration.removeAssignmentsFromPreviousApp
-          ),
+          // Older copy policies derived removal from the copy checkbox.
+          removeAssignmentsFromPreviousApp: false,
         },
         description: config.description,
         notes: config.notes,
         autoUpdateHistoryId: historyId,
       },
       status: !qaDemand || qaDemand.state === 'passed'
-        ? 'queued'
+        ? admitViaQaResume ? 'awaiting_qa' : 'queued'
         : qaDemand.state === 'waiting'
           ? 'awaiting_qa'
           : 'qa_failed',
@@ -1145,16 +1158,17 @@ export class AutoUpdateTrigger {
   /**
    * Increment failure count for circuit breaker
    */
-  private async incrementFailureCount(policyId: string): Promise<void> {
+  private async incrementFailureCount(policyId: string, lastError?: string): Promise<void> {
     // Get current failure count
     const { data: policy } = await this.supabase
       .from('app_update_policies')
-      .select('consecutive_failures')
+      .select('consecutive_failures, policy_type, is_enabled, user_id, winget_id, tenant_id')
       .eq('id', policyId)
       .single();
 
     const newCount = (policy?.consecutive_failures || 0) + 1;
-    const shouldDisable = newCount >= this.safetyConfig.maxConsecutiveFailures;
+    const shouldDisable = policy?.policy_type === 'auto_update' &&
+      newCount >= this.safetyConfig.maxConsecutiveFailures;
 
     const updates: Record<string, unknown> = {
       consecutive_failures: newCount,
@@ -1174,6 +1188,8 @@ export class AutoUpdateTrigger {
 
     if (error) {
       console.error('Failed to update failure count:', error);
+    } else if (policy?.is_enabled && shouldDisable) {
+      await notifyAutoUpdatePaused({ userId: policy.user_id, policyId, wingetId: policy.winget_id, tenantId: policy.tenant_id, failures: newCount, lastError });
     }
   }
 
@@ -1424,6 +1440,11 @@ export async function getLatestInstallerInfo(
     };
   }
 
+  const rowType = versionInfo.installer_type?.trim().toLowerCase();
+  const selectedType = selectedManifestInstaller?.InstallerType?.trim().toLowerCase();
+  const rowSwitchesApply = !selectedType || rowType === selectedType ||
+    (!!rowType && ['msi', 'wix'].includes(selectedType) && ['msi', 'wix'].includes(rowType));
+
   const manifestInstaller = {
     ...(selectedManifestInstaller || {}),
     Architecture: (selectedManifestInstaller?.Architecture || architecture || 'x64'),
@@ -1434,11 +1455,11 @@ export async function getLatestInstallerInfo(
     NestedInstallerFiles: selectedManifestInstaller?.NestedInstallerFiles ||
       (nestedInstallerPath ? [{ RelativeFilePath: nestedInstallerPath }] : undefined),
     Scope: selectedManifestInstaller?.Scope || versionInfo.installer_scope || undefined,
-    // Current snapshots keep the manifest-level Silent value in silent_args
-    // and installer-level overrides (for example Custom) in each installer.
-    // Merge them per field just like a freshly fetched WinGet manifest.
+    // The flattened row describes one installer, not manifest-wide defaults.
+    // Only inherit its silent switch within the selected installer's family;
+    // installer-specific switches remain authoritative.
     InstallerSwitches: {
-      ...(versionInfo.silent_args ? { Silent: versionInfo.silent_args } : {}),
+      ...(versionInfo.silent_args && rowSwitchesApply ? { Silent: versionInfo.silent_args } : {}),
       ...(selectedManifestInstaller?.InstallerSwitches || {}),
     },
   } as WingetInstaller;

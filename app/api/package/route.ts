@@ -18,6 +18,7 @@ import { logValue } from '@/lib/server-log';
 import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
 import { readEffectiveSettings } from '@/lib/user-settings-store';
+import { dispatchRateLimitHold, WorkflowDispatchRateLimitError, WorkflowDispatchUnconfirmedError } from '@/lib/workflow-dispatch-rate-limit';
 import {
   isGitHubActionsConfigured,
   triggerPackagingWorkflow,
@@ -65,10 +66,12 @@ import { evaluatePackagingContract } from '@/lib/packaging-contract';
 import type { NormalizedInstaller } from '@/types/winget';
 import {
   getPackageEligibilityBlocks,
+  getPackageCompatibilityBlock,
   PACKAGE_UNAVAILABLE_MESSAGE,
 } from '@/lib/package-eligibility';
 import { QA_PRIORITY_CUSTOMER } from '@/lib/qa/constants';
 import { enrichCustomerQaStatus } from '@/lib/customer-qa-status';
+import { unsupportedDependencyMessage, knownUnavailableDisposition } from '@/lib/unsupported-dependency';
 
 export const maxDuration = 300;
 
@@ -155,6 +158,12 @@ export async function POST(request: NextRequest) {
     if (!consentResult.verified) {
       const isPermissionError = consentResult.error === 'insufficient_intune_permissions';
       const isTransient = consentResult.error === 'network_error' || consentResult.error === 'missing_credentials';
+      if (isTransient) {
+        console.error('[package-unavailable]', {
+          stage: 'consent',
+          reason: consentResult.error === 'network_error' ? 'network_error' : 'missing_credentials',
+        });
+      }
 
       const errorTitle = isPermissionError
         ? 'Intune permissions required'
@@ -275,7 +284,9 @@ export async function POST(request: NextRequest) {
       //
       // Only ever set, never cleared - the request-level flag is an override,
       // so its absence must not disarm an item that asked for this itself.
-      if (forceCreate) {
+      // The GitHub Actions path receives the flag in the dispatch payload and
+      // keeps package_config as the cart sent it.
+      if (forceCreate && getFeatureFlags().localPackager) {
         (item as { forceCreate?: boolean }).forceCreate = true;
       }
 
@@ -480,6 +491,9 @@ export async function POST(request: NextRequest) {
             code: error.code,
             retryable: error.retryable,
           });
+          if (error.retryable) {
+            console.error('[package-unavailable]', { stage: 'manifest', reason: 'retryable_installer_validation' });
+          }
           return NextResponse.json({
             error: 'Installer validation blocked this deployment',
             message: error.message,
@@ -539,6 +553,9 @@ export async function POST(request: NextRequest) {
         const failedItem = win32Items[i + failedIndex];
         const error = failed.reason;
         if (error instanceof InstallerPreflightError) {
+          if (error.retryable) {
+            console.error('[package-unavailable]', { stage: 'installer_preflight', reason: 'retryable_installer_validation' });
+          }
           return NextResponse.json({
             error: 'Installer validation blocked this deployment',
             message: error.message,
@@ -558,7 +575,7 @@ export async function POST(request: NextRequest) {
     }
 
     const jobs: PackagingJobRecord[] = [];
-    const errors: { wingetId: string; error: string }[] = [];
+    const errors: { wingetId: string; error: string; code?: string }[] = [];
 
     // ========================================================================
     // Handle Store apps - deploy synchronously via Graph API (no packaging)
@@ -831,13 +848,21 @@ export async function POST(request: NextRequest) {
               }
             }
 
+            // This is display classification of an existing exact block only.
+            // An unavailable lookup retains the original closed QA disposition.
+            const unsupportedMessage = qaDemand?.state === 'failed' && !qaDemand.candidateId
+              ? unsupportedDependencyMessage(await getPackageCompatibilityBlock(createServerClient(), {
+                  wingetId: item.wingetId, version: item.version, architecture: item.architecture || 'x64', installerSha256,
+                }).catch(() => null)) : null;
+            const unavailable = qaDemand?.state === 'failed' && !qaDemand.candidateId && !unsupportedMessage
+              ? knownUnavailableDisposition(qaDemand.failureSummary) : null;
             // Self-hosted installs have no QA pipeline, so local jobs must remain pollable.
             const initialStatus = isLocalPackagerMode && !supabaseServerConfigured
               ? 'queued'
               : qaDemand?.state === 'waiting' && !qaDeferred
                 ? 'awaiting_qa'
                 : qaDemand?.state === 'failed'
-                  ? 'qa_failed'
+                  ? unsupportedMessage || unavailable ? 'failed' : 'qa_failed'
                   : 'queued';
             const now = new Date().toISOString();
 
@@ -865,7 +890,7 @@ export async function POST(request: NextRequest) {
                   ? 'Preparing deployment while installation validation remains scheduled'
                   : 'Waiting for installation validation before deployment'
                 : qaDemand?.state === 'failed'
-                  ? qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test.'
+                  ? unsupportedMessage || unavailable?.message || qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test.'
                   : null,
               progress_percent: 0,
               execution_profile_sha256: qaDemand?.identity.executionProfileSha256 || null,
@@ -874,11 +899,12 @@ export async function POST(request: NextRequest) {
               qa_requested_at: qaDemand ? now : null,
               qa_completed_at: qaDemand?.state === 'passed' ? now : null,
               error_message: qaDemand?.state === 'failed'
-                ? qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test.'
+                ? unsupportedMessage || unavailable?.message || qaDemand.failureSummary?.trim() || 'This app did not pass the isolated installation test.'
                 : null,
-              error_code: qaDemand?.state === 'failed' ? 'QA_FAILED_EXECUTION_PROFILE' : null,
+              error_code: qaDemand?.state === 'failed' ? unsupportedMessage ? 'DEPENDENCY_NOT_SUPPORTED' : unavailable?.code || 'QA_FAILED_EXECUTION_PROFILE' : null,
               error_stage: qaDemand?.state === 'failed' ? 'validation' : null,
-              error_category: qaDemand?.state === 'failed' ? 'installer' : null,
+              error_category: qaDemand?.state === 'failed' ? unsupportedMessage || unavailable ? 'validation' : 'installer' : null,
+              ...(unsupportedMessage || unavailable ? { completed_at: now } : {}),
             });
 
             if (!jobRecord) {
@@ -999,7 +1025,7 @@ export async function POST(request: NextRequest) {
             const triggerResult = await triggerPackagingWorkflow(
               workflowInputs,
               undefined,
-              { skipRunCapture: isBatch }
+              { skipRunCapture: isBatch, newJobAdmission: item.sourceType !== 'custom' }
             );
 
             const updateData: Record<string, unknown> = {
@@ -1037,6 +1063,36 @@ export async function POST(request: NextRequest) {
             });
           } else {
             const dispatch = pendingDispatches[idx];
+            const uncertainCode = result.reason instanceof WorkflowDispatchUnconfirmedError ? result.reason.code : undefined;
+            const rateLimit = result.reason instanceof WorkflowDispatchRateLimitError || result.reason instanceof WorkflowDispatchUnconfirmedError ? result.reason : null;
+            // The ordinary QA resume path rebuilds and revalidates hosted inputs.
+            // Custom uploads do not use that path and must not be enqueued here.
+            const rateHold = rateLimit && dispatch?.item.sourceType !== 'custom'
+              ? dispatchRateLimitHold(rateLimit, null) : null;
+            if (rateHold && dispatch) {
+              let retryWriteFailed = false;
+              const held = await db.jobs.update(dispatch.jobId, {
+                ...rateHold,
+                ...(rateLimit instanceof WorkflowDispatchUnconfirmedError && forceCreate && !dispatch.item.forceCreate
+                  ? { package_config: { ...dispatch.item, forceCreate: true } as unknown as import('@/types/database').Json }
+                  : {}),
+              }, {
+                status: 'queued', github_run_id: null, callback_run_id: null, cancelled_at: null, archived_at: null,
+              }).catch(() => {
+                retryWriteFailed = true;
+                console.error(`[Package] Could not schedule a capacity retry for job ${logValue(dispatch.jobId)}`);
+                return null;
+              });
+              if (held) jobs.push({ id: dispatch.jobId, user_id: userId, tenant_id: tenantId,
+                winget_id: dispatch.item.wingetId, version: dispatch.item.version,
+                display_name: dispatch.item.displayName, publisher: dispatch.item.publisher,
+                status: 'awaiting_qa', package_config: dispatch.item, created_at: dispatch.createdAt });
+              else errors.push({ wingetId: dispatch.item.wingetId, ...(uncertainCode ? { code: uncertainCode } : {}),
+                error: retryWriteFailed
+                  ? 'Packaging could not schedule its automatic retry. Refresh the deployment status.'
+                  : 'Packaging status changed before the retry could be scheduled. Refresh the deployment status.' });
+              continue;
+            }
             // The final dispatch boundary re-checks QA, security and
             // compatibility evidence. A block there is a validation outcome
             // with its own reason, not a failure to start the workflow.
@@ -1046,16 +1102,22 @@ export async function POST(request: NextRequest) {
               ? describeQaGateError(qaGateError)
               : result.reason instanceof Error ? result.reason.message : 'Unknown error';
             if (dispatch) {
-              await db.jobs.update(dispatch.jobId, {
+              const failurePatch: Partial<PackagingJob> = {
                 status: reputationHold ? 'awaiting_qa' : 'failed',
                 status_message: reputationHold ? dispatchError : null,
                 progress_percent: 0,
                 error_stage: qaGateError ? 'validation' : 'authenticate',
                 error_category: qaGateError ? null : 'network',
-                error_code: qaGateError ? qaGateError.code : 'WORKFLOW_DISPATCH_FAILED',
+                error_code: qaGateError ? qaGateError.code : rateLimit?.code ?? 'WORKFLOW_DISPATCH_FAILED',
                 error_message: dispatchError,
                 completed_at: reputationHold ? null : new Date().toISOString(),
-              }).catch((updateError) => {
+              };
+              const failureUpdate = result.reason instanceof WorkflowDispatchUnconfirmedError
+                ? db.jobs.update(dispatch.jobId, failurePatch, {
+                  status: 'queued', github_run_id: null, callback_run_id: null, cancelled_at: null, archived_at: null,
+                })
+                : db.jobs.update(dispatch.jobId, failurePatch);
+              await failureUpdate.catch((updateError) => {
                 console.error(`Failed to mark dispatch ${dispatch.jobId} as failed:`, updateError);
               });
             }
@@ -1069,6 +1131,7 @@ export async function POST(request: NextRequest) {
             errors.push({
               wingetId: dispatch?.item.wingetId || 'unknown',
               error: dispatchError,
+              ...(uncertainCode ? { code: uncertainCode } : {}),
             });
           }
         }
@@ -1155,7 +1218,7 @@ async function healStaleJobs(
           error_message: STALE_JOB_ERROR_MESSAGE,
           completed_at: now,
           updated_at: now,
-        })
+        }, { status: job.status, updated_at: job.updated_at, callback_run_id: job.callback_run_id ?? null })
         .catch((error) => {
           console.error(`Failed to heal stale job ${job.id}:`, error);
           return null;

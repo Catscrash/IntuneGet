@@ -1,171 +1,75 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const {
-  createClientMock,
-  processPendingBatchesMock,
-  advanceInProgressBatchesMock,
-  notifyUserOfPendingUpdatesMock,
-  keepActuallyStaleJobsMock,
-  handleAutoUpdateJobCompletionMock,
-  getCatalogSourceMock,
-  createWingetManifestClientMock,
-  resolveWingetManifestMock,
-  classifyWingetSyncRunMock,
-  normalizeInstallerMock,
-  normalizeManifestInstallersMock,
-  selectAppsToSyncMock,
-} = vi.hoisted(() => ({
-  createClientMock: vi.fn(),
-  processPendingBatchesMock: vi.fn(),
-  advanceInProgressBatchesMock: vi.fn(),
-  notifyUserOfPendingUpdatesMock: vi.fn(),
-  keepActuallyStaleJobsMock: vi.fn(),
-  handleAutoUpdateJobCompletionMock: vi.fn(),
-  getCatalogSourceMock: vi.fn(),
-  createWingetManifestClientMock: vi.fn(),
-  resolveWingetManifestMock: vi.fn(),
-  classifyWingetSyncRunMock: vi.fn(),
-  normalizeInstallerMock: vi.fn(),
-  normalizeManifestInstallersMock: vi.fn(),
-  selectAppsToSyncMock: vi.fn(),
-}));
+// Nothing behind the authorization check may run for a rejected request.
+const work = vi.hoisted(() => vi.fn(() => { throw new Error('cron work must not start'); }));
 
-vi.mock('@supabase/supabase-js', () => ({ createClient: createClientMock }));
+vi.mock('@supabase/supabase-js', () => ({ createClient: work }));
 vi.mock('@/lib/msp/batch-orchestrator', () => ({
-  processPendingBatches: processPendingBatchesMock,
-  advanceInProgressBatches: advanceInProgressBatchesMock,
+  processPendingBatches: work,
+  advanceInProgressBatches: work,
 }));
-vi.mock('@/lib/notifications/notify-user', () => ({
-  notifyUserOfPendingUpdates: notifyUserOfPendingUpdatesMock,
-}));
-vi.mock('@/lib/stale-jobs', () => ({
-  STALE_JOB_TIMEOUT_MINUTES: 30,
-  INTERMEDIATE_STATES: ['queued', 'packaging', 'uploading'],
-  STALE_JOB_ERROR_MESSAGE: 'Timed out',
-  keepActuallyStaleJobs: keepActuallyStaleJobsMock,
-}));
-vi.mock('@/lib/auto-update/cleanup', () => ({
-  handleAutoUpdateJobCompletion: handleAutoUpdateJobCompletionMock,
-}));
-vi.mock('@/lib/version-compare', () => ({
-  parseVersion: vi.fn(() => [1, 0, 0]),
-  compareVersions: vi.fn(() => 0),
-}));
-vi.mock('@/lib/auto-update/trigger', () => ({
-  AutoUpdateTrigger: vi.fn(),
-  getLatestInstallerInfo: vi.fn(),
-}));
-vi.mock('@/types/update-policies', () => ({
-  shouldSkipUpdate: vi.fn(() => false),
-}));
-vi.mock('@/lib/catalog', () => ({ getCatalogSource: getCatalogSourceMock }));
-vi.mock('@/lib/winget-sync-resolution.mjs', () => ({
-  classifyWingetSyncRun: classifyWingetSyncRunMock,
-  createWingetManifestClient: createWingetManifestClientMock,
-  resolveWingetManifest: resolveWingetManifestMock,
-}));
-vi.mock('@/lib/manifest-api', () => ({
-  normalizeInstaller: normalizeInstallerMock,
-  normalizeManifestInstallers: normalizeManifestInstallersMock,
-}));
-vi.mock('./sync-packages/select-apps', () => ({
-  selectAppsToSync: selectAppsToSyncMock,
-}));
+vi.mock('@/lib/features', () => ({ getFeatureFlags: work }));
+vi.mock('@/lib/runner-loss-reconciliation', () => ({ reconcileRunnerLosses: work }));
+vi.mock('@/lib/auto-update/cleanup', () => ({ handleAutoUpdateJobCompletion: work }));
+vi.mock('@/lib/email/service', () => ({ isEmailConfigured: work }));
+vi.mock('@/lib/notifications/notify-user', () => ({ notifyUserOfPendingUpdates: work }));
+vi.mock('./sync-packages/select-apps', () => ({ selectAppsToSync: work }));
 
-function request(auth: string) {
-  return new Request('http://localhost/api/cron/validation', {
-    headers: { authorization: auth },
-  });
-}
+import { GET as processBatches } from './process-batches/route';
+import { GET as cleanupStaleJobs } from './cleanup-stale-jobs/route';
+import { GET as sendNotifications } from './send-notifications/route';
+import { GET as syncPackages } from './sync-packages/route';
 
-function makeQuery(result: unknown) {
-  const builder: Record<string, unknown> = {};
-  for (const method of ['select', 'eq', 'in', 'lt', 'gt', 'is', 'not', 'or', 'order', 'limit', 'range', 'upsert', 'update', 'insert', 'delete', 'maybeSingle']) {
-    builder[method] = vi.fn(() => builder);
-  }
-  builder.then = (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve(result).then(onFulfilled, onRejected);
-  return builder;
-}
+const routes: Array<[string, (request: Request) => Promise<Response>]> = [
+  ['process-batches', processBatches],
+  ['cleanup-stale-jobs', cleanupStaleJobs],
+  ['send-notifications', sendNotifications],
+  ['sync-packages', syncPackages],
+];
 
-function makeSupabaseClient() {
-  const client = {
-    from: vi.fn((table: string) => {
-      if (table === 'packaging_jobs') return makeQuery({ data: [], error: null });
-      if (table === 'update_check_results') return makeQuery({ data: [], error: null });
-      if (table === 'notification_preferences') return makeQuery({ data: [], error: null });
-      if (table === 'webhook_configurations') return makeQuery({ data: [], error: null });
-      if (table === 'app_update_policies') return makeQuery({ data: [], error: null });
-      if (table === 'curated_sync_status') return makeQuery({ error: null });
-      return makeQuery({ data: [], error: null });
-    }),
-  };
-  return client;
-}
+const request = (name: string, authorization?: string) => new Request(`https://example.test/api/cron/${name}`, {
+  headers: authorization === undefined ? {} : { authorization },
+});
 
-describe('cron route authentication', () => {
-  const routes = [
-    ['check-updates', './check-updates/route'],
-    ['cleanup-stale-jobs', './cleanup-stale-jobs/route'],
-    ['process-batches', './process-batches/route'],
-    ['send-notifications', './send-notifications/route'],
-    ['sync-packages', './sync-packages/route'],
-  ] as const;
+beforeEach(() => {
+  work.mockClear();
+  // With no Supabase configuration an authorized request stops right after
+  // the authorization check, before any work.
+  vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', '');
+  vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', '');
+});
+afterEach(() => { vi.unstubAllEnvs(); });
 
-  afterEach(() => {
-    delete process.env.CRON_SECRET;
-    delete process.env.NEXT_PUBLIC_SUPABASE_URL;
-    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
-    vi.resetModules();
-    vi.clearAllMocks();
-  });
+describe.each(routes)('cron route %s', (name, GET) => {
+  it.each([
+    ['unset', undefined],
+    ['empty', ''],
+  ])('rejects "Bearer undefined" and a missing header when CRON_SECRET is %s', async (_label, value) => {
+    vi.stubEnv('CRON_SECRET', value);
 
-  it.each(routes)(
-    'rejects Bearer undefined for %s while CRON_SECRET is unset',
-    async (_name, modulePath) => {
-      delete process.env.CRON_SECRET;
-      // Supabase configured, so a 401 cannot be a missing-config error
-      process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
-      process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
-      createClientMock.mockReturnValue(makeSupabaseClient());
-
-      const route = await import(modulePath);
-      const response = await route.GET(request('Bearer undefined'));
-
+    for (const authorization of ['Bearer undefined', undefined, 'Bearer ', 'Bearer null']) {
+      const response = await GET(request(name, authorization));
       expect(response.status).toBe(401);
-      await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
-      expect(createClientMock).not.toHaveBeenCalled();
+      expect(await response.json()).toEqual({ error: 'Unauthorized' });
     }
-  );
-
-  it.each(routes)('rejects a wrong secret for %s', async (_name, modulePath) => {
-    process.env.CRON_SECRET = 'the-real-secret';
-    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
-    process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
-    createClientMock.mockReturnValue(makeSupabaseClient());
-
-    const route = await import(modulePath);
-    const response = await route.GET(request('Bearer totally-wrong-secret'));
-
-    expect(response.status).toBe(401);
-    expect(createClientMock).not.toHaveBeenCalled();
+    expect(work).not.toHaveBeenCalled();
   });
 
-  it.each(routes)('runs %s for the configured secret', async (_name, modulePath) => {
-    process.env.CRON_SECRET = 'the-real-secret';
-    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
-    process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
+  it('rejects a wrong value of the same length and a missing header when the secret is set', async () => {
+    vi.stubEnv('CRON_SECRET', 'correct-secret');
 
-    createClientMock.mockReturnValue(makeSupabaseClient());
-    processPendingBatchesMock.mockResolvedValue({ batchesProcessed: 1, itemsStarted: 2, errors: [] });
-    advanceInProgressBatchesMock.mockResolvedValue({ staleItemsRecovered: 3, batchesCompleted: 4, errors: [] });
-    keepActuallyStaleJobsMock.mockResolvedValue([]);
-    createWingetManifestClientMock.mockReturnValue({});
-    selectAppsToSyncMock.mockResolvedValue([]);
+    for (const authorization of ['Bearer correct-secreT', 'Bearer undefined', undefined]) {
+      const response = await GET(request(name, authorization));
+      expect(response.status).toBe(401);
+    }
+    expect(work).not.toHaveBeenCalled();
+  });
 
-    const route = await import(modulePath);
-    const response = await route.GET(request('Bearer the-real-secret'));
+  it('lets the configured secret through', async () => {
+    vi.stubEnv('CRON_SECRET', 'correct-secret');
 
-    expect(response.status).toBe(200);
+    const response = await GET(request(name, 'Bearer correct-secret'));
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'Missing Supabase configuration' });
   });
 });

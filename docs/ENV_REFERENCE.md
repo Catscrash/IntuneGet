@@ -80,6 +80,8 @@ repository, so it reads its own compact JSON without a cross-repository token.
 | `INSTALLER_ALLOW_PRIVATE_URLS` | Allow custom-app installer URLs that resolve into the deployment's own network, and on non-standard ports. Off by default: such a URL is rejected when the job is submitted, since it decides where the packager connects. Set to `true` only when installers are served from an internal host |
 | `CRON_SECRET` | Protect cron routes. Required to run them at all: while it is unset every cron route answers 401, so a scheduled deployment needs it configured on both the app and the scheduler |
 | `MSP_STATE_SECRET` | MSP state/signing support |
+| `WEBHOOK_ALLOW_PRIVATE_DESTINATIONS` | Set to `true` on a self-hosted installation to let webhooks post to receivers on the local network. Off by default: webhook URLs must resolve to public internet addresses only. Leave it off on any deployment whose users you do not trust with the server's network |
+| `ALLOWED_TOKEN_CLIENT_IDS` | Extra app registration client ids (comma separated) whose Microsoft Graph tokens may call the API. Empty by default: only tokens issued to this deployment's own app registration are accepted |
 
 ## Packager Service Variables
 

@@ -1,6 +1,7 @@
 import { writeFile, rename } from 'node:fs/promises';
-import { recoverInfrastructure, recoverStalledPublication, rateLimitUntil } from './recovery.mjs';
+import { recoverInfrastructure, recoverStalledPublication, holdStalledPublication, rateLimitUntil } from './recovery.mjs';
 import { reconcileActive } from './active-health.mjs';
+import { parseWatchdogResponse, observeLifecycleWatchdog, recordWatchdogAlert } from './lifecycle-watchdog.mjs';
 import { decideDiskAction, diskGuardActor, lowDiskReason, parseHostFreeGb } from './host-disk-guard.mjs';
 
 const base = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -46,7 +47,17 @@ const result = {
   retryAt: null,
 };
 
+let watchdogObserved = false;
+async function observeWatchdogOnce() {
+  if (isDryRun || watchdogObserved) return;
+  watchdogObserved = true;
+  let awaitingQaJobs;
+  try { awaitingQaJobs = await exactCount('packaging_jobs', { select: 'id', status: 'eq.awaiting_qa' }); } catch { /* Unknown demand remains unknown. */ }
+  recordWatchdogAlert(result, await observeLifecycleWatchdog({ read: github, awaitingQaJobs }));
+}
+
 async function persist() {
+  await observeWatchdogOnce().catch(() => {});
   const value = `${JSON.stringify(result, null, 2)}\n`;
   if (statePath) {
     await writeFile(`${statePath}.${process.pid}.tmp`, value, 'utf8');
@@ -102,7 +113,10 @@ async function github(path, init = {}) {
   const owner = process.env.GITHUB_OWNER;
   const repository = process.env.GITHUB_WORKFLOWS_REPO;
   if (!token || !owner || !repository) throw new Error('GitHub recovery configuration is missing.');
+  const watchdogRead = path.startsWith('/actions/workflows/intune-qa.yml/runs?');
+  if (watchdogRead && (owner !== 'ugurkocde' || repository !== 'IntuneGet-Workflows')) throw Object.assign(new Error('scope'), { watchdogCause: 'scope' });
   const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}${path}`, {
+    ...(watchdogRead ? { redirect: 'error' } : {}),
     ...init, headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28' },
     signal: AbortSignal.timeout(20_000),
   });
@@ -114,6 +128,7 @@ async function github(path, init = {}) {
   if (!response.ok) throw Object.assign(new Error(`GitHub recovery returned ${response.status}.`), { httpStatus: response.status, retryAt });
   // Job rerun can return an empty 201 response, not only an empty 204.
   const payload = await response.text();
+  if (path.startsWith('/actions/workflows/intune-qa.yml/runs?') && path.endsWith('&per_page=20')) return parseWatchdogResponse(payload);
   return payload ? JSON.parse(payload) : null;
 }
 
@@ -346,6 +361,7 @@ try {
         result.snapshot = current;
       }
     }
+
   }
 
   if (!result.repairRequired && !result.snapshot.control.paused) {
@@ -389,7 +405,11 @@ try {
           updated_at: new Date().toISOString(),
         });
       }
-      if (recovery.repairRequired) {
+      if (recovery.action === 'publication_candidate_held') {
+        requireRepair('Publication evidence is held for this candidate; the queue keeps running without VM replay.', `publication-hold:${recovery.candidateId}`);
+      }
+      if (recovery.candidateOnly) requireRepair(recovery.repairReason, recovery.repairKey);
+      if (recovery.repairRequired && !recovery.candidateOnly) {
         if (!isDryRun) await patch('qa_pipeline_control', { id: 'eq.global', paused: 'eq.false' }, {
           paused: true, reason: `QA infrastructure recovery requires review for candidate ${recovery.candidateId}.`,
           updated_by: 'qa-infrastructure-recovery', updated_at: new Date().toISOString(),
@@ -415,12 +435,17 @@ try {
       }
     } else if (currentActive) {
       const health = await reconcileActive({ candidate: currentActive, invokeCron, snapshot, dryRun: isDryRun,
-        recoverPublication: candidate => recoverStalledPublication({ candidate, github, patch }) });
+        recoverPublication: candidate => recoverStalledPublication({ candidate, github, patch }),
+        holdPublication: candidate => holdStalledPublication({ candidate, github, patch, rows }) });
       result.action = health.action;
       if (health.snapshot) result.snapshot = health.snapshot;
       if (health.reconciled) result.actions.push({ type: 'active_reconcile', ...health.reconciled });
+      if (health.action === 'publication_candidate_held') {
+        requireRepair('Publication evidence is held for this candidate; the queue keeps running without VM replay.', `publication-hold:${health.candidateId}`);
+        result.action = health.action;
+      }
       if (health.repairRequired) {
-        await patch('qa_pipeline_control', { id: 'eq.global', paused: 'eq.false' }, {
+        if (!health.candidateOnly) await patch('qa_pipeline_control', { id: 'eq.global', paused: 'eq.false' }, {
           paused: true, reason: 'QA infrastructure recovery in progress.',
           updated_by: 'qa-execution-watchdog', updated_at: new Date().toISOString(),
         });
@@ -453,6 +478,7 @@ try {
       if (!/PGRST205|42P01|Supabase REST 404/.test(String(error?.message))) throw error;
     }
   }
+
 
   result.ok = true;
   await persist();

@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
 const {
   parseAccessTokenMock,
@@ -11,7 +11,13 @@ const {
   getPolicyByKeyMock,
   getCatalogSourceMock,
   getAppForInstallerMock,
+  updatePolicyMock,
+  supabaseConfiguredMock,
+  resolveTargetTenantIdMock,
 } = vi.hoisted(() => ({
+  updatePolicyMock: vi.fn(),
+  supabaseConfiguredMock: vi.fn(),
+  resolveTargetTenantIdMock: vi.fn(),
   parseAccessTokenMock: vi.fn(),
   getDatabaseMock: vi.fn(),
   getHistoryMock: vi.fn(),
@@ -37,6 +43,16 @@ vi.mock('@/lib/catalog', () => ({
 // reached through the db abstraction, so there is no Supabase client to mock.
 vi.mock('@/lib/db', () => ({
   getDatabase: getDatabaseMock,
+}));
+
+// Tenant authorization has its own tests in lib/msp/tenant-resolution.test.ts.
+// Here it allows the requested tenant unless a test says otherwise.
+vi.mock('@/lib/msp/tenant-resolution', () => ({
+  resolveTargetTenantId: resolveTargetTenantIdMock,
+}));
+vi.mock('@/lib/supabase', () => ({
+  isSupabaseServerConfigured: supabaseConfiguredMock,
+  createServerClient: () => ({}),
 }));
 
 import { GET, POST } from '@/app/api/update-policies/route';
@@ -83,11 +99,17 @@ beforeEach(() => {
     updateCheckResults: { getByUserId: getDetectedUpdatesMock },
     updatePolicies: {
       upsert: upsertPolicyMock,
+      update: updatePolicyMock,
       list: getPoliciesByUserMock,
       getByKey: getPolicyByKeyMock,
     },
   });
   seed({});
+  supabaseConfiguredMock.mockReturnValue(true);
+  resolveTargetTenantIdMock.mockImplementation(async ({ requestedTenantId }: { requestedTenantId: string }) => ({
+    tenantId: requestedTenantId,
+    errorResponse: null,
+  }));
   getPoliciesByUserMock.mockResolvedValue([]);
   getPolicyByKeyMock.mockResolvedValue(null);
   upsertPolicyMock.mockImplementation(async (policy: Record<string, unknown>) => ({
@@ -143,6 +165,62 @@ describe('POST /api/update-policies', () => {
     expect(upsertPolicyMock).not.toHaveBeenCalled();
     expect((await POST(makeRequest({ ...base, auto_update_scope: 'major' }))).status).toBe(200);
     expect(upsertPolicyMock.mock.calls[0][0].auto_update_scope).toBe('major');
+  });
+
+  it('asks for the manage_policies permission on the tenant named in the body', async () => {
+    await POST(makeRequest({ winget_id: 'Vendor.App', tenant_id: 'tenant-1', policy_type: 'notify' }));
+
+    expect(resolveTargetTenantIdMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-1',
+        tokenTenantId: 'home-tenant',
+        requestedTenantId: 'tenant-1',
+        requiredPermission: 'manage_policies',
+      })
+    );
+  });
+
+  it('writes nothing when the caller may not act in that tenant', async () => {
+    resolveTargetTenantIdMock.mockResolvedValue({
+      tenantId: 'home-tenant',
+      errorResponse: NextResponse.json({ error: 'Not authorized to access other tenants' }, { status: 403 }),
+    });
+
+    const response = await POST(makeRequest({ winget_id: 'Vendor.App', tenant_id: 'someone-elses-tenant', policy_type: 'auto_update' }));
+
+    expect(response.status).toBe(403);
+    expect(upsertPolicyMock).not.toHaveBeenCalled();
+    expect(updatePolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('only manages the caller\'s own tenant without Supabase', async () => {
+    supabaseConfiguredMock.mockReturnValue(false);
+
+    const other = await POST(makeRequest({ winget_id: 'Vendor.App', tenant_id: 'tenant-1', policy_type: 'notify' }));
+    const own = await POST(makeRequest({ winget_id: 'Vendor.App', tenant_id: 'home-tenant', policy_type: 'notify' }));
+
+    expect(other.status).toBe(403);
+    expect(own.status).toBe(200);
+    expect(upsertPolicyMock).toHaveBeenCalledTimes(1);
+    expect(resolveTargetTenantIdMock).not.toHaveBeenCalled();
+  });
+
+  it('resets the failure count when automatic updates are selected again', async () => {
+    upsertPolicyMock.mockImplementation(async (policy: Record<string, unknown>) => ({
+      id: 'paused-policy', ...policy, consecutive_failures: 3,
+    }));
+    updatePolicyMock.mockImplementation(async (_id: string, _user: string, patch: Record<string, unknown>) => ({
+      id: 'paused-policy', consecutive_failures: 3, ...patch,
+    }));
+
+    const response = await POST(makeRequest({
+      winget_id: 'Vendor.App', tenant_id: 'tenant-1', policy_type: 'auto_update',
+      deployment_config: { displayName: 'Fixture app' },
+    }));
+
+    expect(response.status).toBe(200);
+    expect(updatePolicyMock).toHaveBeenCalledWith('paused-policy', 'user-1', expect.objectContaining({ consecutive_failures: 0 }));
+    expect((await response.json()).policy.consecutive_failures).toBe(0);
   });
 
   it('derives the current version for pin_version when client omits it', async () => {

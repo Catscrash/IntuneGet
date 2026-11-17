@@ -110,3 +110,36 @@ describe('reviewing a replacement version', () => {
     expect(useCartStore.getState().items).toEqual([]);
   });
 });
+
+it('places a saved configuration refresh notice inside the editor focus boundary', async () => {
+  const retry = vi.fn();
+  const props = { package: { id: oldItem.wingetId, name: oldItem.displayName, publisher: oldItem.publisher, version: '1.0' }, installers: [installer], deployedConfig: oldItem, onClose: vi.fn(),
+    configurationRefreshNotice: createElement('div', { role: 'alert' }, createElement('button', { onClick: retry }, 'Retry saved configuration')) };
+  await act(async () => root.render(createElement(PackageConfig, props)));
+  const button = [...document.querySelectorAll('button')].find(x => x.textContent === 'Retry saved configuration')!;
+  expect(button).toBeDefined();
+  const focusBoundary = document.querySelector('[role="dialog"]')!.children[1];
+  expect(focusBoundary.contains(button)).toBe(true);
+  const before = useCartStore.getState().items;
+  await act(async () => button.click()); expect(retry).toHaveBeenCalledTimes(1);
+  expect(useCartStore.getState().items).toBe(before);
+});
+
+
+it('keeps copy assignments non-destructive when adding an automatic update policy', async () => {
+  useCartStore.setState({ items: [] });
+  await act(async () => root.render(createElement(PackageConfig, {
+    package: { id: oldItem.wingetId, name: oldItem.displayName, publisher: oldItem.publisher, version: '3.0' },
+    installers: [installer], versions: ['3.0'],
+    deployedConfig: { ...oldItem, version: '3.0', updatePolicy: 'auto_update',
+      assignmentMigration: { carryOverAssignments: true, removeAssignmentsFromPreviousApp: false } },
+    onClose: vi.fn(),
+  })));
+  const add = [...document.querySelectorAll('button')].find(button => button.textContent?.includes('Add to Selection'))!;
+  expect(add.disabled).toBe(false);
+  await act(async () => add.click());
+  expect(useCartStore.getState().items[0]).toMatchObject({
+    updatePolicy: 'auto_update',
+    assignmentMigration: { carryOverAssignments: true, removeAssignmentsFromPreviousApp: false },
+  });
+});

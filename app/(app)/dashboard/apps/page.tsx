@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { AppSearch } from '@/components/AppSearch';
-import { VirtualAppList } from '@/components/VirtualAppList';
+import { APP_GRID_TEMPLATE_COLUMNS, VirtualAppList } from '@/components/VirtualAppList';
 import { useNearViewport } from '@/hooks/use-near-viewport';
 import { AppCard } from '@/components/AppCard';
 import { AppListItem } from '@/components/AppListItem';
@@ -50,6 +50,7 @@ import {
 import { useDeployedPackages } from '@/hooks/use-deployed-packages';
 import { useTenantDeployments } from '@/hooks/use-tenant-deployments';
 import { useDeployedConfig } from '@/hooks/use-deployed-config';
+import { useFocusTrap } from '@/hooks/use-focus-trap';
 import { useBulkAdd } from '@/hooks/use-bulk-add';
 import { useQaStatuses } from '@/hooks/use-qa';
 import { useCuratedReleases } from '@/hooks/use-curated-releases';
@@ -83,13 +84,32 @@ const SORT_OPTIONS = [
   { key: 'newest', label: 'Newest', icon: Clock },
 ] as const;
 
+function SavedConfigurationError({ onClose, onRetry, isFetching }: { onClose: () => void; onRetry: () => void; isFetching: boolean }) {
+  const focusRef = useFocusTrap<HTMLDivElement>();
+  return (<div ref={focusRef} tabIndex={-1} className="fixed inset-0 z-50 overflow-hidden" role="dialog" aria-modal="true" aria-label="Saved configuration unavailable">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} aria-hidden="true" />
+          <div className="absolute right-0 top-0 bottom-0 w-full max-w-2xl bg-bg-surface border-l border-overlay/5 shadow-2xl flex items-center justify-center">
+            <div role="alert" className="text-center px-6">
+              <h3 className="text-text-primary font-medium mb-2"><T>Could not load saved configuration</T></h3>
+              <p className="text-text-secondary text-sm mb-4"><T>Your saved settings could not be loaded. Retry before editing this app.</T></p>
+              <div className="flex justify-center gap-3">
+                <button type="button" onClick={onRetry} disabled={isFetching} className="rounded-lg bg-accent-cyan px-4 py-2 text-sm text-white disabled:opacity-50"><T>Retry</T></button>
+                <button type="button" onClick={onClose} className="rounded-lg border border-overlay/10 bg-bg-elevated px-4 py-2 text-sm text-text-primary"><T>Close</T></button>
+              </div>
+            </div>
+          </div>
+        </div>);
+}
+
 export default function AppCatalogPage() {
   const searchParams = useSearchParams();
   const [deploymentIntentId] = useState(() => searchParams.get('deploy')?.trim() || null);
 
   // Initialize state from URL params
-  const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '');
+  const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || searchParams.get('search') || '');
   const [selectedPackage, setSelectedPackage] = useState<NormalizedPackage | null>(null);
+  const [openedConfigScope, setOpenedConfigScope] = useState<string | null>(null);
+  const previousConfigScope = useRef<string | null>(null);
   const [deploymentIntentError, setDeploymentIntentError] = useState<string | null>(null);
   const processedDeploymentIntentRef = useRef<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(searchParams.get('category') || null);
@@ -228,14 +248,18 @@ export default function AppCatalogPage() {
   }, []);
   const { data: categoriesData } = useCategories();
   const { data: featuredData, isLoading: isLoadingFeatured } = usePopularPackages(5, null, isBrowseMode && discoveryNear);
-  const { data: searchData, isLoading: isSearching, isFetching } = useSearchPackages(searchQuery, 50, selectedCategory, sortBy);
+  const { data: searchData, isLoading: isSearching, isFetching, isError: isSearchError, refetch: refetchSearch } = useSearchPackages(searchQuery, 50, selectedCategory, sortBy);
 
   const {
     data: infiniteData,
     isLoading: isLoadingInfinite,
     isFetchingNextPage,
+    isFetching: isFetchingBrowse,
+    isError: isBrowseError,
+    isFetchNextPageError,
     hasNextPage,
     fetchNextPage,
+    refetch: refetchBrowse,
   } = useInfinitePackages(20, selectedCategory, sortBy, !hasSearched);
   const { deployedSet } = useDeployedPackages();
   const { tenantDeployments } = useTenantDeployments();
@@ -246,9 +270,14 @@ export default function AppCatalogPage() {
   } = useCatalogPackage(deploymentIntentId);
 
   const isSelectedDeployed = selectedPackage ? deployedSet.has(selectedPackage.id) : false;
-  const { deployedConfig, intuneAppId, isLoading: isLoadingDeployedConfig } = useDeployedConfig(
+  const {
+    deployedConfig, intuneAppId, scopeKey: configScopeKey,
+    isPending: isDeployedConfigPending, isError: isDeployedConfigError,
+    isFetching: isFetchingDeployedConfig, refetch: refetchDeployedConfig,
+  } = useDeployedConfig(
     isSelectedDeployed ? selectedPackage?.id ?? null : null
   );
+  const isDeployedConfigBlocked = isSelectedDeployed && openedConfigScope !== configScopeKey && (isDeployedConfigPending || isDeployedConfigError);
 
   const isSelectedStoreApp = selectedPackage?.appSource === 'store';
   const {
@@ -289,6 +318,18 @@ export default function AppCatalogPage() {
   }, [infiniteData?.pages]);
   const selectedInstallers = manifestData?.installers || [];
   const selectedVersions = manifestData?.versions || [];
+  useEffect(() => {
+    if (previousConfigScope.current !== configScopeKey) {
+      previousConfigScope.current = configScopeKey;
+      setOpenedConfigScope(null);
+    }
+    if (!selectedPackage) setOpenedConfigScope(null);
+    else if (isSelectedDeployed && !isDeployedConfigPending && !isDeployedConfigError &&
+      ((isSelectedStoreApp && !isLoadingStoreManifest) || (!isSelectedStoreApp && !isLoadingInstallers && selectedInstallers.length > 0))) {
+      setOpenedConfigScope(configScopeKey);
+    }
+  }, [selectedPackage, isSelectedDeployed, configScopeKey, isDeployedConfigPending, isDeployedConfigError,
+    isSelectedStoreApp, isLoadingStoreManifest, isLoadingInstallers, selectedInstallers.length]);
 
   const showSearchResults = hasSearched;
   const { data: qaStatusesData } = useQaStatuses(visibleQaIds);
@@ -305,7 +346,7 @@ export default function AppCatalogPage() {
   const activeSortLabel = SORT_OPTIONS.find((option) => option.key === sortBy)?.label || 'Popular';
 
   const showInitialLoading = hasSearched && isSearching && searchPackages.length === 0;
-  const showEmptyState = hasSearched && !isSearching && !isFetching && searchPackages.length === 0;
+  const showEmptyState = hasSearched && !isSearchError && !isSearching && !isFetching && searchPackages.length === 0;
 
   useEffect(() => {
     if (
@@ -432,10 +473,10 @@ export default function AppCatalogPage() {
 
   const handleObserver = useCallback((entries: IntersectionObserverEntry[]) => {
     const [target] = entries;
-    if (target.isIntersecting && hasNextPage && !isFetchingNextPage) {
+    if (target.isIntersecting && !hasSearched && !isBrowseError && hasNextPage && !isFetchingBrowse) {
       fetchNextPage();
     }
-  }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
+  }, [fetchNextPage, hasNextPage, hasSearched, isBrowseError, isFetchingBrowse]);
 
   useEffect(() => {
     const element = loadMoreRef.current;
@@ -478,10 +519,12 @@ export default function AppCatalogPage() {
   }, [hasSearched, mounted, selectedCategory, selectedPackage, sortBy]);
 
   const handleSelectPackage = (pkg: NormalizedPackage) => {
+    setOpenedConfigScope(null);
     setSelectedPackage(pkg);
   };
 
   const handleCloseConfig = () => {
+    setOpenedConfigScope(null);
     setSelectedPackage(null);
   };
 
@@ -505,7 +548,7 @@ export default function AppCatalogPage() {
   };
 
   const renderLoadingSkeletons = () => (
-    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+    <div className="grid gap-4" style={{ gridTemplateColumns: APP_GRID_TEMPLATE_COLUMNS }}>
       {[...Array(6)].map((_, i) => (
         <div key={i} className="rounded-xl border border-overlay/10 bg-bg-elevated p-5">
           <div className="flex items-start gap-4">
@@ -811,6 +854,26 @@ export default function AppCatalogPage() {
         </div>
       )}
 
+      {(hasSearched ? isSearchError : isBrowseError) && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-status-error/30 bg-status-error/5 p-4">
+          <p className="text-sm text-text-primary">
+            {loadedCount > 0 ? <T>Could not refresh catalog results.</T> : <T>Could not load catalog results.</T>}
+          </p>
+          <button
+            type="button"
+            disabled={hasSearched ? isFetching : isFetchingBrowse}
+            onClick={() => {
+              if (hasSearched) void refetchSearch();
+              else if (isFetchNextPageError) void fetchNextPage();
+              else void refetchBrowse();
+            }}
+            className="rounded-lg border border-overlay/10 bg-bg-elevated px-4 py-2 text-sm text-text-primary hover:bg-overlay/5 disabled:opacity-50"
+          >
+            <T>Retry</T>
+          </button>
+        </div>
+      )}
+
       {showInitialLoading ? (
         <div className="flex items-center justify-center py-20">
           <div className="text-center">
@@ -848,12 +911,12 @@ export default function AppCatalogPage() {
         </div>
       ) : (
         <>
-          <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
             <aside className="hidden lg:block lg:sticky lg:top-[5.25rem] self-start">
               {renderFilterPanel()}
             </aside>
 
-            <div className="space-y-10">
+            <div className="min-w-0 space-y-10">
               <section ref={resultsSectionRef} className="space-y-4">
                 {/* Category breadcrumb */}
                 {showCategoryResults && (
@@ -914,7 +977,7 @@ export default function AppCatalogPage() {
                           <span className="text-sm"><T>Loading more apps...</T></span>
                         </div>
                       )}
-                      {!hasNextPage && allPackages.length > 0 && (
+                      {!isBrowseError && !hasNextPage && allPackages.length > 0 && (
                         <p className="text-text-muted text-sm"><T>You&apos;ve seen all the apps</T></p>
                       )}
                     </div>
@@ -1018,7 +1081,7 @@ export default function AppCatalogPage() {
           </div>
         )}
 
-      {selectedPackage && ((isSelectedStoreApp && !isLoadingStoreManifest) || (!isSelectedStoreApp && !isLoadingInstallers && selectedInstallers.length > 0)) && !(isSelectedDeployed && isLoadingDeployedConfig) && (
+      {selectedPackage && ((isSelectedStoreApp && !isLoadingStoreManifest) || (!isSelectedStoreApp && !isLoadingInstallers && selectedInstallers.length > 0)) && !isDeployedConfigBlocked && (
         <PackageConfig
           package={selectedPackage}
           installers={selectedInstallers}
@@ -1027,11 +1090,17 @@ export default function AppCatalogPage() {
           isDeployed={isSelectedDeployed}
           deployedConfig={deployedConfig}
           intuneAppId={intuneAppId}
+          configurationRefreshNotice={isSelectedDeployed && openedConfigScope === configScopeKey && isDeployedConfigError ? (
+            <div role="alert" className="rounded-lg border border-status-warning/30 bg-bg-surface p-4">
+              <p><T>Could not refresh saved configuration. Your unsaved edits are kept.</T></p>
+              <button type="button" onClick={() => void refetchDeployedConfig()} disabled={isFetchingDeployedConfig} className="mt-2 text-accent-cyan disabled:opacity-50"><T>Retry</T></button>
+            </div>
+          ) : null}
           storeManifest={storeManifestData}
         />
       )}
 
-      {selectedPackage && ((isSelectedStoreApp && isLoadingStoreManifest) || (!isSelectedStoreApp && isLoadingInstallers) || (isSelectedDeployed && isLoadingDeployedConfig)) && (
+      {selectedPackage && ((isSelectedStoreApp && isLoadingStoreManifest) || (!isSelectedStoreApp && isLoadingInstallers) || (isSelectedDeployed && isDeployedConfigPending && isDeployedConfigBlocked)) && (
         <div className="fixed inset-0 z-50 overflow-hidden" role="dialog" aria-modal="true" aria-label="Loading package details">
           <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={handleCloseConfig} aria-hidden="true" />
           <div className="absolute right-0 top-0 bottom-0 w-full max-w-2xl bg-bg-surface border-l border-overlay/5 shadow-2xl flex items-center justify-center animate-slide-in-right">
@@ -1045,6 +1114,12 @@ export default function AppCatalogPage() {
           </div>
         </div>
       )}
+
+      {selectedPackage && ((isSelectedStoreApp && !isLoadingStoreManifest) || (!isSelectedStoreApp && !isLoadingInstallers && selectedInstallers.length > 0)) && isSelectedDeployed && isDeployedConfigError && isDeployedConfigBlocked && (
+        <SavedConfigurationError onClose={handleCloseConfig} onRetry={() => void refetchDeployedConfig()} isFetching={isFetchingDeployedConfig} />
+      )}
+
+
 
       {selectedPackage && !isSelectedStoreApp && !isLoadingInstallers && selectedInstallers.length === 0 && (
         <div className="fixed inset-0 z-50 overflow-hidden" role="dialog" aria-modal="true" aria-label="No installers found">
@@ -1080,11 +1155,11 @@ export default function AppCatalogPage() {
 
       {/* Floating bulk action bar */}
       {isBulkSelectMode && selectedPackageIds.size > 0 && (
-        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-5 py-3 rounded-2xl bg-bg-elevated/95 backdrop-blur-md border border-overlay/10 shadow-2xl">
+        <div className="fixed bottom-20 inset-x-3 z-40 mx-auto flex w-fit max-w-[calc(100vw-1.5rem)] flex-wrap items-center justify-center gap-x-3 gap-y-2 px-4 py-3 sm:px-5 rounded-2xl bg-bg-elevated/95 backdrop-blur-md border border-overlay/10 shadow-2xl">
           <span className="text-sm font-medium text-text-primary whitespace-nowrap">
             {selectedPackageIds.size} <T>selected</T>
           </span>
-          <div className="w-px h-5 bg-overlay/10" />
+          <div className="hidden sm:block w-px h-5 bg-overlay/10" />
           <button
             onClick={handleSelectAllVisible}
             className="text-sm text-text-secondary hover:text-accent-cyan transition-colors whitespace-nowrap"
@@ -1097,7 +1172,7 @@ export default function AppCatalogPage() {
           >
             <T>Clear</T>
           </button>
-          <div className="w-px h-5 bg-overlay/10" />
+          <div className="hidden sm:block w-px h-5 bg-overlay/10" />
           <button
             onClick={handleBulkQuickAdd}
             disabled={isBulkAdding}

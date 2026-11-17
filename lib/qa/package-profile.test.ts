@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
 import { applyApplicationPackagingAdapter } from '@/lib/packaging-adapters';
+import curatedDefinitions from '@/lib/curated-catalog/definitions.json';
 import {
   buildQaPackageIdentity,
   buildQaPackageIdentityFromWorkflowInput,
@@ -35,6 +36,148 @@ const input = {
 };
 
 describe('PSADT QA package identity', () => {
+  it('preserves signed curated identity bytes only for exact reviewed definition metadata', () => {
+    const app = curatedDefinitions[0];
+    const curatedInput = { ...input, profileKind: 'deployment-config' as const,
+      wingetId: app.packageId, displayName: app.name, publisher: app.publisher };
+    const curated = buildQaPackageIdentity(curatedInput);
+    expect(curated.profile.app.displayName).toBe(app.packageId);
+    expect(curated.profile.app.publisher).toBe('IntuneGet QA');
+    for (const mismatch of [{ displayName: app.name + ' changed' }, { publisher: app.publisher + ' changed' }]) {
+      const changed = buildQaPackageIdentity({ ...curatedInput, ...mismatch });
+      expect(changed.packageProfileSha256).not.toBe(curated.packageProfileSha256);
+      expect(changed.profile.app.displayName).toBe(mismatch.displayName ?? app.name);
+      expect(changed.profile.app.publisher).toBe(mismatch.publisher ?? app.publisher);
+    }
+  });
+  it('gives LegendCTL a new capture profile without changing installer or toolchain', () => {
+    const legend = { ...input, wingetId: 'EvilHumphrey.LegendCTL', displayName: 'LegendCTL',
+      publisher: 'EvilHumphrey', version: '2.6.6', uninstallCommand: 'REGISTRY_UNINSTALL:LegendCTL' };
+    const repaired = normalizeQaWorkflowPackageInput({
+      wingetId: legend.wingetId, displayName: legend.displayName, publisher: legend.publisher,
+      version: legend.version, architecture: legend.architecture,
+      installerSha256: legend.installerSha256, installerType: legend.sourceInstallerType,
+      silentSwitches: legend.silentArgs, installScope: legend.installScope,
+      uninstallCommand: legend.uninstallCommand, detectionRules: '[]',
+      psadtConfig: JSON.stringify(legend.psadtConfig),
+    }).identity;
+    const previous = buildQaPackageIdentity({ ...legend, profileKind: 'deployment-config',
+      psadtConfig: repaired.profile.psadtConfig, detectionRules: repaired.profile.detectionRules });
+    expect(repaired.profile.installer.uninstallCommand).toBe('REGISTRY_UNINSTALL:ZD Ultimate Legend Wrapper');
+    expect(repaired.packageProfileSha256).not.toBe(previous.packageProfileSha256);
+    expect(repaired.profile.installer.sha256).toBe(previous.profile.installer.sha256);
+    expect(repaired.detectionRulesSha256).toBe(previous.detectionRulesSha256);
+    expect(repaired.psadtConfigSha256).toBe(previous.psadtConfigSha256);
+    expect(repaired.profile.toolchain).toEqual(previous.profile.toolchain);
+    const unrelated = { ...legend, wingetId: 'Example.App' };
+    expect(buildQaPackageIdentity(unrelated).profile.installer.uninstallCommand).toBe(legend.uninstallCommand);
+  });
+
+  it('changes the Breitbandmessung uninstall profile without changing detection, configuration or installer bytes', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{14607473-30DB-509F-94F0-BB7C085C619E}:Breitbandmessung';
+    const application = {
+      ...input, wingetId: 'zafaco.Breitbandmessung', displayName: 'Breitbandmessung', publisher: 'zafaco',
+      version: '3.13.0', sourceInstallerType: 'nullsoft', silentArgs: '/S',
+      uninstallCommand: original,
+    };
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: application.wingetId, displayName: application.displayName, publisher: application.publisher,
+      version: application.version, architecture: application.architecture,
+      installerSha256: application.installerSha256, installerType: application.sourceInstallerType,
+      silentSwitches: application.silentArgs, installScope: application.installScope,
+      uninstallCommand: original, detectionRules: JSON.stringify(application.detectionRules),
+      psadtConfig: JSON.stringify(application.psadtConfig),
+    }).identity;
+    const previous = buildQaPackageIdentity({
+      ...application, psadtConfig: normalized.profile.psadtConfig,
+      detectionRules: normalized.profile.detectionRules,
+    });
+    expect(normalized.profile.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:14607473-30db-509f-94f0-bb7c085c619e:Breitbandmessung'
+    );
+    expect(normalized.packageProfileSha256).not.toBe(previous.packageProfileSha256);
+    expect(normalized.detectionRulesSha256).toBe(previous.detectionRulesSha256);
+    expect(normalized.psadtConfigSha256).toBe(previous.psadtConfigSha256);
+    expect(normalized.profile.installer.sha256).toBe(previous.profile.installer.sha256);
+    expect(normalized.profile.installer.installScope).toBe('machine');
+  });
+
+  it('changes the Niko Home Control uninstall profile without changing detection, configuration or installer bytes', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{E0658CE6-6ECB-5EC8-AE2F-5A81C75FBCD6}:Niko Home Control programming software';
+    const application = {
+      ...input, wingetId: 'Niko.HomeControlProgrammingSoftware', displayName: 'Niko Home Control programming software', publisher: 'Niko',
+      version: '2.28.16662', sourceInstallerType: 'nullsoft', silentArgs: '/S',
+      uninstallCommand: original,
+    };
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: application.wingetId, displayName: application.displayName, publisher: application.publisher,
+      version: application.version, architecture: application.architecture,
+      installerSha256: application.installerSha256, installerType: application.sourceInstallerType,
+      silentSwitches: application.silentArgs, installScope: application.installScope,
+      uninstallCommand: original, detectionRules: JSON.stringify(application.detectionRules),
+      psadtConfig: JSON.stringify(application.psadtConfig),
+    }).identity;
+    const previous = buildQaPackageIdentity({
+      ...application, psadtConfig: normalized.profile.psadtConfig,
+      detectionRules: normalized.profile.detectionRules,
+    });
+    expect(normalized.profile.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:e0658ce6-6ecb-5ec8-ae2f-5a81c75fbcd6:Niko Home Control programming software'
+    );
+    expect(normalized.packageProfileSha256).not.toBe(previous.packageProfileSha256);
+    expect(normalized.detectionRulesSha256).toBe(previous.detectionRulesSha256);
+    expect(normalized.psadtConfigSha256).toBe(previous.psadtConfigSha256);
+    expect(normalized.profile.installer.sha256).toBe(previous.profile.installer.sha256);
+    expect(normalized.profile.installer.installScope).toBe('machine');
+  });
+
+  it('changes the Tuta uninstall profile without changing detection, configuration or installer bytes', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{450699D2-1C81-5EE5-AEC6-08DDDB7AF9D7}:Tuta Mail';
+    const tuta = {
+      ...input, wingetId: 'Tutanota.Tutanota', displayName: 'Tuta Mail', publisher: 'Tutanota',
+      version: '365.261030.0', sourceInstallerType: 'nullsoft', silentArgs: '/S',
+      uninstallCommand: original,
+    };
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: tuta.wingetId, displayName: tuta.displayName, publisher: tuta.publisher,
+      version: tuta.version, architecture: tuta.architecture,
+      installerSha256: tuta.installerSha256, installerType: tuta.sourceInstallerType,
+      silentSwitches: tuta.silentArgs, installScope: tuta.installScope,
+      uninstallCommand: original, detectionRules: JSON.stringify(tuta.detectionRules),
+      psadtConfig: JSON.stringify(tuta.psadtConfig),
+    }).identity;
+    const previous = buildQaPackageIdentity({
+      ...tuta, psadtConfig: normalized.profile.psadtConfig,
+      detectionRules: normalized.profile.detectionRules,
+    });
+    expect(normalized.profile.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_KEY:450699d2-1c81-5ee5-aec6-08dddb7af9d7:Tuta Mail'
+    );
+    expect(normalized.packageProfileSha256).not.toBe(previous.packageProfileSha256);
+    expect(normalized.detectionRulesSha256).toBe(previous.detectionRulesSha256);
+    expect(normalized.psadtConfigSha256).toBe(previous.psadtConfigSha256);
+    expect(normalized.profile.installer.sha256).toBe(previous.profile.installer.sha256);
+    expect(normalized.profile.installer.installScope).toBe('machine');
+  });
+
+  it('gives the UDS capture repair a new profile while preserving detection and installer identity', () => {
+    const uds = {
+      ...input, wingetId: 'VirtualCable.UDSClient', displayName: 'UDS Enterprise Client',
+      publisher: 'VirtualCable', version: '3.6.0.18670', architecture: 'x86',
+      sourceInstallerType: 'nullsoft', silentArgs: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL:UDS Enterprise Client',
+    };
+    const previous = buildQaPackageIdentity(uds);
+    const repaired = buildQaPackageIdentity({
+      ...uds, psadtConfig: applyApplicationPackagingAdapter(uds.wingetId, uds.psadtConfig),
+    });
+    expect(repaired.profile.psadtConfig.reviewedRegistryUninstallDisplayName).toBe('UDS Client');
+    expect(repaired.psadtConfigSha256).not.toBe(previous.psadtConfigSha256);
+    expect(repaired.packageProfileSha256).not.toBe(previous.packageProfileSha256);
+    expect(repaired.detectionRulesSha256).toBe(previous.detectionRulesSha256);
+    expect(repaired.profile.installer).toEqual(previous.profile.installer);
+  });
+
   it('preserves the exact failed Wacom driver identity for the shared registered-command adapter', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'Wacom.WacomTabletDriver', displayName: 'Wacom Tablet', publisher: 'Wacom',
@@ -152,13 +295,11 @@ describe('PSADT QA package identity', () => {
     );
   });
 
-  it('reuses execution QA when only presentation changes', () => {
+  it('reuses execution QA when only PSADT branding changes', () => {
     const deploymentInput = { ...input, profileKind: 'deployment-config' as const };
     const baseline = buildQaPackageIdentity(deploymentInput);
     const branded = buildQaPackageIdentity({
       ...deploymentInput,
-      displayName: 'Customer-facing Example',
-      publisher: 'Customer Publisher',
       psadtConfig: {
         ...DEFAULT_PSADT_CONFIG,
         brandingCompanyName: 'Contoso',
@@ -177,6 +318,18 @@ describe('PSADT QA package identity', () => {
     expect(branded.presentationProfileSha256).not.toBe(
       baseline.presentationProfileSha256
     );
+  });
+
+  it('binds deployment app identity metadata because the packager uses it for registry selection', () => {
+    const deployment = { ...input, profileKind: 'deployment-config' as const };
+    const baseline = buildQaPackageIdentity(deployment);
+    expect(JSON.parse(baseline.canonicalJson).app).toMatchObject({
+      displayName: input.displayName, publisher: input.publisher,
+    });
+    for (const change of [{ publisher: 'Other Vendor' }, { displayName: 'Other Product' }]) {
+      expect(buildQaPackageIdentity({ ...deployment, ...change }).executionProfileSha256)
+        .not.toBe(baseline.executionProfileSha256);
+    }
   });
 
   it('keeps interaction timing and custom command changes in the execution profile', () => {
@@ -1054,6 +1207,66 @@ describe('PSADT QA package identity', () => {
     ]);
   });
 
+  it('keeps UniClipboard out of LocalSystem when WinGet omits its scope', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'UniClipboard.UniClipboard',
+      displayName: 'UniClipboard',
+      publisher: 'UniClipboard',
+      version: '1.5.0',
+      architecture: 'x64',
+      installerSha256: 'd'.repeat(64),
+      installerType: 'nullsoft',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL:UniClipboard',
+      installScope: 'machine',
+      detectionRules: '[]',
+      psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    const profile = normalized.identity.profile as {
+      installer: { installScope: string };
+    };
+
+    expect(profile.installer.installScope).toBe('user');
+    expect(normalized.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\UniClipboard_UniClipboard',
+      }),
+    ]);
+  });
+
+  it('keeps Orca out of LocalSystem when WinGet omits its scope', () => {
+    const normalized = normalizeQaWorkflowPackageInput({
+      wingetId: 'StablyAI.Orca',
+      displayName: 'Orca',
+      publisher: 'StablyAI',
+      version: '1.4.242',
+      architecture: 'x64',
+      installerSha256: '9D3E8639CAACB61C3AF2510A39069016E1A744D7425A146186A050E5978224EF',
+      installerType: 'nullsoft',
+      silentSwitches: '/S',
+      uninstallCommand: 'REGISTRY_UNINSTALL_PRODUCT:{2B325EC9-0ED1-575F-AD70-E08307AEE879}:Orca',
+      installScope: 'machine',
+      detectionRules: '[]',
+      psadtConfig: JSON.stringify({ detectionRules: [] }),
+    });
+    const profile = normalized.identity.profile as {
+      installer: { installScope: string; silentArgs: string; uninstallCommand: string };
+    };
+
+    expect(profile.installer.installScope).toBe('user');
+    expect(profile.installer.silentArgs).toBe('/S');
+    expect(profile.installer.uninstallCommand).toBe(
+      'REGISTRY_UNINSTALL_PRODUCT:{2B325EC9-0ED1-575F-AD70-E08307AEE879}:Orca'
+    );
+    expect(normalized.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\StablyAI_Orca',
+      }),
+    ]);
+  });
+
   it('keeps Android Apps Manager out of LocalSystem when WinGet omits its scope', () => {
     const normalized = normalizeQaWorkflowPackageInput({
       wingetId: 'SIMSDEV.AndroidAppsManager',
@@ -1748,6 +1961,27 @@ describe('PSADT QA package identity', () => {
     expect(normalized.identity.profile.installer).toMatchObject({
       installScope: 'user', silentArgs: '/S', uninstallCommand, sha256: installerSha256,
     });
+  });
+
+  it('normalizes T3 Code to one user profile while preserving installer and removal identity', () => {
+    const installerSha256 = '8CFF5C90FDC976C0BDEF86074A8CDE9C3784AF8DE2091759514CD9F8F1457405';
+    const uninstallCommand = 'REGISTRY_UNINSTALL_PRODUCT:{E9197887-EFB3-55E0-985E-D6D3B5DD594A}:T3 Code';
+    const input = {
+      wingetId: 'T3Tools.T3Code', displayName: 'T3 Code', publisher: 'T3Tools',
+      version: '0.1.6', architecture: 'x64', installerSha256,
+      installerType: 'nullsoft', silentSwitches: '/S', uninstallCommand,
+      detectionRules: '[]', psadtConfig: JSON.stringify({ detectionRules: [] }),
+    };
+    const machine = normalizeQaWorkflowPackageInput({ ...input, installScope: 'machine' });
+    const user = normalizeQaWorkflowPackageInput({ ...input, installScope: 'user' });
+    expect(machine.identity.profile.installer).toMatchObject({
+      installScope: 'user', sourceType: 'nullsoft', silentArgs: '/S',
+      uninstallCommand, sha256: installerSha256,
+    });
+    expect(machine.identity.executionProfileSha256).toBe(user.identity.executionProfileSha256);
+    expect(normalizeQaWorkflowPackageInput({
+      ...input, wingetId: 'T3Tools.Other', installScope: 'machine',
+    }).identity.profile.installer.installScope).toBe('machine');
   });
 
   it('uses Negative Encoder user context while preserving the machine-labelled installer bytes and removal identity', () => {

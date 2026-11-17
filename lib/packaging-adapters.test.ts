@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PSADT_CONFIG } from '@/types/psadt';
+import { generateUninstallCommand } from '@/lib/detection-rules';
 import {
   applyApplicationPackagingAdapter,
   resolveApplicationInstallScope,
@@ -8,6 +9,24 @@ import {
   resolveApplicationInstallerSelectionType,
   resolveApplicationUninstallCommand,
 } from './packaging-adapters';
+
+describe('LegendCTL registry capture identity', () => {
+  it('binds only the LegendCTL catalog marker to the vendor registration', () => {
+    const generated = generateUninstallCommand({
+      architecture: 'x64', type: 'inno', url: 'https://example.com/setup.exe',
+      sha256: 'a'.repeat(64), productCode: '{ZDUltimateLegend}_is1',
+    }, 'LegendCTL');
+    // Keep the existing pinned marker grammar; capture persists the exact key.
+    expect(generated).toBe('REGISTRY_UNINSTALL:LegendCTL');
+    expect(resolveApplicationUninstallCommand('EvilHumphrey.LegendCTL', generated))
+      .toBe('REGISTRY_UNINSTALL:ZD Ultimate Legend Wrapper');
+    for (const command of ['custom.exe /remove', 'REGISTRY_UNINSTALL:Other',
+      'REGISTRY_UNINSTALL_KEY:Other:LegendCTL']) {
+      expect(resolveApplicationUninstallCommand('EvilHumphrey.LegendCTL', command)).toBe(command);
+    }
+    expect(resolveApplicationUninstallCommand('Example.App', generated)).toBe(generated);
+  });
+});
 
 describe('OneKey exact registry identity', () => {
   const expected = 'REGISTRY_UNINSTALL_KEY:c63242f1-2b62-5725-b853-31b79889ccf8:OneKey';
@@ -36,6 +55,47 @@ describe('OneKey exact registry identity', () => {
 });
 
 describe('application packaging adapters', () => {
+  it.each(['FunRoutine.WorkFlowy', 'GarboMuffin.TurboWarp'])(
+    'keeps %s per-user registration out of the SYSTEM profile',
+    (wingetId) => {
+      const uninstall = 'REGISTRY_UNINSTALL:Vendor Application';
+      for (const id of [wingetId, ` ${wingetId.toLowerCase()} `]) {
+        for (const scope of [undefined, 'machine', 'user'] as const) {
+          expect(resolveApplicationInstallScope(id, scope)).toBe('user');
+        }
+        expect(resolveApplicationInstallerSelectionScope(id, 'machine')).toBe('machine');
+        expect(resolveApplicationInstallerSelectionScope(id, 'user')).toBe('user');
+        expect(resolveApplicationUninstallCommand(id, uninstall)).toBe(uninstall);
+        const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+        expect(adapted.reviewedInstallArguments).toEqual([]);
+        expect(adapted.reviewedUninstallArguments).toEqual([]);
+        expect(adapted.reviewedExactUninstall).toBeUndefined();
+        expect(adapted.reviewedRecoverCapturedUninstallByExactIdentity).toBeUndefined();
+        expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+      }
+      expect(resolveApplicationInstallScope(`${wingetId}.Other`, 'machine')).toBe('machine');
+    }
+  );
+
+  it('uses the profile-preserving Opera launcher only for the Opera Air identity', () => {
+    for (const id of ['Opera.OperaAir', ' opera.operaair ']) {
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedExactUninstall).toEqual({
+        executablePath: '%ProgramFiles%\\Opera Air\\opera.exe',
+        arguments: ['--uninstall', '--runimmediately', '--deleteuserprofile=0'],
+        completionTimeoutMinutes: 5,
+      });
+      expect(adapted.processesToClose).toContainEqual({ name: 'opera', description: 'Opera Air browser' });
+      expect(adapted.reviewedManagedInstallDirectory).toBeUndefined();
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+    for (const id of ['Opera.OperaAir.Beta', 'Other.OperaAir']) {
+      expect(applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG).reviewedExactUninstall).toBeUndefined();
+    }
+    expect(applyApplicationPackagingAdapter('Opera.OperaGX', DEFAULT_PSADT_CONFIG).reviewedExactUninstall?.executablePath)
+      .toBe('%ProgramFiles%\\Opera GX\\opera.exe');
+  });
+
   it('binds ZDisk to its observed exact NSIS key without changing custom identities', () => {
     const exact = 'REGISTRY_UNINSTALL_KEY:ZDiskCleanerPro:ZDiskCleanerPro';
     expect(resolveApplicationUninstallCommand(' YushengBeep.ZDiskCleanerPro ', 'REGISTRY_UNINSTALL:ZDiskCleaner Pro')).toBe(exact);
@@ -215,6 +275,19 @@ describe('application packaging adapters', () => {
     ).toBeUndefined();
   });
 
+  it('binds UDS Enterprise Client only to its exact UDS Client registration', () => {
+    const config = applyApplicationPackagingAdapter('VirtualCable.UDSClient', {
+      ...DEFAULT_PSADT_CONFIG,
+      reviewedRegistryUninstallDisplayName: 'customer override',
+    });
+    expect(config.reviewedRegistryUninstallDisplayName).toBe('UDS Client');
+    expect(config.detectionRules).toEqual(DEFAULT_PSADT_CONFIG.detectionRules);
+    expect(
+      applyApplicationPackagingAdapter('VirtualCable.Other', config)
+        .reviewedRegistryUninstallDisplayName
+    ).toBeUndefined();
+  });
+
   it('binds Jamovi Desktop to its actual lowercase jamovi ARP identity', () => {
     expect(
       applyApplicationPackagingAdapter('Jamovi.Desktop.Current', {
@@ -297,6 +370,42 @@ describe('application packaging adapters', () => {
       'js8call-improved.js8call-improved',
       'vendor-uninstall.exe --custom'
     )).toBe('vendor-uninstall.exe --custom');
+  });
+
+  it('binds Breitbandmessung only to its reviewed unbraced NSIS key', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{14607473-30DB-509F-94F0-BB7C085C619E}:Breitbandmessung';
+    const expected = 'REGISTRY_UNINSTALL_KEY:14607473-30db-509f-94f0-bb7c085c619e:Breitbandmessung';
+    expect(resolveApplicationUninstallCommand(' zafaco.Breitbandmessung ', original)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('zafaco.Breitbandmessung', 'REGISTRY_UNINSTALL:Breitbandmessung')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('zafaco.Breitbandmessung', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('zafaco.Breitbandmessung.Other', original)).toBe(original);
+    for (const command of [original.replace('14607473', '00000000'), 'vendor.exe --custom']) {
+      expect(resolveApplicationUninstallCommand('zafaco.Breitbandmessung', command)).toBe(command);
+    }
+  });
+
+  it('binds Niko Home Control only to its reviewed unbraced NSIS key', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{E0658CE6-6ECB-5EC8-AE2F-5A81C75FBCD6}:Niko Home Control programming software';
+    const expected = 'REGISTRY_UNINSTALL_KEY:e0658ce6-6ecb-5ec8-ae2f-5a81c75fbcd6:Niko Home Control programming software';
+    expect(resolveApplicationUninstallCommand(' Niko.HomeControlProgrammingSoftware ', original)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Niko.HomeControlProgrammingSoftware', 'REGISTRY_UNINSTALL:Niko Home Control programming software')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Niko.HomeControlProgrammingSoftware', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Niko.HomeControlProgrammingSoftware.Other', original)).toBe(original);
+    for (const command of [original.replace('E0658CE6', '00000000'), 'vendor.exe --custom']) {
+      expect(resolveApplicationUninstallCommand('Niko.HomeControlProgrammingSoftware', command)).toBe(command);
+    }
+  });
+
+  it('binds Tuta only to its reviewed unbraced NSIS key', () => {
+    const original = 'REGISTRY_UNINSTALL_PRODUCT:{450699D2-1C81-5EE5-AEC6-08DDDB7AF9D7}:Tuta Mail';
+    const expected = 'REGISTRY_UNINSTALL_KEY:450699d2-1c81-5ee5-aec6-08dddb7af9d7:Tuta Mail';
+    expect(resolveApplicationUninstallCommand(' Tutanota.Tutanota ', original)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Tutanota.Tutanota', 'REGISTRY_UNINSTALL:Tuta Mail')).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Tutanota.Tutanota', expected)).toBe(expected);
+    expect(resolveApplicationUninstallCommand('Tutanota.Other', original)).toBe(original);
+    for (const command of [original.replace('450699D2', '450699D3'), 'vendor.exe --custom']) {
+      expect(resolveApplicationUninstallCommand('Tutanota.Tutanota', command)).toBe(command);
+    }
   });
 
   it('binds Philips SmartControl only to its reviewed exact NSIS identity', () => {
@@ -628,6 +737,43 @@ describe('application packaging adapters', () => {
     expect(resolveApplicationInstallScope('Example.App', 'machine')).toBe('machine');
   });
 
+  it('keeps Threat Dragon one-click NSIS out of the SYSTEM profile', () => {
+    const uninstall = 'REGISTRY_UNINSTALL_PRODUCT:{970B2D4F-CDCC-5118-BC8B-330D878CA743}:Threat-Dragon-ng';
+    for (const id of ['OWASP.ThreatDragon', ' owasp.threatdragon ']) {
+      expect(resolveApplicationInstallScope(id, 'machine')).toBe('user');
+      expect(resolveApplicationInstallScope(id, undefined)).toBe('user');
+      expect(resolveApplicationInstallerSelectionScope(id, 'user')).toBe('user');
+      expect(resolveApplicationUninstallCommand(id, uninstall)).toBe(uninstall);
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedInstallArguments).toEqual([]);
+      expect(adapted.reviewedUninstallArguments).toEqual([]);
+      expect(adapted.reviewedExactUninstall).toBeUndefined();
+      expect(adapted.reviewedRecoverCapturedUninstallByExactIdentity).toBeUndefined();
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+    expect(resolveApplicationInstallScope('OWASP.Other', 'machine')).toBe('machine');
+  });
+
+  it('keeps T3 Code one-click NSIS in the user context without changing removal behavior', () => {
+    const uninstall = 'REGISTRY_UNINSTALL_PRODUCT:{E9197887-EFB3-55E0-985E-D6D3B5DD594A}:T3 Code';
+    for (const id of ['T3Tools.T3Code', ' t3tools.t3code ']) {
+      for (const scope of [undefined, 'machine', 'user'] as const) {
+        expect(resolveApplicationInstallScope(id, scope)).toBe('user');
+      }
+      expect(resolveApplicationInstallerSelectionScope(id, 'user')).toBe('user');
+      expect(resolveApplicationUninstallCommand(id, uninstall)).toBe(uninstall);
+      const adapted = applyApplicationPackagingAdapter(id, DEFAULT_PSADT_CONFIG);
+      expect(adapted.reviewedInstallArguments).toEqual([]);
+      expect(adapted.reviewedUninstallArguments).toEqual([]);
+      expect(adapted.reviewedExactUninstall).toBeUndefined();
+      expect(adapted.reviewedRecoverCapturedUninstallByExactIdentity).toBeUndefined();
+      expect(applyApplicationPackagingAdapter(id, adapted)).toEqual(adapted);
+    }
+    for (const id of ['T3Tools.Other', 'T3Tools.T3CodeX', 'Example.App']) {
+      expect(resolveApplicationInstallScope(id, 'machine')).toBe('machine');
+    }
+  });
+
   it('keeps Equibop assisted NSIS in the signed-in user context', () => {
     for (const id of ['Equicord.Equibop', ' equicord.equibop ']) {
       expect(resolveApplicationInstallScope(id, undefined)).toBe('user');
@@ -803,6 +949,16 @@ describe('application packaging adapters', () => {
       'machine'
     )).toBe('user');
     expect(resolveApplicationInstallScope('Example.App', 'user')).toBe('user');
+  });
+
+  it('runs GameMaker elevated while selecting the published user-scope installer', () => {
+    expect(resolveApplicationInstallScope('YoYoGames.GameMaker.Studio.2', 'user')).toBe('machine');
+    expect(resolveApplicationInstallerSelectionScope(
+      'YoYoGames.GameMaker.Studio.2',
+      'machine'
+    )).toBe('user');
+    expect(resolveApplicationInstallScope('Example.App', 'user')).toBe('user');
+    expect(resolveApplicationInstallerSelectionScope('Example.App', 'machine')).toBe('machine');
   });
 
   it('runs NVM for Windows elevated from a deterministic machine directory', () => {
@@ -2223,5 +2379,36 @@ describe('application packaging adapters', () => {
       name: 'notepad++.exe',
       description: 'Notepad++',
     });
+  });
+});
+
+
+describe('UniClipboard vendor user scope', () => {
+  it.each(['UniClipboard.UniClipboard', ' UNICLIPBOARD.UNICLIPBOARD '])(
+    'keeps %s in user scope without changing the installer identity', wingetId => {
+      const scope = resolveApplicationInstallScope(wingetId, 'machine');
+      expect(scope).toBe('user');
+      expect(resolveApplicationInstallerSelectionScope(wingetId, scope)).toBe('user');
+      expect(resolveApplicationUninstallCommand(wingetId, 'custom.exe /remove')).toBe('custom.exe /remove');
+    }
+  );
+  it('preserves other application scope', () => {
+    expect(resolveApplicationInstallScope('UniClipboard.Other', 'machine')).toBe('machine');
+  });
+});
+
+describe('Orca vendor user scope', () => {
+  it.each(['StablyAI.Orca', ' STABLYAI.ORCA '])(
+    'keeps %s in user scope without changing the installer identity', wingetId => {
+      const scope = resolveApplicationInstallScope(wingetId, 'machine');
+      expect(scope).toBe('user');
+      expect(resolveApplicationInstallerSelectionScope(wingetId, scope)).toBe('user');
+      expect(resolveApplicationInstallScope(wingetId, undefined)).toBe('user');
+      expect(applyApplicationPackagingAdapter(wingetId, { ...DEFAULT_PSADT_CONFIG }).reviewedInstallArguments || []).toEqual([]);
+      expect(resolveApplicationUninstallCommand(wingetId, 'custom.exe /remove')).toBe('custom.exe /remove');
+    }
+  );
+  it('preserves other application scope', () => {
+    expect(resolveApplicationInstallScope('StablyAI.Other', 'machine')).toBe('machine');
   });
 });

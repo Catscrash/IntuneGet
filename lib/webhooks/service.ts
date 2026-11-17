@@ -10,7 +10,6 @@ import type {
   WebhookTestPayload,
   WebhookType,
 } from '@/types/notifications';
-import { postWebhook, WebhookTargetError } from './egress';
 import {
   formatSlackMessage,
   formatTeamsMessage,
@@ -20,6 +19,12 @@ import {
   formatTeamsTestMessage,
   formatDiscordTestMessage,
 } from './formatters';
+import {
+  describeWebhookFailure,
+  parseWebhookUrl,
+  postWebhook,
+  WebhookDestinationError,
+} from './destination';
 
 // Circuit breaker thresholds
 const MAX_FAILURES = 5;
@@ -164,28 +169,28 @@ export async function deliverWebhook(
     }
 
     try {
+      // The destination is resolved, checked and pinned on every attempt.
       const response = await postWebhook(webhook.url, {
         headers,
         body: payloadString,
-        timeoutMs: opts.timeout,
+        timeoutMs: opts.timeout ?? 10000,
       });
 
       lastStatusCode = response.status;
 
-      if (response.ok) {
+      if (response.status >= 200 && response.status < 300) {
         return {
           success: true,
           statusCode: response.status,
         };
       }
 
-      // Non-retryable errors. Redirects land here too: they are never
-      // followed, so a webhook that answers with one cannot be delivered.
-      if (response.status < 500 && response.status !== 429) {
+      // Non-retryable errors
+      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
         return {
           success: false,
           statusCode: response.status,
-          error: `HTTP ${response.status}: ${response.body.slice(0, 200) || 'Unknown error'}`,
+          error: `HTTP ${response.status}: ${response.bodyExcerpt.slice(0, 200)}`,
           retryable: false,
         };
       }
@@ -193,19 +198,17 @@ export async function deliverWebhook(
       // Retryable error (5xx or 429)
       lastError = `HTTP ${response.status}`;
     } catch (error) {
-      // A destination that is not allowed stays disallowed on retry
-      if (error instanceof WebhookTargetError) {
+      const failure = describeWebhookFailure(error);
+      if (!failure.retryable) {
+        // Refused destinations and redirects fail the same way every time.
         return {
           success: false,
-          error: error.message,
+          statusCode: failure.statusCode,
+          error: failure.message,
           retryable: false,
         };
       }
-      if (error instanceof Error) {
-        lastError = error.message;
-      } else {
-        lastError = 'Unknown error';
-      }
+      lastError = failure.message;
     }
   }
 
@@ -243,28 +246,44 @@ export async function sendTestWebhook(
       timeoutMs: 10000,
     });
 
-    if (response.ok) {
+    if (response.status >= 200 && response.status < 300) {
       return {
         success: true,
         statusCode: response.status,
       };
     }
 
+    // The result goes back to the caller of the test endpoint, so it carries
+    // the status code only and never text returned by the destination.
     return {
       success: false,
       statusCode: response.status,
-      error: `HTTP ${response.status}: ${response.body.slice(0, 200) || 'Unknown error'}`,
+      error: `HTTP ${response.status}`,
     };
   } catch (error) {
-    if (error instanceof Error) {
-      return {
-        success: false,
-        error: error.message,
-      };
-    }
+    const failure = describeWebhookFailure(error);
     return {
       success: false,
-      error: 'Unknown error',
+      statusCode: failure.statusCode,
+      error: failure.message,
+    };
+  }
+}
+
+/**
+ * Validate the webhook URL string (HTTPS, no embedded credentials).
+ * This does not resolve the host. Routes that store a URL must also call
+ * validateWebhookDestination from ./destination, which requires a public
+ * destination.
+ */
+export function validateWebhookUrl(url: string): { valid: boolean; error?: string } {
+  try {
+    parseWebhookUrl(url);
+    return { valid: true };
+  } catch (error) {
+    return {
+      valid: false,
+      error: error instanceof WebhookDestinationError ? error.message : 'Invalid URL format',
     };
   }
 }

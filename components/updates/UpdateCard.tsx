@@ -22,7 +22,7 @@ import { Button } from '@/components/ui/button';
 import { AppIcon } from '@/components/AppIcon';
 import { UpdatePolicySelector } from './UpdatePolicySelector';
 import { cn } from '@/lib/utils';
-import { autoUpdateScopeReason, classifyUpdateType } from '@/types/update-policies';
+import { autoUpdateScopeReason, classifyUpdateType, isAutoUpdatePaused } from '@/types/update-policies';
 import { fadeUp, springPresets } from '@/lib/animations/variants';
 import type { AvailableUpdate, UpdatePolicyType } from '@/types/update-policies';
 
@@ -95,8 +95,9 @@ export function UpdateCard({
   };
 
   const policyStatus = update.policy;
+  const isPaused = isAutoUpdatePaused(policyStatus);
   const isAutoUpdateEnabled =
-    policyStatus?.policy_type === 'auto_update' && policyStatus?.is_enabled;
+    policyStatus?.policy_type === 'auto_update' && policyStatus?.is_enabled && !isPaused;
   const scopeReason = isAutoUpdateEnabled ? autoUpdateScopeReason(policyStatus?.auto_update_scope, update.current_version, update.latest_version) : null;
   const hasFailures = (policyStatus?.consecutive_failures || 0) > 0;
   const updateType = classifyUpdateType(update.current_version, update.latest_version);
@@ -182,11 +183,12 @@ export function UpdateCard({
             <span
               className={cn(
                 'flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-lg border flex-shrink-0',
-                policyColors[policyStatus.policy_type] || 'text-text-muted bg-overlay/5 border-overlay/10'
+                isPaused ? 'text-status-warning bg-status-warning/10 border-status-warning/20' :
+                  policyColors[policyStatus.policy_type] || 'text-text-muted bg-overlay/5 border-overlay/10'
               )}
             >
               <PolicyIcon className="w-3 h-3" />
-              {policyLabels[policyStatus.policy_type]}
+              {isPaused ? <T>Paused</T> : policyLabels[policyStatus.policy_type]}
             </span>
           )}
         </div>
@@ -256,15 +258,25 @@ export function UpdateCard({
           )}
         </div>
 
+        {isPaused && (
+          <p className="mb-3 text-xs text-status-warning" role="status">
+            <T>Automatic updates are paused.</T>{' '}
+            {policyStatus?.last_error || <T>No recent failure detail is available.</T>}
+          </p>
+        )}
+
         {/* Action row */}
         <div className="flex items-center justify-between pt-3 border-t border-black/[0.06]">
           <UpdatePolicySelector
             currentPolicy={policyStatus?.policy_type || null}
             currentScope={policyStatus?.auto_update_scope}
+            paused={isPaused}
+            disabled={isUpdating}
             onPolicyChange={handlePolicyChange}
             size="sm"
             showLabel={false}
           />
+
 
           <Button
             size="sm"

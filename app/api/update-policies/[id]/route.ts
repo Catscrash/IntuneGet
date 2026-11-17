@@ -9,6 +9,8 @@ import { isAutoUpdateScope } from '@/types/update-policies';
 import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
+import { createServerClient, isSupabaseServerConfigured } from '@/lib/supabase';
+import { resolveTargetTenantId } from '@/lib/msp/tenant-resolution';
 import type { AppUpdatePolicy, UpdatePolicyType } from '@/types/update-policies';
 import type { DatabaseAdapter } from '@/lib/db/types';
 
@@ -87,6 +89,28 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json(
         { error: 'Policy not found' },
         { status: 404 }
+      );
+    }
+
+    // Owning the row is not enough: the policy acts on a tenant, and the
+    // caller's access to that tenant may have ended since it was created.
+    // Without Supabase there is no MSP membership to check, and the
+    // installation only serves the caller's own tenant.
+    if (isSupabaseServerConfigured()) {
+      const tenantResolution = await resolveTargetTenantId({
+        supabase: createServerClient(),
+        userId: user.userId,
+        tokenTenantId: user.tenantId,
+        requestedTenantId: existingPolicy.tenant_id,
+        requiredPermission: 'manage_policies',
+      });
+      if (tenantResolution.errorResponse) {
+        return tenantResolution.errorResponse;
+      }
+    } else if (existingPolicy.tenant_id !== user.tenantId) {
+      return NextResponse.json(
+        { error: 'This installation cannot manage another tenant' },
+        { status: 403 }
       );
     }
 

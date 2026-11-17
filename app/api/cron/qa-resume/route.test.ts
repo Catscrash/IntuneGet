@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { NextRequest } from 'next/server';
+const securityHoldsMock = vi.hoisted(() => vi.fn().mockResolvedValue(new Map()));
+vi.mock('@/lib/qa/installer-security-holds', async importOriginal => ({ ...(await importOriginal<typeof import('@/lib/qa/installer-security-holds')>()), loadInstallerSecurityHolds: securityHoldsMock }));
 vi.mock('@/lib/customer-upstream-recovery', () => ({ holdCustomerUpstreamJob: vi.fn(async () => false), reopenCustomerUpstreamJobs: vi.fn(async () => 0) }));
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -38,10 +42,10 @@ vi.mock('@/lib/curated-catalog/server', async (importOriginal) => ({
 
 vi.mock('@/lib/intune-approval-guard', () => ({ findPendingApprovalBlocks: findPendingApprovalBlocksMock }));
 vi.mock('@/lib/db', () => ({ getDatabase: () => ({}) }));
-vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock }));
+vi.mock('@/lib/supabase', () => ({ createServerClient: createServerClientMock, isSupabaseServerConfigured: () => true }));
 vi.mock('@/lib/features', () => ({ getFeatureFlags: getFeatureFlagsMock }));
 vi.mock('@/lib/config', () => ({ getAppConfig: () => ({ app: { url: 'https://example.test' } }) }));
-vi.mock('@/lib/github-actions', () => ({ triggerPackagingWorkflow: triggerPackagingWorkflowMock }));
+vi.mock('@/lib/github-actions', () => ({ triggerPackagingWorkflow: triggerPackagingWorkflowMock, isGitHubActionsConfigured: () => true }));
 vi.mock('@/lib/auto-update/cleanup', () => ({
   handleAutoUpdateJobCompletion: handleAutoUpdateJobCompletionMock,
 }));
@@ -61,8 +65,26 @@ vi.mock('@/lib/catalog-installer-reconciliation', () => ({
   reconcileCatalogInstaller: reconcileCatalogInstallerMock,
 }));
 
+const manualMocks = vi.hoisted(() => ({ installer: vi.fn(), trigger: vi.fn() }));
+vi.mock('@/lib/auth-utils', () => ({ parseAccessToken: async () => ({ userId: 'user-test', tenantId: 'tenant-test' }) }));
+vi.mock('@/lib/msp/tenant-resolution', () => ({ resolveTargetTenantId: async () => ({ tenantId: 'tenant-test', errorResponse: null }) }));
+vi.mock('@/lib/auto-update/trigger', () => ({
+  AutoUpdateTrigger: class {
+    triggerAutoUpdate = manualMocks.trigger;
+    // A single deployment track forwards to triggerAutoUpdate and reports its job.
+    triggerTrackedAutoUpdate = async (policy: { deployment_config: unknown }, info: { currentIntuneAppId?: string }, options: unknown) => {
+      const result = await manualMocks.trigger(policy, info, options);
+      return { ...result, jobs: result?.success && result.packagingJobId ? [{ track: 'primary', packagingJobId: result.packagingJobId,
+        historyId: result.historyId, packageProfileSha256: result.packageProfileSha256,
+        deploymentConfig: policy.deployment_config, sourceIntuneAppId: info.currentIntuneAppId }] : [] };
+    };
+  },
+  getLatestInstallerInfo: manualMocks.installer,
+}));
+import { POST } from '@/app/api/updates/trigger/route';
 import { GET } from './route';
 import { InstallerPreflightError } from '@/lib/installer-preflight';
+import { WorkflowDispatchRateLimitError, WorkflowDispatchUnconfirmedError } from '@/lib/workflow-dispatch-rate-limit';
 import { holdCustomerUpstreamJob } from '@/lib/customer-upstream-recovery';
 import { CURATED_APPS } from '@/lib/curated-catalog/definitions';
 import { CuratedLicenceError } from '@/lib/curated-catalog/licence';
@@ -121,10 +143,12 @@ function jobStore(initial: Record<string, unknown>) {
     builder.update = vi.fn((value) => { patch = value; return builder; });
     builder.eq = vi.fn((column, value) => { filters.push([column, value]); return builder; });
     builder.is = vi.fn((column, value) => { filters.push([column, value]); return builder; });
+    builder.in = vi.fn((column, values) => { filters.push([column, { values }]); return builder; });
     builder.maybeSingle = vi.fn(async () => {
       const matches = filters.every(([column, value]) => {
         const [field, key] = column.split('->>');
         const actual = key ? (row[field] as Record<string, unknown> | null)?.[key] : row[field];
+        if (value && typeof value === 'object' && 'values' in value) return (value.values as unknown[]).includes(actual);
         return (actual ?? null) === value;
       });
       if (!matches) return { data: null, error: null };
@@ -196,7 +220,10 @@ describe('GET /api/cron/qa-resume', () => {
     expect(JSON.stringify(store.row)).not.toContain('private.invalid');
     expect(JSON.stringify(body)).not.toContain('tenant-private');
     if (kind === 'removed') {
-      expect(store.row.status).toBe('qa_failed');
+      expect(store.row.status).toBe('failed');
+      expect(store.row.error_code).toBe('MANIFEST_UNAVAILABLE');
+      expect(store.row.error_category).toBe('validation');
+      expect(store.row.qa_completed_at).toBeUndefined();
       expect(store.row.error_message).toBe('The selected package could not be validated. Review your selection before trying again.');
       expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledOnce();
     } else {
@@ -303,7 +330,13 @@ describe('GET /api/cron/qa-resume', () => {
       const response = await GET(new Request('https://example.test/api/cron/qa-resume', { headers: { authorization: 'Bearer secret' } }));
       const terminal = kind !== 'one flag' && kind !== 'curated pending' && kind !== 'curated withdrawn' && !kind.includes('changed identity');
       expect(await response.json()).toMatchObject({ resumed: 0, failed: terminal ? 1 : 0 });
-      expect(store.row.status).toBe(terminal ? 'qa_failed' : 'awaiting_qa');
+      expect(store.row.status).toBe(terminal ? (kind === 'two flags' ? 'failed' : 'qa_failed') : 'awaiting_qa');
+      if (kind === 'two flags') {
+        expect(store.row.error_code).toBe('QA_SECURITY_FLAGGED_CURRENT_VERSION');
+        expect(store.row.error_stage).toBe('validation');
+        expect(store.row.completed_at).toEqual(expect.any(String));
+        expect(store.row).not.toHaveProperty('qa_completed_at');
+      }
       if (kind === 'one flag') expect(store.row.status_message).toBe('VirusTotal: 1 engine flagged, rechecking daily');
       else if (kind === 'two flags') expect(store.row.status_message).toBe('VirusTotal refused execution for this installer hash.');
       else if (kind === 'curated pending' || kind === 'curated withdrawn') expect(store.row.status_message).toBe('Curated release verification is pending. Packaging remains on hold.');
@@ -622,6 +655,8 @@ describe('GET /api/cron/qa-resume', () => {
     });
     const job = {
       id: 'job-deferred-customer',
+      infrastructure_retry_count: 1,
+      infrastructure_retry_run_id: '42',
       tenant_id: 'tenant-1',
       qa_candidate_id: 'candidate-queued',
       created_at: '2026-09-01T12:00:00Z',
@@ -689,6 +724,12 @@ describe('GET /api/cron/qa-resume', () => {
       qa_completed_at: null,
     }));
     expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(1);
+    for (const update of [claimUpdate.update, provenanceUpdate.update]) {
+      for (const [patch] of update.mock.calls) {
+        expect(patch).not.toHaveProperty('infrastructure_retry_count');
+        expect(patch).not.toHaveProperty('infrastructure_retry_run_id');
+      }
+    }
   });
 
   it('resumes existing customer uploads without querying or creating QA in maintenance', async () => {
@@ -766,7 +807,7 @@ describe('GET /api/cron/qa-resume', () => {
       status_message: 'Preparing deployment',
       qa_completed_at: null,
     }));
-    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(expect.objectContaining({ qaOverride: true }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(expect.objectContaining({ qaOverride: true }), undefined, undefined);
     expect(ensureQaDemandMock).not.toHaveBeenCalled();
     expect(client.from).not.toHaveBeenCalledWith('qa_candidates');
   });
@@ -862,7 +903,7 @@ describe('GET /api/cron/qa-resume', () => {
     );
   });
 
-  it.each([true, false])('rebuilds a superseded exact QA profile when relink matches=%s', async (matches) => {
+  it.each([true, false])('rebuilds a catalog-version-superseded exact QA profile when relink matches=%s', async (matches) => {
     const job = {
       tenant_id: 'tenant-1', id: 'job-superseded',
       qa_candidate_id: 'candidate-old',
@@ -905,7 +946,7 @@ describe('GET /api/cron/qa-resume', () => {
             data: {
               id: 'candidate-old',
               status: 'superseded',
-              failure_summary: null,
+              failure_summary: 'Superseded before dispatch: catalog-version-changed.',
               package_profile_sha256: 'A'.repeat(64),
             },
             error: null,
@@ -1230,8 +1271,9 @@ describe('GET /api/cron/qa-resume', () => {
         installer_type: 'exe', install_command: 'installer.exe /silent',
         installer_url: 'https://example.test/installer.exe',
         qa_candidate_id: 'passed-candidate', execution_profile_sha256: 'B'.repeat(64),
-        installer_sha256: 'A'.repeat(64), architecture: 'x64', github_run_id: null,
+        installer_sha256: 'A'.repeat(64), architecture: 'x64', github_run_id: null, callback_run_id: null,
         qa_completed_at: '2026-10-01T00:00:00Z', packaging_started_at: null,
+        error_details: null,
         package_config: { installerSha256: 'A'.repeat(64), architecture: 'x64' },
       });
       let reading = true;
@@ -1254,6 +1296,335 @@ describe('GET /api/cron/qa-resume', () => {
       };
       return { store, run };
     }
+
+    it.each([false, true])('matches the real manual handler input on pinned resume, payload changed: %s', async changed => {
+      const { store, run } = setup();
+      vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'https://fixture.invalid');
+      vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'synthetic-fixture-key');
+      const policy = { id: 'policy-test', user_id: 'user-test', tenant_id: 'tenant-test',
+        winget_id: 'Example.App', policy_type: 'auto_update', is_enabled: true,
+        deployment_config: { architecture: 'x64', installCommand: 'old.exe /old',
+          assignedGroups: ['group-test'], assignmentMigration: { carryOverAssignments: false } },
+      };
+      Object.assign(store.row, { user_id: 'user-test', auto_update_policy_id: policy.id,
+        is_auto_update: true, status: 'queued', error_details: null,
+        package_config: { architecture: 'x64', installerSuccessCodes: [0, 3010],
+          forceCreate: true, sourceIntuneAppId: null, autoSupersede: false,
+          assignmentMigration: { carryOverAssignments: true },
+          assignments: [{ target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId: 'group-test' }, intent: 'required' }],
+        },
+      });
+      let phase = 'manual';
+      const resumeClient = createServerClientMock.getMockImplementation()!();
+      createServerClientMock.mockReturnValue({ from: (table: string) => {
+        if (phase !== 'manual') return resumeClient.from(table);
+        if (table === 'packaging_jobs') return {
+          select: () => chain({ data: structuredClone(store.row), error: null }),
+          update: (patch: unknown) => (store.updateQuery().update as (v: unknown) => unknown)(patch),
+        };
+        if (table === 'user_settings') return chain({ data: { settings: { carryOverAssignments: true, supersedePreviousApp: true } }, error: null });
+        if (table === 'upload_history') return chain({ data: null, error: null });
+        throw new Error('Unexpected manual table ' + table);
+      } });
+      const client = createServerClientMock.getMockImplementation()!();
+      const originalFrom = client.from;
+      client.from = (table: string) => {
+        if (phase === 'manual' && ['app_update_policies', 'update_check_results'].includes(table)) {
+          const q = { eq: () => q, single: async () => ({ data: table === 'app_update_policies' ? policy : { current_version: '0.9' }, error: null }) };
+          return { select: () => q };
+        }
+        return originalFrom(table);
+      };
+      manualMocks.installer.mockResolvedValue({ ok: true, info: { wingetId: 'Example.App', latestVersion: '1.0', installerType: 'exe' } });
+      manualMocks.trigger.mockImplementation(async (_policy, _info, options) => {
+        expect(options.assignmentMigrationOverride).toEqual({ carryOverAssignments: true, removeAssignmentsFromPreviousApp: false });
+        return { success: true, packagingJobId: store.row.id };
+      });
+      const captured: unknown[] = [];
+      let posted = 0;
+      triggerPackagingWorkflowMock.mockImplementation(async (inputs, _config, options) => {
+        captured.push(inputs);
+        const canonical = (v: unknown): unknown => v && typeof v === 'object'
+          ? Array.isArray(v) ? v.map(canonical) : Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).filter(([, x]) => x !== undefined).map(([k, x]) => [k, canonical(x)])) : v;
+        const identity = createHash('sha256').update(JSON.stringify(canonical(inputs))).digest('hex');
+        if (phase === 'manual') throw new WorkflowDispatchUnconfirmedError(503, Date.now(), identity);
+        await options.beforeDispatch(identity);
+        posted++;
+        return { success: true };
+      });
+      const response = await POST(new NextRequest('https://example.test/api/updates/trigger', {
+        method: 'POST', headers: { authorization: 'Bearer fixture' },
+        body: JSON.stringify({ winget_id: 'Example.App', tenant_id: 'tenant-test' }),
+      }));
+      expect(await response.json()).toMatchObject({ triggered: 1, failed: 0 });
+      expect(store.row.status).toBe('awaiting_qa');
+      if (changed) store.row.install_command = 'installer.exe /different';
+      phase = 'resume';
+      expect(await (await run()).json()).toMatchObject({ resumed: changed ? 0 : 1, failed: changed ? 1 : 0 });
+      expect(captured).toHaveLength(2);
+      if (!changed) expect(captured[1]).toEqual(captured[0]);
+      else expect(store.row.error_code).toBe('WORKFLOW_DISPATCH_IDENTITY_CHANGED');
+      expect(posted).toBe(changed ? 0 : 1);
+    });
+
+    it('holds a fresh unconfirmed dispatch and shares the existing bounded retry budget', async () => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        await options.beforeDispatch('A'.repeat(64));
+        throw new WorkflowDispatchUnconfirmedError(503);
+      });
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        expect(await (await run()).json()).toMatchObject({ held: 1, failed: 0 });
+        expect(store.row).toMatchObject({ status: 'awaiting_qa', error_code: 'WORKFLOW_DISPATCH_UNCONFIRMED',
+          error_details: { workflow_dispatch_rate_limit_attempts: attempt } });
+      }
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 1 });
+      expect(store.row).toMatchObject({ status: 'failed', error_code: 'WORKFLOW_DISPATCH_UNCONFIRMED' });
+    });
+    it.each([0, 5])('never overwrites a late callback owner when an unconfirmed hold budget is %s', async count => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_rate_limit_attempts: count };
+      triggerPackagingWorkflowMock.mockImplementation(async () => {
+        store.row.callback_run_id = '43';
+        throw new WorkflowDispatchUnconfirmedError(null);
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 0 });
+      expect(store.row).toMatchObject({ status: 'packaging', callback_run_id: '43' });
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    });
+    it('does not dispatch an awaiting row already owned by a late original run', async () => {
+      const { store, run } = setup();
+      store.row.callback_run_id = '43';
+      expect(await (await run()).json()).toMatchObject({ resumed: 0, failed: 0 });
+      expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      expect(store.row.status).toBe('awaiting_qa');
+    });
+    it('does not overwrite the original callback owner with a later dispatch capture', async () => {
+      const { store, run } = setup();
+      triggerPackagingWorkflowMock.mockImplementation(async () => {
+        store.row.callback_run_id = '43';
+        store.row.github_run_id = '43';
+        return { success: true, runId: 44 };
+      });
+      expect(await (await run()).json()).toMatchObject({ resumed: 1, failed: 0 });
+      expect(store.row).toMatchObject({ status: 'packaging', callback_run_id: '43', github_run_id: '43' });
+    });
+    it('keeps a pinned retry closed until validation then fails a changed payload without dispatch', async () => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      store.row.is_auto_update = true;
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        expect(store.row.status).toBe('awaiting_qa');
+        await options.beforeDispatch('B'.repeat(64));
+        throw new Error('POST must not be reached');
+      });
+      expect(await (await run()).json()).toMatchObject({ failed: 1, resumed: 0 });
+      expect(store.row).toMatchObject({ status: 'failed', error_code: 'WORKFLOW_DISPATCH_IDENTITY_CHANGED' });
+      expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledOnce();
+    });
+    it.each([null, 'malformed'])('never dispatches an old unconfirmed row without a valid admission pin: %s', async pin => {
+      const { store, run } = setup();
+      store.row.error_code = 'WORKFLOW_DISPATCH_UNCONFIRMED';
+      store.row.error_details = pin === null ? null : { workflow_dispatch_unconfirmed_identity: pin };
+      expect(await (await run()).json()).toMatchObject({ failed: 1, resumed: 0 });
+      expect(store.row).toMatchObject({ status: 'failed', callback_run_id: null });
+      expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    });
+    it('retains the admission pin through a 429 and refuses changed inputs on the next retry', async () => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64), workflow_dispatch_rate_limit_attempts: 1 };
+      triggerPackagingWorkflowMock.mockImplementationOnce(async (_input, _config, options) => {
+        await options.beforeDispatch('A'.repeat(64));
+        throw new WorkflowDispatchRateLimitError(429, new Date(Date.now() + 60_000).toISOString());
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 1, failed: 0 });
+      expect(store.row).toMatchObject({ error_code: 'WORKFLOW_DISPATCH_RATE_LIMITED',
+        error_details: { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64), workflow_dispatch_rate_limit_attempts: 2 } });
+      triggerPackagingWorkflowMock.mockImplementationOnce(async (_input, _config, options) => {
+        expect(store.row.status).toBe('awaiting_qa');
+        await options.beforeDispatch('B'.repeat(64));
+        throw new Error('POST must not be reached');
+      });
+      expect(await (await run()).json()).toMatchObject({ failed: 1, resumed: 0 });
+      expect(store.row.error_code).toBe('WORKFLOW_DISPATCH_IDENTITY_CHANGED');
+    });
+    it.each(['preflight', 'generic'])('handles a pinned %s failure before the deferred claim', async kind => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockRejectedValueOnce(kind === 'preflight'
+        ? new InstallerPreflightError('PREFLIGHT_UNAVAILABLE', 'synthetic unavailable', true) : new Error('synthetic unavailable'));
+      expect(await (await run()).json()).toMatchObject(kind === 'preflight' ? { held: 1, failed: 0 } : { failed: 1 });
+      expect(store.row.status).toBe(kind === 'preflight' ? 'awaiting_qa' : 'failed');
+      expect(store.row.callback_run_id).toBeNull();
+    });
+    it('claims an unchanged pinned payload only at the dispatch boundary', async () => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        expect(store.row.status).toBe('awaiting_qa');
+        await options.beforeDispatch('A'.repeat(64));
+        expect(store.row.status).toBe('packaging');
+        return { success: true };
+      });
+      expect(await (await run()).json()).toMatchObject({ resumed: 1, failed: 0 });
+      expect(store.row.error_details).toEqual({ workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) });
+    });
+    it('does not let a stale worker claim again after another worker schedules a new hold', async () => {
+      const { store, run } = setup();
+      store.row.qa_resume_due_at = '2026-01-01T00:00:00Z';
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      let release!: () => void;
+      let reached!: () => void;
+      const paused = new Promise<void>(resolve => { reached = resolve; });
+      const resume = new Promise<void>(resolve => { release = resolve; });
+      findPendingApprovalBlocksMock.mockImplementationOnce(async () => { reached(); await resume; return []; });
+      let posts = 0;
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        await options.beforeDispatch('A'.repeat(64));
+        posts++;
+        throw new WorkflowDispatchUnconfirmedError(503);
+      });
+      const stale = run();
+      await paused;
+      expect(await (await run()).json()).toMatchObject({ held: 1 });
+      const held = structuredClone(store.row);
+      release();
+      expect(await (await stale).json()).toMatchObject({ held: 0, failed: 0, resumed: 0 });
+      expect(posts).toBe(1);
+      expect(store.row).toEqual(held);
+      expect(store.row.error_details).toMatchObject({ workflow_dispatch_rate_limit_attempts: 1 });
+    });
+    it.each([true, false])('uses admission assignment sanitization only for pinned retries: %s', async pinned => {
+      const { store, run } = setup();
+      const assignments = [{ type: 'allUsers', intent: 'updateOnly' }];
+      store.row.package_config = { ...store.row.package_config as object, assignments,
+        requirementRules: [{ ruleType: 'registry', keyPath: 'HKEY_LOCAL_MACHINE\\Software\\Fixture' }] };
+      if (pinned) store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockImplementation(async (input, _config, options) => {
+        expect(JSON.parse(input.assignments)).toEqual([{ ...assignments[0], intent: pinned ? 'required' : 'updateOnly' }]);
+        if (pinned) await options.beforeDispatch('A'.repeat(64));
+        return { success: true };
+      });
+      expect(await (await run()).json()).toMatchObject({ resumed: 1, failed: 0 });
+    });
+    it.each(['preflight', 'generic', 'identity'])('preserves a newer hold when stale validation ends with %s before claiming', async kind => {
+      const { store, run } = setup();
+      store.row.qa_resume_due_at = '2026-01-01T00:00:00Z';
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      let newer!: Record<string, unknown>;
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        expect(store.row.status).toBe('awaiting_qa');
+        store.row.qa_resume_due_at = new Date(Date.now() + 600_000).toISOString();
+        store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64), workflow_dispatch_rate_limit_attempts: 2 };
+        newer = structuredClone(store.row);
+        if (kind === 'identity') await options.beforeDispatch('B'.repeat(64));
+        if (kind === 'preflight') throw new InstallerPreflightError('PREFLIGHT_UNAVAILABLE', 'synthetic unavailable', true);
+        throw new Error('synthetic validation failure');
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 0, resumed: 0 });
+      expect(store.row).toEqual(newer);
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    });
+    it.each([null, '43'])('stops a lost deferred claim without writing a failure over the winner with owner %s', async owner => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        expect(store.row.status).toBe('awaiting_qa');
+        store.row.status = 'packaging';
+        store.row.callback_run_id = owner;
+        await options.beforeDispatch('A'.repeat(64));
+        throw new Error('POST must not be reached');
+      });
+      expect(await (await run()).json()).toMatchObject({ resumed: 0, failed: 0 });
+      expect(store.row).toMatchObject({ status: 'packaging', callback_run_id: owner });
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    });
+    it('defers explicit rate limits five times then stops without resetting the persisted budget', async () => {
+      const { store, run } = setup();
+      const error = new WorkflowDispatchRateLimitError(429, new Date(Date.now() + 60_000).toISOString());
+      triggerPackagingWorkflowMock.mockRejectedValue(error);
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        expect(await (await run()).json()).toMatchObject({ held: 1, failed: 0, resumed: 0 });
+        expect(store.row).toMatchObject({ status: 'awaiting_qa', completed_at: null,
+          error_details: { workflow_dispatch_rate_limit_attempts: attempt }, github_run_id: null });
+      }
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 1 });
+      expect(store.row).toMatchObject({ status: 'failed', error_code: 'WORKFLOW_DISPATCH_RATE_LIMITED' });
+      expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(6);
+    });
+
+    it('never rolls a concurrent accepted run back into the rate limit hold', async () => {
+      const { store, run } = setup();
+      triggerPackagingWorkflowMock.mockImplementation(async () => {
+        store.row.github_run_id = '123';
+        throw new WorkflowDispatchRateLimitError(403, new Date(Date.now() + 60_000).toISOString());
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 0 });
+      expect(store.row.github_run_id).toBe('123');
+      expect(store.row.status).toBe('packaging');
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    });
+    it('preserves an accepted run even when the rate limit budget is exhausted', async () => {
+      const { store, run } = setup();
+      store.row.error_details = { workflow_dispatch_rate_limit_attempts: 5 };
+      triggerPackagingWorkflowMock.mockImplementation(async () => {
+        store.row.github_run_id = '123';
+        throw new WorkflowDispatchRateLimitError(429, new Date(Date.now() + 60_000).toISOString());
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 0, failed: 0 });
+      expect(store.row).toMatchObject({ status: 'packaging', github_run_id: '123' });
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    });
+    it.each(['rate limit', 'unconfirmed'])('runs upstream, QA and approval admission again before a %s retry', async kind => {
+      const { store, run } = setup();
+      if (kind === 'unconfirmed') store.row.error_details = { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) };
+      triggerPackagingWorkflowMock.mockImplementation(async (_input, _config, options) => {
+        if (options?.beforeDispatch) await options.beforeDispatch('A'.repeat(64));
+        throw kind === 'unconfirmed' ? new WorkflowDispatchUnconfirmedError(503)
+          : new WorkflowDispatchRateLimitError(429, new Date(Date.now() + 60_000).toISOString());
+      });
+      expect(await (await run()).json()).toMatchObject({ held: 1, failed: 0 });
+      vi.mocked(holdCustomerUpstreamJob).mockResolvedValueOnce(true);
+      expect(await (await run()).json()).toMatchObject({ held: 1 });
+      enforceQaGateMock.mockRejectedValueOnce(new Error('synthetic outage'));
+      expect(await (await run()).json()).toMatchObject({ waiting: 1 });
+      findPendingApprovalBlocksMock.mockResolvedValueOnce([{ reason: 'release_check_failed', message: 'Approval pending' }]);
+      expect(await (await run()).json()).toMatchObject({ held: 1 });
+      expect(triggerPackagingWorkflowMock).toHaveBeenCalledOnce();
+      expect(await (await run()).json()).toMatchObject({ held: 1, failed: 0 });
+      expect(triggerPackagingWorkflowMock).toHaveBeenCalledTimes(2);
+      expect(store.row.error_details).toEqual({ workflow_dispatch_rate_limit_attempts: 2,
+        ...(kind === 'unconfirmed' ? { workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) } : {}) });
+      expect(holdCustomerUpstreamJob).toHaveBeenCalledTimes(5);
+      expect(enforceQaGateMock).toHaveBeenCalledTimes(4);
+      expect(findPendingApprovalBlocksMock).toHaveBeenCalledTimes(3);
+    });
+    it('clears the rate limit error when a retry starts without resetting its budget', async () => {
+      const { store, run } = setup();
+      triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchRateLimitError(429, new Date(Date.now() + 60_000).toISOString()));
+      expect(await (await run()).json()).toMatchObject({ held: 1 });
+      triggerPackagingWorkflowMock.mockResolvedValueOnce({ success: true, runId: 42, runUrl: 'https://example.test/run/42' });
+      expect(await (await run()).json()).toMatchObject({ resumed: 1, failed: 0 });
+      expect(store.row).toMatchObject({ status: 'packaging', github_run_id: '42',
+        error_code: null, error_message: null, error_stage: null, error_category: null,
+        error_details: { workflow_dispatch_rate_limit_attempts: 1 } });
+    });
+
+    it.each(['Microsoft.WindowsAppRuntime.2', 'https://private.invalid/hidden'])('classifies an unreviewed dependency without a QA failure: %s', async id => {
+      const { store, run } = setup();
+      getPackageCompatibilityBlockMock.mockResolvedValueOnce({ code: 'unreviewed_dependency',
+        detail: `WinGet dependency ${id} is not in the reviewed redistribution allowlist.` });
+      expect(await (await run()).json()).toMatchObject({ failed: 1, resumed: 0 });
+      expect(store.row).toMatchObject({ status: 'failed', error_code: 'DEPENDENCY_NOT_SUPPORTED',
+        error_stage: 'validation', error_category: 'validation' });
+      expect(String(store.row.error_message)).toContain('which is not supported yet'.replace('which ', id.startsWith('https:') ? 'that ' : 'which '));
+      expect(JSON.stringify(store.row)).not.toContain('private.invalid');
+      expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      expect(ensureQaDemandMock).not.toHaveBeenCalled();
+      expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledWith('retry-job', 'failed', store.row.error_message);
+    });
 
     it.each([null, '2026-10-01T00:00:00Z'])('holds a retryable preflight failure and restores QA completion %s', async priorCompletion => {
       const { store, run } = setup();
@@ -1474,4 +1845,67 @@ describe('GET /api/cron/qa-resume', () => {
     expect(failedUpdate.update).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'queued' }));
     expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledWith(job.id, 'failed', licenceError.message);
   });
+  it.each([{malicious:0,mode:'hold'},{malicious:1,mode:'hold'},{malicious:2,mode:'hold'},{malicious:0,mode:'failed-result'},{malicious:2,mode:'failed-result'},{malicious:0,mode:'read-error'},{malicious:2,mode:'read-error'},{malicious:0,mode:'wrong-profile'},{malicious:2,mode:'wrong-profile'},{malicious:2,mode:'changed-identity'}])('classifies pretest hold only with exact evidence %j', async ({malicious,mode}) => {
+    getFeatureFlagsMock.mockReturnValue({ localPackager: false });
+    const hash = 'A'.repeat(64), profile = 'B'.repeat(64);
+    const job = { id: 'security-job', status: 'awaiting_qa', tenant_id: 'tenant-1', winget_id: 'Example.App', version: '1.0',
+      architecture: 'x64', installer_sha256: hash, execution_profile_sha256: profile, qa_candidate_id: 'security-candidate',
+      package_config: { sourceType: 'winget', architecture: 'x64', installerSha256: hash }, error_code: null,
+      cancelled_at: null, archived_at: null, github_run_id: null, intune_app_id: null, updated_at: '2026-11-10T00:00:00Z' };
+    const candidate = { id: job.qa_candidate_id, status: 'error', phase: 'scanning_installer', github_run_id: '42',
+      failure_summary: 'reputation check stopped', winget_id: job.winget_id, version: job.version,
+      architecture: job.architecture, installer_sha256: hash, package_profile_sha256: profile };
+    if(mode === 'wrong-profile') candidate.package_profile_sha256 = 'C'.repeat(64);
+    const store = jobStore(job); let calls = 0;
+    securityHoldsMock.mockImplementation(async () => {
+      if (mode === 'changed-identity') store.row.installer_sha256 = 'D'.repeat(64);
+      return new Map([[hash.toLowerCase(), { reason: malicious >= 2 ? 'VirusTotal refused execution for this installer hash.' : malicious ? 'VirusTotal: 1 engine flagged, rechecking daily' : 'VirusTotal: awaiting engine coverage, rechecking daily', nextCheckAt: new Date(Date.now() + 3600_000).toISOString() }]]);
+    });
+    const from = vi.fn((table: string) => {
+      if (table === 'packaging_jobs') return ++calls === 1 ? chain({ data: [structuredClone(store.row)], error: null }) : store.updateQuery();
+      if (table === 'qa_candidates') return candidateQuery([candidate]);
+      if (table === 'qa_package_results') return chain({ data: mode === 'failed-result' ? { outcome: 'Failed' } : null, error: mode === 'read-error' ? { message: 'lookup failed' } : null });
+      throw new Error('Unexpected table ' + table);
+    });
+    createServerClientMock.mockReturnValue({ from });
+    const response = await GET(new Request('https://example.test/api/cron/qa-resume', { headers: { authorization: 'Bearer secret' } }));
+    const result = await response.json();
+    if(mode === 'hold' && malicious >= 2) {
+      expect(result).toMatchObject({ failed: 1, resumed: 0, held: 0 });
+      expect(store.row.status).toBe('failed');
+      expect(store.row.error_code).toBe('QA_SECURITY_FLAGGED_CURRENT_VERSION');
+      expect(store.row.error_stage).toBe('validation');
+      expect(store.row.error_category).toBe('installer');
+      expect(store.row.qa_completed_at).toBeNull();
+      expect(store.row.completed_at).toEqual(expect.any(String));
+      expect(store.row.status_message).toBe('VirusTotal refused execution for this installer hash.');
+      expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledTimes(1);
+      expect(handleAutoUpdateJobCompletionMock).toHaveBeenCalledWith(job.id, 'failed', store.row.status_message);
+    } else if(mode === 'changed-identity') {
+      expect(result).toMatchObject({ failed: 0, resumed: 0, held: 0 });
+      expect(store.row.status).toBe('awaiting_qa');
+      expect(store.row.error_code).toBeNull();
+      expect(store.row.installer_sha256).toBe('D'.repeat(64));
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    } else if(mode === 'hold') {
+      expect(result).toMatchObject({ failed: 0, resumed: 0, held: 1 });
+      expect(store.row.status).toBe('awaiting_qa');
+      expect(store.row.error_code).toBeNull();
+      expect(store.row).not.toHaveProperty('qa_completed_at');
+      expect(store.row.status_message).toContain(malicious ? '1 engine flagged' : 'awaiting engine coverage');
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    } else if(mode === 'read-error') {
+      expect(result).toMatchObject({failed:0,resumed:0,waiting:1});
+      expect(store.row.status).toBe('awaiting_qa');
+      expect(handleAutoUpdateJobCompletionMock).not.toHaveBeenCalled();
+    } else {
+      expect(result).toMatchObject({failed:1,resumed:0,held:0});
+      expect(store.row.status).toBe('qa_failed');
+      expect(store.row.error_code).toBe('QA_FAILED_EXECUTION_PROFILE');
+    }
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).not.toHaveBeenCalled();
+    expect(from.mock.calls.some(([name]) => name === 'qa_installer_security_holds')).toBe(false);
+  });
+
 });

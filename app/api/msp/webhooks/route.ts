@@ -10,7 +10,7 @@ import { parseAccessToken } from '@/lib/auth-utils';
 import { hasPermission, type MspRole } from '@/lib/msp-permissions';
 import { createAuditLog } from '@/lib/audit-logger';
 import { generateWebhookSecret } from '@/lib/msp/webhook-signatures';
-import { validateWebhookTarget } from '@/lib/webhooks/egress';
+import { validateWebhookDestination } from '@/lib/webhooks/destination';
 
 const VALID_EVENT_TYPES = [
   'deployment.completed',
@@ -155,11 +155,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate URL
-    const urlValidation = await validateWebhookTarget(body.url);
-    if (!urlValidation.valid) {
+    // Validate URL: HTTPS, no credentials, and a destination that resolves
+    // to public addresses only
+    const destination = await validateWebhookDestination(body.url);
+    if (!destination.valid) {
       return NextResponse.json(
-        { error: urlValidation.error || 'Invalid webhook URL' },
+        { error: destination.error || 'Invalid webhook URL' },
         { status: 400 }
       );
     }

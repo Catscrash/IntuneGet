@@ -98,6 +98,9 @@ export interface PackagingJob {
   qa_requested_at: string | null;
   qa_completed_at: string | null;
   qa_resume_due_at?: string;
+  infrastructure_retry_count?: number;
+  infrastructure_retry_run_id?: string | null;
+  callback_run_id?: string | null;
   is_auto_update?: boolean | null;
   auto_update_policy_id?: string | null;
   packager_id: string | null;
@@ -226,10 +229,12 @@ export interface UserSettingsRecord {
 /**
  * Job statistics
  */
-export type AnalyticsJob = Pick<PackagingJob, 'id' | 'user_id' | 'user_email' | 'status' | 'completed_at' | 'created_at' | 'winget_id' | 'display_name' | 'intune_app_url'>;
+export type AnalyticsJob = Pick<PackagingJob, 'id' | 'user_id' | 'user_email' | 'status' | 'completed_at' | 'created_at' | 'winget_id' | 'display_name' | 'intune_app_url'> & Partial<Pick<PackagingJob, 'publisher' | 'error_message' | 'version' | 'architecture' | 'installer_type' | 'intune_app_id'>>;
 export type AnalyticsJobScope = { userId: string; tenantId?: never } | { tenantId: string; userId?: never };
 
 export interface JobStats {
+  /** Distinct workers observed through recent job heartbeats, when supported. */
+  activePackagers?: number;
   queued: number;
   packaging: number;
   uploading: number;

@@ -21,6 +21,9 @@
 import type { DatabaseAdapter, UploadHistoryRecord } from '@/lib/db/types';
 import { findPendingApprovalBlocks } from '@/lib/intune-approval-guard';
 import type { Json } from '@/types/database';
+import type { DetectionRule } from '@/types/intune';
+import { reconcileManagedMarkerDetectionRules } from '@/lib/registry-marker';
+import { parseAssignmentMigration } from '@/lib/update-policies/build-deployment-config';
 import { getCatalogSource } from '@/lib/catalog';
 import { compareVersions } from '@/lib/version-compare';
 import { getLatestInstallerInfo } from '@/lib/auto-update/trigger';
@@ -52,6 +55,7 @@ export interface SqliteUpdateInfo {
   installerType: string;
   installCommand: string;
   uninstallCommand: string;
+  detectionRules?: DetectionRule[];
   installScope: string | null;
   nestedInstallerType?: string;
   nestedInstallerPath?: string;
@@ -148,6 +152,24 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
     if (config.psadtConfig?.customDetection) {
       return { success: false, skipped: true, skipReason: customDetectionUpdateHold(updateInfo.latestVersion) };
     }
+    let resolvedScope = updateInfo.installScope || config.installScope;
+    // Refresh generated rules only when the saved settings establish that
+    // detection is not custom. Older policies without settings keep their
+    // original rules rather than silently replacing an administrator's rules.
+    if (config.psadtConfig && updateInfo.detectionRules) {
+      // Change scope casing only together with the rules. Retained legacy
+      // rules must keep the packager's original hive selection behavior.
+      resolvedScope = resolvedScope?.toLowerCase();
+      const detectionRules = reconcileManagedMarkerDetectionRules({
+        detectionRules: updateInfo.detectionRules,
+        wingetId: updateInfo.wingetId,
+        version: updateInfo.latestVersion,
+        installScope: resolvedScope,
+        markerPath: config.psadtConfig.registryMarkerPath,
+      });
+      config = { ...config, detectionRules,
+        psadtConfig: { ...config.psadtConfig, detectionRules } };
+    }
     let curatedLicenceAcceptance: CuratedLicenceAcceptanceSnapshot | null = null;
     let approvalIds = [updateInfo.wingetId];
     if (isCuratedPackageId(updateInfo.wingetId)) {
@@ -212,6 +234,7 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
       historyId = history.id;
 
       const sourceIntuneAppId = updateInfo.currentIntuneAppId || null;
+      const migration = parseAssignmentMigration(config);
       const autoSupersede = Boolean(sourceIntuneAppId);
 
       const job = await db.jobs.create({
@@ -227,7 +250,7 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
         installer_sha256: updateInfo.installerSha256,
         install_command: updateInfo.installCommand || config.installCommand,
         uninstall_command: updateInfo.uninstallCommand || config.uninstallCommand,
-        install_scope: updateInfo.installScope || config.installScope,
+        install_scope: resolvedScope,
         detection_rules: (config.detectionRules ?? []) as unknown as Json,
         package_config: {
           sourceType: updateInfo.sourceType || config.sourceType,
@@ -248,6 +271,11 @@ const scopeReason = !options?.bypassUpdateScope && autoUpdateScopeReason(policy.
           sourceIntuneAppId,
           autoSupersede,
           supersedenceType: autoSupersede ? 'update' : undefined,
+          assignmentMigration: {
+            carryOverAssignments: Boolean(migration?.carryOverAssignments),
+            // Copying an update must preserve the original assignments.
+            removeAssignmentsFromPreviousApp: false,
+          },
           description: config.description,
           notes: config.notes,
           autoUpdateHistoryId: history.id,
@@ -482,6 +510,7 @@ export async function runSqliteUpdateCheck(
       installerType: resolution.info.installerType,
       installCommand: resolution.info.installCommand ?? '',
       uninstallCommand: resolution.info.uninstallCommand ?? '',
+      detectionRules: resolution.info.detectionRules,
       installScope: resolution.info.installScope ?? null,
       nestedInstallerType: resolution.info.nestedInstallerType,
       nestedInstallerPath: resolution.info.nestedInstallerPath,

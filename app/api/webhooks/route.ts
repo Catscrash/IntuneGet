@@ -8,7 +8,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/db';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { detectWebhookType } from '@/lib/webhooks/service';
-import { validateWebhookTarget } from '@/lib/webhooks/egress';
+import { validateWebhookDestination } from '@/lib/webhooks/destination';
 import type {
   WebhookConfiguration,
   WebhookConfigurationInput,
@@ -83,7 +83,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Validate URL
-    const urlValidation = await validateWebhookTarget(body.url);
+    const urlValidation = await validateWebhookDestination(body.url);
     if (!urlValidation.valid) {
       return NextResponse.json(
         { error: urlValidation.error || 'Invalid webhook URL' },

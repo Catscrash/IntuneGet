@@ -81,6 +81,7 @@ export function shouldApplyCallback(
   currentUpdatedAt: string,
   heartbeatAt?: string,
 ): boolean {
+  if (currentStatus === 'awaiting_qa') return false;
   const normalizedCurrent = packageJobStatuses.includes(currentStatus as PackageJobStatus)
     ? currentStatus as PackageJobStatus
     : 'queued';
@@ -122,4 +123,30 @@ export function sanitizeErrorDetails(
         return [key, '[redacted complex value]'];
       }),
   );
+}
+
+/** Parse the authenticated runner identity without trusting dispatcher capture. */
+export function callbackRunIdentity(
+  incomingRunId: string | number | undefined,
+  attemptId?: string,
+): string | undefined {
+  const validId = (value: string) => /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
+  const explicit = incomingRunId === undefined ? undefined : String(incomingRunId);
+  const attempt = attemptId?.match(/^([1-9]\d*)-([1-9]\d*)$/);
+  if (explicit !== undefined && !validId(explicit)) return undefined;
+  if (attemptId !== undefined && (!attempt || !validId(attempt[1]) || !validId(attempt[2]))) return undefined;
+  const fromAttempt = attempt?.[1];
+  if (explicit && fromAttempt && explicit !== fromAttempt) return undefined;
+  return explicit ?? fromAttempt;
+}
+
+/** A retired run cannot mutate the fresh admission or its replacement run. */
+export function isRetiredRunCallback(
+  retiredRunId: string | null | undefined,
+  incomingRunId: string | number | undefined,
+  attemptId?: string,
+): boolean {
+  if (!retiredRunId) return false;
+  const identity = callbackRunIdentity(incomingRunId, attemptId);
+  return identity === undefined || identity === retiredRunId;
 }

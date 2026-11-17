@@ -27,12 +27,25 @@ export function rateLimitUntil(response, now = Date.now()) {
 
 /** Release a stranded publisher, retaining the VM job and candidate run ID. */
 export async function recoverStalledPublication({ candidate: c, github, patch, now = Date.now() }) {
-  if (c.status !== 'running' || c.phase !== 'publishing' || !/^[1-9][0-9]*$/.test(c.github_run_id || '')) return null;
+  if (c.status !== 'running' || !['publishing', 'preparing_package'].includes(c.phase) || !/^[1-9][0-9]*$/.test(c.github_run_id || '')) return null;
   const runId = c.github_run_id;
   const validRun = run => run && String(run.id) === runId && run.path === '.github/workflows/intune-qa.yml' &&
     run.head_branch === 'main' && run.event === 'workflow_dispatch';
   const run = await github(`/actions/runs/${runId}`);
   if (!validRun(run)) throw new Error('QA workflow identity mismatch');
+  if (c.phase === 'preparing_package') {
+    if (run.status !== 'in_progress' || run.run_attempt !== 1) return null;
+    const payload = await github(`/actions/runs/${runId}/jobs?filter=latest&per_page=100`);
+    if (!payload || !Array.isArray(payload.jobs) || payload.total_count !== payload.jobs.length || payload.total_count > 100) return null;
+    const qa = payload.jobs.filter(j => j.name === 'qa');
+    if (qa.length !== 1 || qa[0].status !== 'in_progress' || !Array.isArray(qa[0].steps)) return null;
+    const executing = qa[0].steps.filter(s => s.status === 'in_progress');
+    const execute = qa[0].steps.filter(s => s.name === 'Execute isolated QA test');
+    if (executing.length !== 1 || !['Prepare package from catalog candidate', 'Prepare package from repository definition'].includes(executing[0].name) ||
+        execute.length !== 1 || execute[0].status !== 'pending' || execute[0].started_at != null) return null;
+    return { action: 'preparation_candidate_stalled', candidateOnly: true, repairRequired: true,
+      repairKey: `preparation-stall:${c.id}`, repairReason: 'One candidate preparation is stalled before Execute. Preserve runner ownership; use the bounded preparation timeout and qualify terminal cleanup before isolation. Do not globally pause or replay it.' };
+  }
   if (!['queued', 'completed'].includes(run.status)) return null;
   const payload = await github(`/actions/runs/${runId}/jobs?filter=latest&per_page=100`);
   if (!payload || !Array.isArray(payload.jobs) || !Number.isInteger(payload.total_count) ||
@@ -67,6 +80,46 @@ export async function recoverStalledPublication({ candidate: c, github, patch, n
   return { action: 'publication_cancel_requested' };
 }
 
+async function publicationScope(candidate, rows, now) {
+  const held = await rows('qa_candidates', { select: 'winget_id', status: 'eq.error',
+    failure_summary: `eq.${PUBLICATION_FAILURE}`, next_retry_at: 'eq.infinity',
+    winget_id: `neq.${candidate.winget_id}`, updated_at: `gte.${new Date(now - 24 * 60 * 60_000).toISOString()}`, limit: '100' });
+  if (held.length >= 100 || new Set(held.map(row => row.winget_id.toLowerCase())).size >= 2) {
+    return { action: 'repair_required', repairRequired: true, repairKey: 'qa-publication-systemic',
+      candidateId: candidate.id, repairReason: 'Publication failures affect at least three distinct applications; inspect shared publisher infrastructure.' };
+  }
+  return null;
+}
+
+/** Isolate publication-only stalls only after complete terminal VM evidence. */
+export async function holdStalledPublication({ candidate: c, github, patch, rows, now = Date.now() }) {
+  if (c.status !== 'running' || c.phase !== 'publishing' || !/^[1-9][0-9]*$/.test(c.github_run_id || '')) return null;
+  const runId = c.github_run_id;
+  const run = await github(`/actions/runs/${runId}`);
+  if (!run || String(run.id) !== runId || run.path !== '.github/workflows/intune-qa.yml' ||
+      run.head_branch !== 'main' || run.event !== 'workflow_dispatch') return null;
+  if (!Number.isInteger(run.run_attempt) || run.run_attempt < 1) return null;
+  const history = Array.isArray(c.recovery_history) ? c.recovery_history : [];
+  let prior = history.length - 1;
+  while (prior >= 0 && history[prior].kind === 'publication_queue_cancel' &&
+      history[prior].previousRunId === runId && history[prior].runAttempt === run.run_attempt) prior--;
+  if (run.run_attempt > 1 && !(history[prior]?.kind === 'publication' && history[prior]?.previousRunId === runId)) return null;
+  const payload = await github(`/actions/runs/${runId}/jobs?filter=all&per_page=100`);
+  if (!payload || !Array.isArray(payload.jobs) || !Number.isInteger(payload.total_count) ||
+      payload.total_count !== payload.jobs.length || payload.total_count > 100) return null;
+  const qa = payload.jobs.filter(job => job.name === 'qa');
+  const publishers = payload.jobs.filter(job => job.name === 'Publish compact app JSON');
+  if (!qa.length || !publishers.length || payload.jobs.some(job => job.status === 'in_progress') ||
+      qa.some(job => job.status !== 'completed' || !['success', 'failure'].includes(job.conclusion)) ||
+      payload.jobs.some(job => job.name !== 'Publish compact app JSON' && job.status !== 'completed')) return null;
+  const systemic = await publicationScope(c, rows, now);
+  if (systemic) return systemic;
+  const changed = await patch('qa_candidates', { id: `eq.${c.id}`, status: 'eq.running', phase: 'eq.publishing',
+    github_run_id: `eq.${runId}` }, { status: 'error', failure_summary: PUBLICATION_FAILURE,
+    finished_at: new Date(now).toISOString(), next_retry_at: 'infinity', updated_at: new Date(now).toISOString() });
+  return { action: changed.length === 1 ? 'publication_candidate_held' : 'recovery_claim_lost', candidateId: c.id };
+}
+
 /** No arbitrary workflow IDs or repository URLs from the candidate are followed. */
 export async function publicationJob(runId, github) {
   if (!/^[1-9][0-9]*$/.test(runId || '')) throw new Error('Invalid QA workflow run ID');
@@ -92,6 +145,11 @@ export async function publicationJob(runId, github) {
       !steps.slice(reputationIndex + 1).some(step => step.conclusion === 'cancelled')) {
     return { preExecutionRefusal: true };
   }
+  const preparation = Array.isArray(steps) ? steps.filter(s => ['Prepare package from catalog candidate', 'Prepare package from repository definition'].includes(s.name) && ['failure', 'cancelled', 'timed_out'].includes(s.conclusion)) : [];
+  const execute = Array.isArray(steps) ? steps.filter(s => s.name === 'Execute isolated QA test') : [];
+  if (run.run_attempt === 1 && payload.total_count === payload.jobs.length && payload.jobs.every(j => j.status === 'completed') &&
+      qa?.status === 'completed' && ['failure', 'cancelled', 'timed_out'].includes(qa.conclusion) && preparation.length === 1 &&
+      execute.length === 1 && execute[0].conclusion === 'skipped' && execute[0].started_at == null) return { preparationFailed: true };
   const merged = publisher?.steps?.some(step => step.name === 'Merge result through protected branch' && step.conclusion === 'success');
   const replaySafe = publisher?.steps?.some(step => step.name === 'Commit or reuse the compact result');
   const legacyCommitFailed = publisher?.steps?.some(step => step.name === 'Commit the compact result' && step.conclusion === 'failure');
@@ -157,9 +215,24 @@ export async function recoverInfrastructure({ rows, patch, github, now = Date.no
       continue;
     }
     let job = null;
-    if (kind === 'publication' && !dryRun) {
+    if ((kind === 'publication' || (kind === 'lifecycle' && c.phase === 'preparing_package')) && !dryRun) {
       job = await publicationJob(c.github_run_id, github);
       if (job.waiting) continue;
+      if (job.preparationFailed) {
+        const held = await rows('qa_candidates', { select: 'winget_id', status: 'eq.error', next_retry_at: 'eq.infinity',
+          failure_summary: 'like.Candidate-only preparation hold:*', winget_id: `neq.${c.winget_id}`,
+          updated_at: `gte.${new Date(now - 24 * 60 * 60_000).toISOString()}`, limit: '100' });
+        if (held.length >= 100 || new Set(held.map(r => r.winget_id.toLowerCase())).size >= 2) return {
+          action: 'repair_required', repairRequired: true, repairKey: 'qa-preparation-systemic', candidateId: c.id,
+          repairReason: 'Preparation failures affect at least three distinct applications; inspect shared preparation infrastructure.' };
+        const changed = await patch('qa_candidates', { id: `eq.${c.id}`, status: 'eq.error', github_run_id: `eq.${c.github_run_id}`, failure_summary: `eq.${c.failure_summary}` }, {
+          next_retry_at: 'infinity', updated_at: new Date(now).toISOString(),
+          failure_summary: 'Candidate-only preparation hold: preparation failed before Execute. Installer remains untested; repair required before retry.',
+        });
+        return { action: changed.length === 1 ? 'preparation_candidate_held' : 'recovery_claim_lost', candidateId: c.id,
+          ...(changed.length === 1 ? { repairRequired: true, candidateOnly: true, repairKey: `preparation-stall:${c.id}`,
+            repairReason: 'Preparation failed before Execute. Candidate is held without replay; repair its preparation before any retry. Other candidates remain eligible.' } : {}) };
+      }
       if (job.preExecutionRefusal) {
         await patch('qa_candidates', { id: `eq.${c.id}`, status: 'eq.error',
           failure_summary: `eq.${PUBLICATION_FAILURE}`, github_run_id: `eq.${c.github_run_id}` }, {
@@ -169,6 +242,15 @@ export async function recoverInfrastructure({ rows, patch, github, now = Date.no
         });
         continue;
       }
+    }
+    if (!dryRun && recoveryAttempts >= 5 && kind === 'publication' && job?.jobId) {
+      const systemic = await publicationScope(c, rows, now);
+      if (systemic) return systemic;
+      const changed = await patch('qa_candidates', { id: `eq.${c.id}`, status: 'eq.error',
+        recovery_attempts: `eq.${recoveryAttempts}`, github_run_id: `eq.${c.github_run_id}` }, {
+        next_retry_at: 'infinity', updated_at: new Date(now).toISOString(),
+      });
+      return { action: changed.length === 1 ? 'publication_candidate_held' : 'recovery_claim_lost', candidateId: c.id };
     }
     if (recoveryAttempts >= 5 && kind !== 'source') return { action: 'recovery_exhausted', candidateId: c.id, repairRequired: true };
     if (dryRun) return { action: 'would_recover_infrastructure', candidateId: c.id, kind };

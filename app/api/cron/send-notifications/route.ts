@@ -5,11 +5,11 @@
 
 import { createHash } from 'crypto';
 import { NextResponse } from 'next/server';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { isEmailConfigured } from '@/lib/email/service';
 import { notifyUserOfPendingUpdates } from '@/lib/notifications/notify-user';
 import type { UpdateCheckResult } from '@/types/notifications';
-import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 20;
 

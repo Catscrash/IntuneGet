@@ -168,8 +168,11 @@ def transaction(text, application, role="service_role"):
         yield session
     finally:
         if session.poll() is None:
-            session.stdin.write("rollback;\n\\q\n")
-            session.stdin.flush()
+            try:
+                session.stdin.write("rollback;\n\\q\n")
+                session.stdin.flush()
+            except OSError:
+                pass  # The reader may exit first; communicate still drains and reaps.
         try:
             session.communicate(timeout=15)
         except subprocess.TimeoutExpired:
@@ -412,6 +415,40 @@ def contracts():
     for priority_case in ('no_customer', 'customer_ready', 'customer_fresh', 'backoff'):
         sql("set qa.priority_case='"+priority_case+"';"+priority)
     print('PASS uploaded priority, customer-first ordering and unchanged analysis backoff')
+    no_upload = (ROOT/'supabase/tests/qa_defender_pilot_no_upload.sql').read_text()
+    before = sql(no_upload, check=False)
+    assert before.returncode != 0 and 'Pilot upload was not refused' in before.stderr
+    pilot_patch = migration('20261110134102_qa_defender_pilot_no_upload')
+    production_pin = 'cd14fa085865af02c1b5f3b0ac1401352f2297ff26a6204d3e92d3f74b236602'
+    assert pilot_patch.count(production_pin) == 1
+    # Normalize only the disposable database's function-source pin, never shipped SQL.
+    fixture_pin = value("select encode(extensions.digest(pg_get_functiondef('public.reserve_qa_vt_candidate_request(text,uuid,text,text,uuid)'::regprocedure),'sha256'),'hex')")
+    sql(pilot_patch.replace(production_pin, fixture_pin))
+    sql(no_upload)
+    sql((ROOT/'supabase/tests/qa_vt_upload_url_recovery.sql').read_text())
+    print('PASS PG17 Defender pilot upload refusal, zero quota/evidence mutation, auth/hash/lease guards, hash lookup and unrelated upload recovery')
+    static_scan = (ROOT/'supabase/tests/qa_reader_static_scan_reservation.sql').read_text()
+    before = sql(static_scan, check=False)
+    assert before.returncode != 0 and 'Reader scan-only reservation unavailable' in before.stderr, before.stderr
+    static_patch = migration('20261111044500_qa_reader_static_scan_reservation')
+    for signature, production_pin in (
+        ('reserve_qa_vt_candidate_request(text,uuid,text,text,uuid)',
+         'd82f5cd1df5c869f330f267988052c6c9d0bd2f82a705d4430fcb41b3d19455c'),
+        ('report_qa_vt_candidate_rate_limit(text,uuid,uuid,timestamptz)',
+         'ffaaf313f296124c509c6e0bd38c2827df2a54a3a403488eb723ca296bb89e7f'),
+    ):
+        assert static_patch.count(production_pin) == 1
+        fixture_pin = value("select encode(extensions.digest(pg_get_functiondef(" +
+                            literal('public.' + signature) + "::regprocedure),'sha256'),'hex')")
+        static_patch = static_patch.replace(production_pin, fixture_pin)
+    sql(static_patch)
+    sql(static_scan)
+    # Replacing an already changed source must fail, including atomically.
+    repeated = sql(static_patch, check=False)
+    assert repeated.returncode != 0 and 'Reader scan-only source pin mismatch' in repeated.stderr
+    sql(no_upload)
+    sql((ROOT/'supabase/tests/qa_vt_upload_url_recovery.sql').read_text())
+    print('PASS PG17 Reader one-shot scan reservation, deadline/binding/hold/cache refusals, shared429 backoff, immutable candidate/hold/ACL and unchanged ordinary upload guards')
     sql(migration('20261018011340_qa_vt_result_record_refresh'))
     refresh = (ROOT/'supabase/tests/qa_vt_analysis_record_refresh.sql').read_text()
     before = sql(refresh, check=False)
@@ -493,7 +530,101 @@ def contracts():
     denied("select claim_qa_vt_metadata_recheck('wrong-fixture',false)", 'authentication|secret|Unauthorized|unauthorized|invalid|Invalid')
     denied("select claim_qa_vt_metadata_recheck('local-fixture-only',null)", 'QA VT capability required')
     print('PASS unsupported public work consumes no attempt/lease/reservation and cannot block hash work; legacy body/ACL retained')
+    reservation = (ROOT/'supabase/tests/qa_vcpp_single_attempt_authorizations.sql').read_text()
+    # The disposable postgres session can SET ROLE to exercise the real caller
+    # ACLs; fixture_owner intentionally has no membership in the API roles.
+    before = sql(reservation, role=None, check=False)
+    assert before.returncode != 0 and 'does not exist' in before.stderr
+    sql(migration('20261029000852_qa_vcpp_single_attempt_authorizations'))
+    sql(reservation, role=None)
+    print('PASS VC++ reservation ACL, lifetime uniqueness, full-profile identity, customer/sibling/pin guards and unchanged original lifecycle')
+    prefilters = (ROOT/'supabase/tests/qa_vt_admission_prefilters.sql').read_text()
+    before = sql(prefilters, check=False)
+    assert before.returncode != 0 and 'Opaque identity predicate reached decoys' in before.stderr, before.stderr
+    sql(migration('20261112153855_qa_vt_admission_prefilters'))
+    sql(prefilters)
+    print('PASS admission prefilters: original predicate-call regression fails, identical customer-first batches drain 100/100/99/0 without decoy calls or budget reset')
     print("LIMIT: CI cannot observe unmetered production callers; fresh live S3 caller-drain proof remains required.")
+
+
+def corrected_profile_contracts():
+    # This database was created by main() inside the portless disposable PG17
+    # service. Reset only its synthetic fixture after the VT contracts finish.
+    assert re.fullmatch(r"vt_contract_[a-f0-9]{32}", DB)
+    sql("drop schema public cascade;create schema public authorization fixture_owner", role=None)
+    fixture()
+    for name in ("20261012200751_qa_repair_current_profile_adoption",
+                 "20261012225940_qa_deployment_profile_adoption",
+                 "20261014222100_qa_terminal_failure_retest_guards",
+                 "20261007224438_qa_candidate_conflict_free_insert"):
+        sql(migration(name))
+    dependency = migration("20261019125457_qa_vt_dependency_lookup")
+    coverage = dependency[dependency.index("create function public.qa_vt_dependency_coverage"):]
+    sql(coverage[:coverage.index("$$;") + 3])
+    sql(migration("20261110051729_qa_corrected_profile_repair"))
+    sql(migration("20261103104500_curated_hold_candidate_only"))
+    patch = migration("20261110091207_qa_scoped_corrected_profile_retests")
+    production = "3dda5c4f2820d93448e66655e39a7ce7e2ce68c3cc1ccd9076632ca018c8768e"
+    assert patch.count(production) == 1
+    # historicalFixture's only source substitution is the fixed local secret.
+    sql(patch.replace(production, "3d46bbba82435e54602b378b6959c907596b9e2850d215720c5f34a54ba9bbd5"))
+    for f in json.loads((FIXTURES / "corrected-profile-prerequisite.json").read_text()):
+        sql("truncate qa_repair_profile_corrections,qa_retest_grants,qa_repair_requests,"
+            "qa_candidates,qa_package_results,catalog_file_reputation,qa_pipeline_control cascade")
+        canonical = json.loads(f["oldCanonicalJson"])
+        canonical["installer"]["silentArgs"] = '/Q /C:"msiexec /i ""vcredist.msi"" /quiet /norestart"'
+        corrected = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False)
+        assert hashlib.sha256(f["oldCanonicalJson"].encode()).hexdigest().upper() == f["oldProfile"]
+        assert hashlib.sha256(corrected.encode()).hexdigest().upper() == f["newProfile"]
+        def config(text, profile):
+            return json.dumps({"profileKind": "deployment-config", "packageProfileCanonicalJson": text,
+                              "packageProfileSha256": profile, "psadtConfig": canonical["psadtConfig"],
+                              "detectionRules": canonical["detectionRules"]})
+        pin = canonical["toolchain"]["packagerCommit"]
+        sql("insert into qa_pipeline_control(id,paused,required_packager_commit,scheduler_packager_commit,scheduler_seen_at) "
+            "values('global',false," + literal(pin) + "," + literal(pin) + ",now())")
+        old_values = [f["oldCandidateId"], f["app"], f["version"], f["architecture"], f["hash"], f["url"],
+                      f["oldProfile"], config(f["oldCanonicalJson"], f["oldProfile"])]
+        sql("insert into qa_candidates(id,winget_id,version,architecture,installer_sha256,installer_url,package_profile_sha256,test_config,test_level,status,phase,finished_at) values(" +
+            ",".join(map(literal, old_values)) + ",'psadt-package','failed','publishing',now())")
+        sql("insert into qa_repair_requests(id,candidate_id,winget_id,version,architecture,failure_class,status,prior_requeues) values(" +
+            ",".join(map(literal, [f["repairId"], f["oldCandidateId"], f["app"], f["version"], f["architecture"]])) + ",'app_lifecycle','pending',0)")
+        sql("insert into qa_package_results(package_profile_sha256,winget_id,tested_version,architecture,installer_sha256,outcome) values(" +
+            ",".join(map(literal, [f["oldProfile"], f["app"], f["version"], f["architecture"], f["hash"]])) + ",'Failed')")
+        sql("insert into catalog_file_reputation(sha256,status,malicious,suspicious,total_engines,engine_count_version,checked_at,analyzed_at,retry_after) values(lower(" + literal(f["hash"]) + "),'found',0,0,70,2,now(),now(),now()+interval '1 day')")
+        old = value("select to_jsonb(c) from qa_candidates c where id=" + literal(f["oldCandidateId"]))
+        candidate_value = {"winget_id": f["app"], "version": f["version"], "architecture": f["architecture"],
+                           "installer_sha256": f["hash"], "installer_url": f["url"], "installer_type": "exe",
+                           "installer_file_name": "vcredist.exe", "test_level": "psadt-package",
+                           "package_profile_sha256": f["newProfile"], "test_config": json.loads(config(corrected, f["newProfile"]))}
+        adopt = "select adopt_qa_repair_corrected_candidate(" + ",".join(map(literal, [f["repairId"], json.dumps(candidate_value), f["oldProfile"], f["newProfile"], "exe-embedded-msi-target@1779"])) + ")"
+        cid = value(adopt, role="service_role")
+        assert value(adopt, role="service_role") == cid
+        assert value("select status from qa_candidates where id=" + literal(cid)) == "superseded"
+        claim = "select claim_qa_work('ordinary'," + literal(cid) + "," + literal(pin) + ")"
+        grant = "select create_qa_retest_grant(" + literal(cid) + ",now()+interval '1 hour','PG17 concurrency fixture')"
+        sql(grant, role="service_role")
+        replies = parallel([claim, claim])
+        assert all(r.returncode == 0 for r in replies), [r.stderr for r in replies]
+        decoded = [json.loads(r.stdout) for r in replies]
+        assert sum(r.get("row", {}).get("id") == cid for r in decoded) == 1, decoded
+        assert sum(r.get("reason") == "qa_active" for r in decoded) == 1, decoded
+        sql("update qa_candidates set status='running',phase='installing' where id=" + literal(cid))
+        sql("select report_qa_candidate_result(" + literal(SECRET) + "," + literal(cid) + ",'failed','PG17 fixture')", role="service_role")
+        assert value("select prior_requeues from qa_repair_requests where id=" + literal(f["repairId"])) == 1
+        # The claim can observe queue_empty before the grant, or dispatch after
+        # it commits. Both sessions use the real dispatch advisory lock.
+        replies = parallel([grant, claim])
+        assert all(r.returncode == 0 for r in replies), [r.stderr for r in replies]
+        observed = json.loads(replies[1].stdout)
+        if observed.get("reason") == "queue_empty":
+            observed = value(claim, role="service_role")
+        assert observed.get("row", {}).get("id") == cid, observed
+        assert value("select count(*) from qa_candidates where status in ('running','dispatched')") == 1
+        assert value("select count(*) from qa_package_blocks") == 0
+        assert value("select to_jsonb(c) from qa_candidates c where id=" + literal(f["oldCandidateId"])) == old
+        assert value("select outcome from qa_package_results where package_profile_sha256=" + literal(f["oldProfile"])) == "Failed"
+    print("PASS PG17 corrected-profile adoption and real two-session claim/claim and grant/claim serialization for both approved tuples")
 
 
 def main():
@@ -508,6 +639,7 @@ def main():
         runpy.run_path(str(ROOT / 'scripts/ci/catalog-sync-schema-postgres.py'))['contracts'](sql)
         sql("create schema extensions authorization fixture_owner;create extension pgcrypto with schema extensions", role=None)
         contracts()
+        corrected_profile_contracts()
     finally:
         sql("select pg_terminate_backend(pid) from pg_stat_activity where datname=" + literal(DB) + " and pid<>pg_backend_pid();drop database " + DB + " with (force)", role=None, database="postgres")
 

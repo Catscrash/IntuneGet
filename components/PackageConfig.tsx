@@ -68,6 +68,7 @@ import { useCartStore, createStoreCartItem } from '@/stores/cart-store';
 import { useUserSettings } from '@/components/providers/UserSettingsProvider';
 import { useUpdateAppSettings } from '@/hooks/use-update-app-settings';
 import { useFocusTrap } from '@/hooks/use-focus-trap';
+import type { ReactNode } from 'react';
 import { generateDetectionRules, generateInstallCommand, generateUninstallCommand } from '@/lib/detection-rules';
 import { LEGACY_INTUNE_APP_SOURCE_MARKER } from '@/lib/intune-description';
 import {
@@ -115,6 +116,7 @@ interface PackageConfigProps {
   deployedConfig?: CartItem | null;
   intuneAppId?: string | null;
   storeManifest?: StoreManifestResponse;
+  configurationRefreshNotice?: ReactNode;
 }
 
 type ConfigSection =
@@ -133,7 +135,7 @@ type ConfigSection =
   | 'branding'
   | 'advanced';
 
-export function PackageConfig({ package: pkg, installers, versions = [], onClose, replaceCartItemId, onAddedToCart, isDeployed = false, deployedConfig, intuneAppId, storeManifest }: PackageConfigProps) {
+export function PackageConfig({ package: pkg, installers, versions = [], onClose, replaceCartItemId, onAddedToCart, isDeployed = false, deployedConfig, intuneAppId, storeManifest, configurationRefreshNotice }: PackageConfigProps) {
   const isStoreApp = pkg.appSource === 'store';
 
   // Store app install experience state
@@ -590,7 +592,7 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
             updatePolicy === 'auto_update'
               ? {
                   carryOverAssignments,
-                  removeAssignmentsFromPreviousApp: carryOverAssignments,
+                  removeAssignmentsFromPreviousApp: false,
                 }
               : undefined,
           ...(isDeployed ? { forceCreate: true } : {}),
@@ -721,6 +723,8 @@ export function PackageConfig({ package: pkg, installers, versions = [], onClose
             </button>
           </div>
         </div>
+
+        {configurationRefreshNotice && <div className="flex-shrink-0 px-6 py-3">{configurationRefreshNotice}</div>}
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto">

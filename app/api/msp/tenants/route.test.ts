@@ -1,251 +1,119 @@
-/**
- * Tenant management is reserved for roles carrying `manage_tenants`, and the
- * server-side Supabase client bypasses RLS - so these handlers are the only
- * thing standing between a viewer and someone else's customer tenants.
- */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const {
-  parseAccessTokenMock,
-  createServerClientMock,
-  getMspCustomerConsentUrlMock,
-  signConsentStateMock,
-  getBaseUrlMock,
-} = vi.hoisted(() => ({
-  parseAccessTokenMock: vi.fn(),
-  createServerClientMock: vi.fn(),
-  getMspCustomerConsentUrlMock: vi.fn(),
-  signConsentStateMock: vi.fn(),
-  getBaseUrlMock: vi.fn(),
+const { auth, client, createAuditLog } = vi.hoisted(() => ({
+  auth: vi.fn(),
+  client: vi.fn(),
+  createAuditLog: vi.fn(async () => {}),
+}));
+vi.mock('@/lib/auth-utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/auth-utils')>()),
+  parseAccessToken: auth,
+}));
+vi.mock('@/lib/supabase', () => ({ createServerClient: client }));
+vi.mock('@/lib/msal-config', () => ({ getMspCustomerConsentUrl: () => 'https://login.example/adminconsent' }));
+vi.mock('@/lib/audit-logger', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/audit-logger')>()),
+  createAuditLog,
+  logTenantCreated: vi.fn(async (ctx, id, name) => createAuditLog({ ...ctx, action: 'tenant.created', resource_id: id, details: { display_name: name } })),
+  logTenantRemoved: vi.fn(async (ctx, id, name) => createAuditLog({ ...ctx, action: 'tenant.removed', resource_id: id, details: { display_name: name } })),
 }));
 
-vi.mock('@/lib/auth-utils', () => ({
-  parseAccessToken: parseAccessTokenMock,
-  signConsentState: signConsentStateMock,
-  getBaseUrl: getBaseUrlMock,
-}));
+import { createFakeSupabase } from '@/lib/msp/test-support/fake-supabase';
+import { DELETE, POST } from './route';
+import { POST as consentUrl } from './[id]/consent-url/route';
 
-vi.mock('@/lib/msal-config', () => ({
-  getMspCustomerConsentUrl: getMspCustomerConsentUrlMock,
-}));
+const ORG = 'org-1';
+const PRIMARY = 'primary-tenant';
+const CUSTOMER = 'customer-tenant';
 
-vi.mock('@/lib/supabase', () => ({
-  createServerClient: createServerClientMock,
-}));
-
-import {
-  DELETE as deleteTenant,
-  POST as addTenant,
-} from '@/app/api/msp/tenants/route';
-import { POST as regenerateConsentUrl } from '@/app/api/msp/tenants/[id]/consent-url/route';
-
-interface SupabaseCall {
-  table: string;
-  operation: string;
-  value?: unknown;
+function world(role: string) {
+  return createFakeSupabase({
+    msp_user_memberships: [
+      { user_id: 'u1', msp_organization_id: ORG, access_mode: 'full', role, msp_organizations: { is_active: true, primary_tenant_id: PRIMARY } },
+      { user_id: 'u2', msp_organization_id: ORG, access_mode: 'full', role: 'operator', msp_organizations: { is_active: true, primary_tenant_id: PRIMARY } },
+    ],
+    msp_organizations: [{ id: ORG, primary_tenant_id: PRIMARY }],
+    msp_managed_tenants: [
+      { id: 'rec-1', msp_organization_id: ORG, tenant_id: CUSTOMER, display_name: 'Customer', consent_status: 'granted', is_active: true },
+      { id: 'rec-2', msp_organization_id: ORG, tenant_id: null, display_name: 'Waiting', consent_status: 'pending', is_active: true },
+    ],
+    app_update_policies: [
+      { id: 'p1', user_id: 'u2', tenant_id: CUSTOMER, is_enabled: true },
+      { id: 'p2', user_id: 'u2', tenant_id: PRIMARY, is_enabled: true },
+      // A user of the customer who is not in the MSP: never touched.
+      { id: 'p3', user_id: 'customer-admin', tenant_id: CUSTOMER, is_enabled: true },
+    ],
+  });
 }
 
-const calls: SupabaseCall[] = [];
-const membershipSelects: string[] = [];
-let currentRole = 'viewer';
-
-function createQuery(table: string) {
-  let operation = 'select';
-  const query = {
-    select(value: string) {
-      calls.push({ table, operation: 'select', value });
-      if (table === 'msp_user_memberships') {
-        membershipSelects.push(value);
-      }
-      return query;
-    },
-    eq(column: string, value: unknown) {
-      calls.push({ table, operation: 'eq', value: { column, value } });
-      if (operation === 'update' && table === 'msp_managed_tenants') {
-        return Promise.resolve({ error: null });
-      }
-      return query;
-    },
-    insert(value: unknown) {
-      operation = 'insert';
-      calls.push({ table, operation: 'insert', value });
-      return query;
-    },
-    update(value: unknown) {
-      operation = 'update';
-      calls.push({ table, operation: 'update', value });
-      return query;
-    },
-    single() {
-      calls.push({ table, operation: 'single' });
-      if (table === 'msp_user_memberships') {
-        return Promise.resolve({
-          data: {
-            msp_organization_id: 'msp-org-1',
-            access_mode: 'full',
-            role: currentRole,
-            msp_organizations: {
-              is_active: true,
-              primary_tenant_id: 'primary-tenant',
-            },
-          },
-          error: null,
-        });
-      }
-      if (table === 'msp_managed_tenants' && operation === 'insert') {
-        return Promise.resolve({
-          data: {
-            id: 'tenant-record-new',
-            msp_organization_id: 'msp-org-1',
-            display_name: 'Customer Tenant',
-            consent_status: 'pending',
-            is_active: true,
-          },
-          error: null,
-        });
-      }
-      if (table === 'msp_managed_tenants') {
-        return Promise.resolve({
-          data: {
-            id: 'tenant-record-1',
-            msp_organization_id: 'msp-org-1',
-            tenant_id: 'customer-tenant',
-            display_name: 'Existing Customer',
-            consent_status: 'pending',
-            is_active: true,
-          },
-          error: null,
-        });
-      }
-      if (table === 'msp_organizations') {
-        return Promise.resolve({
-          data: { primary_tenant_id: 'primary-tenant' },
-          error: null,
-        });
-      }
-      return Promise.resolve({ data: null, error: null });
-    },
-  };
-  return query;
+function request(method: string, url: string, body?: unknown) {
+  return new NextRequest(url, {
+    method,
+    headers: { 'content-type': 'application/json', authorization: 'Bearer token' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  calls.length = 0;
-  membershipSelects.length = 0;
-  currentRole = 'viewer';
-  parseAccessTokenMock.mockResolvedValue({
-    userId: 'viewer-user',
-    userEmail: 'viewer@example.test',
-    tenantId: 'primary-tenant',
-    userName: 'Viewer',
-  });
-  createServerClientMock.mockReturnValue({
-    from: vi.fn((table: string) => createQuery(table)),
-  });
-  getBaseUrlMock.mockReturnValue('https://app.example.test');
-  signConsentStateMock.mockReturnValue('signed-state');
-  getMspCustomerConsentUrlMock.mockReturnValue('https://login.example.test/consent');
+  vi.stubEnv('MSP_STATE_SECRET', 'unit-test-secret');
+  auth.mockResolvedValue({ userId: 'u1', userEmail: 'u1@msp.example', tenantId: PRIMARY, userName: null });
+  createAuditLog.mockClear();
 });
 
-describe('MSP tenant management role permissions', () => {
-  it('blocks a viewer membership from adding a pending customer tenant', async () => {
-    const request = new NextRequest('http://localhost/api/msp/tenants', {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer viewer-token',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ display_name: 'Customer Tenant' }),
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe('MSP tenant management needs the manage_tenants permission', () => {
+  it.each(['viewer', 'operator'])('refuses a %s adding, removing or relinking a tenant', async (role) => {
+    const db = world(role);
+    client.mockReturnValue(db.client);
+
+    const add = await POST(request('POST', 'https://app.example/api/msp/tenants', { display_name: 'New customer' }));
+    const remove = await DELETE(request('DELETE', 'https://app.example/api/msp/tenants?id=rec-1'));
+    const link = await consentUrl(request('POST', 'https://app.example/api/msp/tenants/rec-2/consent-url'), {
+      params: Promise.resolve({ id: 'rec-2' }),
     });
 
-    const response = await addTenant(request);
-    const body = await response.json();
-
-    expect(response.status).toBe(403);
-    expect(body.error).toContain('permission');
-    expect(calls).not.toContainEqual(
-      expect.objectContaining({
-        table: 'msp_managed_tenants',
-        operation: 'insert',
-      })
-    );
-    expect(membershipSelects[0]).toContain('role');
+    expect([add.status, remove.status, link.status]).toEqual([403, 403, 403]);
+    expect(db.writes).toEqual([]);
+    expect(createAuditLog).not.toHaveBeenCalled();
   });
 
-  it('blocks a viewer membership from regenerating a consent URL', async () => {
-    const request = new NextRequest('http://localhost/api/msp/tenants/tenant-record-1/consent-url', {
-      method: 'POST',
-      headers: { Authorization: 'Bearer viewer-token' },
-    });
+  it.each(['admin', 'owner'])('lets a %s add a tenant and records it', async (role) => {
+    const db = world(role);
+    client.mockReturnValue(db.client);
 
-    const response = await regenerateConsentUrl(request, {
-      params: Promise.resolve({ id: 'tenant-record-1' }),
-    });
-    const body = await response.json();
-
-    expect(response.status).toBe(403);
-    expect(body.error).toContain('permission');
-    expect(getMspCustomerConsentUrlMock).not.toHaveBeenCalled();
-    expect(membershipSelects[0]).toContain('role');
-  });
-
-  it('blocks a viewer membership from soft-deleting an existing managed tenant', async () => {
-    const request = new NextRequest('http://localhost/api/msp/tenants?id=tenant-record-1', {
-      method: 'DELETE',
-      headers: { Authorization: 'Bearer viewer-token' },
-    });
-
-    const response = await deleteTenant(request);
-    const body = await response.json();
-
-    expect(response.status).toBe(403);
-    expect(body.error).toContain('permission');
-    expect(calls).not.toContainEqual(
-      expect.objectContaining({
-        table: 'msp_managed_tenants',
-        operation: 'update',
-        value: expect.objectContaining({ is_active: false }),
-      })
-    );
-    expect(membershipSelects[0]).toContain('role');
-  });
-
-  it('blocks an operator membership from adding a pending customer tenant', async () => {
-    currentRole = 'operator';
-    const request = new NextRequest('http://localhost/api/msp/tenants', {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer operator-token',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ display_name: 'Customer Tenant' }),
-    });
-
-    const response = await addTenant(request);
-
-    expect(response.status).toBe(403);
-    expect(calls).not.toContainEqual(
-      expect.objectContaining({ table: 'msp_managed_tenants', operation: 'insert' })
-    );
-  });
-
-  it('still allows an admin membership to add a pending customer tenant', async () => {
-    currentRole = 'admin';
-    const request = new NextRequest('http://localhost/api/msp/tenants', {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer admin-token',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ display_name: 'Customer Tenant' }),
-    });
-
-    const response = await addTenant(request);
-    const body = await response.json();
+    const response = await POST(request('POST', 'https://app.example/api/msp/tenants', { display_name: 'New customer' }));
 
     expect(response.status).toBe(201);
-    expect(body.tenant.id).toBe('tenant-record-new');
-    expect(body.consentUrl).toBe('https://login.example.test/consent');
+    expect(db.tables.msp_managed_tenants).toHaveLength(3);
+    expect(createAuditLog).toHaveBeenCalledWith(expect.objectContaining({ action: 'tenant.created', organization_id: ORG, user_id: 'u1' }));
+  });
+
+  it('removing a tenant switches off the team policies for it and nothing else', async () => {
+    const db = world('admin');
+    client.mockReturnValue(db.client);
+
+    const response = await DELETE(request('DELETE', 'https://app.example/api/msp/tenants?id=rec-1'));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ success: true, disabled_policies: 1 });
+    expect(db.tables.msp_managed_tenants[0].is_active).toBe(false);
+    const enabled = Object.fromEntries(db.tables.app_update_policies.map((p) => [p.id, p.is_enabled]));
+    expect(enabled).toEqual({ p1: false, p2: true, p3: true });
+    expect(createAuditLog).toHaveBeenCalledWith(expect.objectContaining({ action: 'tenant.removed', resource_id: 'rec-1' }));
+  });
+
+  it('lets an admin generate a new consent link for a pending record', async () => {
+    const db = world('admin');
+    client.mockReturnValue(db.client);
+
+    const response = await consentUrl(request('POST', 'https://app.example/api/msp/tenants/rec-2/consent-url'), {
+      params: Promise.resolve({ id: 'rec-2' }),
+    });
+
+    expect(response.status).toBe(200);
   });
 });

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { isIntuneApprovalFailure } from '@/lib/intune-approval';
 import { T, Var } from "gt-next";
 import Link from 'next/link';
@@ -47,11 +47,20 @@ import { EspProfileSelector } from '@/components/EspProfileSelector';
 import { PageHeader, AnimatedStatCard, StatCardGrid, AnimatedEmptyState, SkeletonCard, SkeletonGrid } from '@/components/dashboard';
 import type { PackageAssignment } from '@/types/upload';
 import type { CustomerQaStatus } from '@/types/customer-qa';
+import { CustomerWaitOptions } from '@/components/CustomerWaitOptions';
+import { customerJobSnapshotKey, type CustomerJobSnapshot } from '@/lib/customer-wait-options';
+import {
+  ACTIVE_DEPLOYMENT_STATUSES,
+  SUCCEEDED_DEPLOYMENT_STATUSES,
+  FAILED_DEPLOYMENT_STATUSES,
+  TERMINAL_DEPLOYMENT_STATUSES,
+} from '@/lib/deployment-status-groups';
 
 interface PackagingJob {
   qa_status?: CustomerQaStatus;
   id: string;
   user_id: string;
+  tenant_id?: string;
   user_email?: string | null;
   winget_id: string;
   version: string;
@@ -106,11 +115,14 @@ function formatRelativeTime(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString();
 }
 
+const PROGRESS_JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ACTIVE_JOB_STATUSES = ACTIVE_DEPLOYMENT_STATUSES;
+
 export default function UploadsPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const { user, getAccessToken, signIn } = useMicrosoftAuth();
-  const { isMspUser, selectedTenantId } = useMspOptional();
+  const { isMspUser, selectedTenantId, managedTenants } = useMspOptional();
   const prefersReducedMotion = useReducedMotion();
 
   const [jobs, setJobs] = useState<PackagingJob[]>([]);
@@ -118,12 +130,14 @@ export default function UploadsPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
+  const cancellingJob = useRef<string | null>(null);
   const [redeployingJobId, setRedeployingJobId] = useState<string | null>(null);
   const [isClearingHistory, setIsClearingHistory] = useState(false);
   const [sessionExpired, setSessionExpired] = useState(false);
 
   // Get job IDs and status filter from URL params
-  const highlightedJobIds = searchParams.get('jobs')?.split(',') || [];
+  const highlightedJobsParam = useMemo(() => searchParams.get('jobs') || '', [searchParams]);
+  const highlightedJobIds = highlightedJobsParam.split(',').filter(Boolean);
   const urlStatus = searchParams.get('status');
   const initialFilter = (['all', 'active', 'completed', 'failed', 'pending'] as const).includes(
     urlStatus as 'all' | 'active' | 'completed' | 'failed' | 'pending'
@@ -134,14 +148,22 @@ export default function UploadsPage() {
   // 'mine' shows the signed-in user's deployments; 'tenant' shows everyone's in
   // the tenant so a team can avoid deploying the same app twice.
   const [viewScope, setViewScope] = useState<'mine' | 'tenant'>('mine');
+  const [jobsSnapshotKey, setJobsSnapshotKey] = useState<string | null>(null);
+  const jobScope = { viewScope, isMspUser, selectedTenantId, userId: user?.id, userTenantId: user?.tenantId };
+  const redeployScope = useRef(jobScope);
+  useLayoutEffect(() => { redeployScope.current = jobScope; });
+  const waitOptionsContext: CustomerJobSnapshot = { scope: jobScope, snapshotKey: jobsSnapshotKey, isLoading, error, sessionExpired };
 
   const jobsRequest = useRef<AbortController | null>(null);
-  useEffect(() => () => { jobsRequest.current?.abort(); jobsRequest.current = null; }, [viewScope, isMspUser, selectedTenantId, user?.id, user?.tenantId]);
+  const progressJobs = useRef(new Map<string, { job: PackagingJob | null; fetchedAt: number; retryable?: boolean }>());
+  useEffect(() => () => { jobsRequest.current?.abort(); jobsRequest.current = null; progressJobs.current.clear(); }, [viewScope, isMspUser, selectedTenantId, user?.id, user?.tenantId, highlightedJobsParam]);
 
   const fetchJobs = useCallback(async (showRefreshing = false) => {
-    if (!user?.id || jobsRequest.current) return;
+    const requestUserId = user?.id;
+    if (!requestUserId || jobsRequest.current) return;
     const controller = new AbortController();
     jobsRequest.current = controller;
+    const requestSnapshotKey = customerJobSnapshotKey({ viewScope, isMspUser, selectedTenantId, userId: user?.id, userTenantId: user?.tenantId });
 
     if (showRefreshing) {
       setIsRefreshing(true);
@@ -184,7 +206,36 @@ export default function UploadsPage() {
 
       const data = await response.json();
       if (controller.signal.aborted) return;
-      setJobs(data.jobs || []);
+      const listedJobs: PackagingJob[] = Array.isArray(data.jobs) ? data.jobs : [];
+      const merged = new Map(listedJobs.map(job => [job.id, job]));
+      if (viewScope === 'mine') {
+        const requested = [...new Set(highlightedJobsParam.split(',').filter(id => PROGRESS_JOB_ID.test(id)))];
+        const cache = progressJobs.current;
+        const pending = requested.filter(id => !merged.has(id) && (!cache.has(id) || cache.get(id)?.retryable || (cache.get(id)?.job && ACTIVE_JOB_STATUSES.includes(cache.get(id)!.job!.status))))
+          .sort((a, b) => Number(cache.has(a)) - Number(cache.has(b)) || (cache.get(a)?.fetchedAt ?? 0) - (cache.get(b)?.fetchedAt ?? 0)).slice(0, 4);
+        await Promise.all(pending.map(async id => {
+          try {
+            const extra = await fetch(`/api/package?jobId=${encodeURIComponent(id)}`, { signal: controller.signal, headers: { Authorization: `Bearer ${accessToken}` } });
+            if (!extra.ok) {
+              if (!controller.signal.aborted) cache.set(id, { job: cache.get(id)?.job ?? null, fetchedAt: Date.now(), retryable: extra.status !== 404 });
+              return;
+            }
+            const detail = await extra.json();
+            if (controller.signal.aborted) return;
+            const job = detail?.job as (PackagingJob & { archived_at?: string | null }) | undefined;
+            cache.set(id, { job: job && job.id === id && job.user_id === requestUserId && !job.archived_at ? job : null, fetchedAt: Date.now() });
+          } catch {
+            if (!controller.signal.aborted) cache.set(id, { job: cache.get(id)?.job ?? null, fetchedAt: Date.now(), retryable: true });
+          }
+        }));
+        if (controller.signal.aborted) return;
+        for (const id of requested) {
+          const job = cache.get(id)?.job;
+          if (job && !merged.has(id)) merged.set(id, job);
+        }
+      }
+      setJobs([...merged.values()]);
+      setJobsSnapshotKey(requestSnapshotKey);
       setError(null);
       setSessionExpired(false);
     } catch (err) {
@@ -198,7 +249,7 @@ export default function UploadsPage() {
         setIsRefreshing(false);
       }
     }
-  }, [user?.id, getAccessToken, viewScope, isMspUser, selectedTenantId]);
+  }, [user?.id, user?.tenantId, getAccessToken, viewScope, isMspUser, selectedTenantId, highlightedJobsParam]);
 
   // Initial load
   useEffect(() => {
@@ -209,10 +260,11 @@ export default function UploadsPage() {
   // background poll less often and a manual refresh remains available.
   useEffect(() => {
     const hasActiveJobs = jobs.some((job) =>
-      ['blocked_upstream', 'awaiting_qa', 'queued', 'packaging', 'uploading'].includes(job.status)
+      ACTIVE_JOB_STATUSES.includes(job.status)
     );
 
-    if (!hasActiveJobs || sessionExpired) return;
+    const unresolvedProgress = viewScope === 'mine' && highlightedJobsParam.split(',').some(id => PROGRESS_JOB_ID.test(id) && !jobs.some(job => job.id === id) && (!progressJobs.current.has(id) || progressJobs.current.get(id)?.retryable));
+    if ((!hasActiveJobs && !unresolvedProgress) || sessionExpired) return;
 
     let interval: ReturnType<typeof setInterval>;
     const schedule = () => {
@@ -222,7 +274,7 @@ export default function UploadsPage() {
     schedule();
     document.addEventListener('visibilitychange', schedule);
     return () => { clearInterval(interval); document.removeEventListener('visibilitychange', schedule); };
-  }, [jobs, fetchJobs, sessionExpired]);
+  }, [jobs, fetchJobs, sessionExpired, viewScope, highlightedJobsParam]);
 
   const handleSignInAgain = async () => {
     try {
@@ -239,36 +291,41 @@ export default function UploadsPage() {
   };
 
   const handleCancelJob = async (jobId: string, dismiss?: boolean) => {
-    const accessToken = await getAccessToken();
-    if (!accessToken) return;
-
-    // Optimistic UI update: immediately update state so the dialog closes fast
-    const previousJobs = jobs;
-    if (dismiss) {
-      // For dismiss, remove the job from the list immediately
-      setJobs((prev) => prev.filter((j) => j.id !== jobId));
-    } else {
-      // For cancel, mark as cancelled immediately
-      setJobs((prev) =>
-        prev.map((j) =>
-          j.id === jobId
-            ? { ...j, status: 'cancelled' as const, cancelled_at: new Date().toISOString() }
-            : j
-        )
-      );
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    if (!user?.id || job?.user_id !== user.id) {
+      setError('Only the deployment owner can cancel or dismiss this job.');
+      return;
     }
-
-    // Fire the API call in the background
+    if (cancellingJob.current) {
+      setError('Wait for the current deployment action to finish before starting another.');
+      return;
+    }
+    const requestScopeKey = customerJobSnapshotKey(redeployScope.current);
+    if (!requestScopeKey || jobsSnapshotKey !== requestScopeKey) {
+      setError('Refresh deployments before cancelling or dismissing a job in this view.');
+      return;
+    }
+    const isCurrentScope = () => customerJobSnapshotKey(redeployScope.current) === requestScopeKey;
+    cancellingJob.current = jobId;
+    setCancellingJobId(jobId);
     try {
+      const accessToken = await getAccessToken();
+      if (!isCurrentScope()) {
+        setError('The deployment view changed. Refresh deployments before trying again.');
+        return;
+      }
+      if (!accessToken) {
+        setSessionExpired(true);
+        return;
+      }
+      // Keep server rows intact while the action is pending. Polling can update
+      // them in the meantime, and failures must never restore an older list.
       const response = await fetch('/api/package/cancel', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${accessToken}`,
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
         body: JSON.stringify({ jobId, dismiss }),
       });
-
+      if (!isCurrentScope()) return;
       if (!response.ok) {
         const contentType = response.headers.get('content-type');
         if (contentType?.includes('application/json')) {
@@ -277,14 +334,18 @@ export default function UploadsPage() {
         }
         throw new Error(`Failed to cancel job (${response.status})`);
       }
-
-      // Silently sync with server to pick up any fields set by the backend
+      if (dismiss) {
+        progressJobs.current.delete(jobId);
+        setJobs((currentJobs) => currentJobs.filter((candidate) => candidate.id !== jobId));
+      }
       fetchJobs();
     } catch (err) {
-      // Revert optimistic update on failure
-      setJobs(previousJobs);
+      if (!isCurrentScope()) return;
       console.error('Failed to cancel job:', err);
       setError(err instanceof Error ? err.message : `Failed to ${dismiss ? 'dismiss' : 'cancel'} job`);
+    } finally {
+      cancellingJob.current = null;
+      setCancellingJobId(null);
     }
   };
 
@@ -312,6 +373,7 @@ export default function UploadsPage() {
         throw new Error(`Failed to clear history (${response.status})`);
       }
 
+      progressJobs.current.clear();
       await fetchJobs();
     } catch (err) {
       console.error('Failed to clear history:', err);
@@ -322,8 +384,24 @@ export default function UploadsPage() {
   };
 
   const handleRedeploy = async (job: PackagingJob, forceCreate = false) => {
+    const requestScopeKey = customerJobSnapshotKey(redeployScope.current);
+    const matchesOriginalTenant = () => {
+      const scope = redeployScope.current;
+      const targetTenant = scope.isMspUser && scope.selectedTenantId ? scope.selectedTenantId : scope.userTenantId;
+      return Boolean(job.tenant_id && job.user_id === scope.userId && job.tenant_id === targetTenant
+        && requestScopeKey && requestScopeKey === customerJobSnapshotKey(scope));
+    };
+    if (!matchesOriginalTenant()) {
+      setError('Select the original tenant and account before retrying this deployment.');
+      return;
+    }
     const accessToken = await getAccessToken();
     if (!accessToken) return;
+    // Authentication can outlive an account or tenant selection change.
+    if (!matchesOriginalTenant()) {
+      setError('Select the original tenant and account before retrying this deployment.');
+      return;
+    }
     if (!job.package_config) {
       setError('The original package configuration is unavailable. Create a new deployment from the catalog.');
       return;
@@ -336,6 +414,7 @@ export default function UploadsPage() {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${accessToken}`,
+          ...(isMspUser ? { 'X-MSP-Tenant-Id': job.tenant_id! } : {}),
         },
         body: JSON.stringify({
           items: [job.package_config],
@@ -366,11 +445,11 @@ export default function UploadsPage() {
   const filteredJobs = jobs.filter((job) => {
     switch (filter) {
       case 'active':
-        return ['blocked_upstream', 'awaiting_qa', 'queued', 'packaging', 'uploading'].includes(job.status);
+        return ACTIVE_DEPLOYMENT_STATUSES.includes(job.status);
       case 'completed':
-        return ['completed', 'deployed', 'duplicate_skipped'].includes(job.status);
+        return SUCCEEDED_DEPLOYMENT_STATUSES.includes(job.status);
       case 'failed':
-        return ['failed', 'cancelled'].includes(job.status);
+        return FAILED_DEPLOYMENT_STATUSES.includes(job.status);
       default:
         return true;
     }
@@ -379,10 +458,10 @@ export default function UploadsPage() {
   const stats = {
     total: jobs.length,
     active: jobs.filter((j) =>
-      ['blocked_upstream', 'awaiting_qa', 'queued', 'packaging', 'uploading'].includes(j.status)
+      ACTIVE_DEPLOYMENT_STATUSES.includes(j.status)
     ).length,
-    completed: jobs.filter((j) => ['completed', 'deployed', 'duplicate_skipped'].includes(j.status)).length,
-    failed: jobs.filter((j) => ['qa_failed', 'failed'].includes(j.status)).length,
+    completed: jobs.filter((j) => SUCCEEDED_DEPLOYMENT_STATUSES.includes(j.status)).length,
+    failed: jobs.filter((j) => FAILED_DEPLOYMENT_STATUSES.includes(j.status)).length,
   };
 
   const filterButtons = ['all', 'active', 'completed', 'failed'] as const;
@@ -415,7 +494,7 @@ export default function UploadsPage() {
         badge={stats.active > 0 ? { text: <T>Live</T>, variant: 'success' as const } : undefined}
         actions={
           <div className="flex items-center gap-2">
-            {(stats.completed + stats.failed) > 0 && (
+            {jobs.some(job => TERMINAL_DEPLOYMENT_STATUSES.includes(job.status)) && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button
@@ -435,7 +514,7 @@ export default function UploadsPage() {
                   <AlertDialogHeader>
                     <AlertDialogTitle><T>Clear Upload History?</T></AlertDialogTitle>
                     <AlertDialogDescription>
-                      <T>This hides completed, failed, cancelled, and deployed jobs from this page. Deployment audit and update records are preserved. Active jobs are not affected.</T>
+                      <T>This hides completed, stopped, failed, cancelled, and deployed jobs from this page. Deployment audit and update records are preserved. Active jobs are not affected.</T>
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
@@ -646,6 +725,7 @@ export default function UploadsPage() {
               <UploadJobCard
                 key={job.id}
                 job={job}
+                currentUserId={user?.id}
                 index={index}
                 isHighlighted={highlightedJobIds.includes(job.id)}
                 onCancel={handleCancelJob}
@@ -653,6 +733,8 @@ export default function UploadsPage() {
                 onRedeploy={handleRedeploy}
                 isRedeploying={redeployingJobId === job.id}
                 showOwner={viewScope === 'tenant'}
+                tenantLabel={managedTenants?.find(tenant => tenant.tenant_id === job.tenant_id)?.display_name || job.tenant_id || null}
+                waitOptionsContext={waitOptionsContext}
               />
             ))}
           </AnimatePresence>
@@ -664,6 +746,7 @@ export default function UploadsPage() {
 
 function UploadJobCard({
   job,
+  currentUserId,
   index,
   isHighlighted,
   onCancel,
@@ -671,8 +754,11 @@ function UploadJobCard({
   onRedeploy,
   isRedeploying,
   showOwner,
+  waitOptionsContext,
+  tenantLabel,
 }: {
   job: PackagingJob;
+  currentUserId?: string;
   index: number;
   isHighlighted?: boolean;
   onCancel: (jobId: string, dismiss?: boolean) => void;
@@ -680,9 +766,15 @@ function UploadJobCard({
   onRedeploy: (job: PackagingJob, forceCreate?: boolean) => void;
   isRedeploying?: boolean;
   showOwner?: boolean;
+  waitOptionsContext: CustomerJobSnapshot;
+  tenantLabel: string | null;
 }) {
   const prefersReducedMotion = useReducedMotion();
 
+  const securityBlocked = job.status === 'qa_failed' && job.qa_status?.category === 'installer_security_hold';
+  const availabilityCode = job.status === 'qa_failed' && job.qa_status?.category === 'unavailable'
+    && (job.qa_status.reasonCode === 'VERSION_UNAVAILABLE' || job.qa_status.reasonCode === 'PACKAGE_UNAVAILABLE' || job.qa_status.reasonCode === 'ARCHITECTURE_UNAVAILABLE')
+    ? job.qa_status.reasonCode : null;
   const statusConfig = {
     blocked_upstream: { icon: Clock, label: 'Blocked upstream', color: 'text-status-warning', bg: 'bg-status-warning/10', border: 'border-l-status-warning' },
     awaiting_qa: {
@@ -697,7 +789,10 @@ function UploadJobCard({
     },
     qa_failed: {
       icon: XCircle,
-      label: 'Installation test failed',
+      label: securityBlocked ? 'Security check blocked deployment'
+        : availabilityCode === 'PACKAGE_UNAVAILABLE' ? 'App not available'
+          : availabilityCode === 'VERSION_UNAVAILABLE' ? 'App version not available'
+            : availabilityCode === 'ARCHITECTURE_UNAVAILABLE' ? <T>App architecture not available</T> : <T>Deployment stopped</T>,
       color: 'text-status-error',
       bg: 'bg-status-error/10',
       border: 'border-l-status-error',
@@ -762,12 +857,12 @@ function UploadJobCard({
 
   const config = statusConfig[job.status] || statusConfig.queued;
   const StatusIcon = config.icon;
-  const isActive = ['blocked_upstream', 'awaiting_qa', 'queued', 'packaging', 'uploading'].includes(job.status);
+  const isActive = ACTIVE_DEPLOYMENT_STATUSES.includes(job.status);
   const isStale = !['blocked_upstream', 'awaiting_qa'].includes(job.status) && isActive && (Date.now() - new Date(job.updated_at).getTime()) > 75 * 60 * 1000;
   // Allow cancelling active jobs or dismissing completed/failed jobs
-  const isCancellable = ['blocked_upstream', 'awaiting_qa', 'queued', 'packaging', 'uploading'].includes(job.status);
+  const isCancellable = ACTIVE_DEPLOYMENT_STATUSES.includes(job.status);
   const isDismissable = ['qa_failed', 'completed', 'failed', 'duplicate_skipped', 'deployed'].includes(job.status);
-  const canRemove = isCancellable || isDismissable;
+  const canRemove = !!currentUserId && job.user_id === currentUserId && (isCancellable || isDismissable);
 
   const itemVariants = {
     hidden: { opacity: 0, y: prefersReducedMotion ? 0 : 20 },
@@ -833,6 +928,9 @@ function UploadJobCard({
                   <><span className="text-overlay/20"> | </span>v{job.version}</>
                 )}
                 <span className="text-overlay/20"> | </span>{job.architecture}
+              </p>
+              <p className="text-text-muted text-xs mt-0.5">
+                {tenantLabel ? <T>Tenant: <Var>{tenantLabel}</Var></T> : <T>Destination tenant unavailable</T>}
               </p>
               {showOwner && job.user_email && (
                 <p className="text-text-muted text-xs mt-0.5">
@@ -984,14 +1082,17 @@ function UploadJobCard({
             <span title={job.id} translate="no">Support ID: {job.id.slice(0, 8)}</span>
           </div>
 
+          <CustomerWaitOptions job={job} context={waitOptionsContext} />
+
           {/* Error message */}
           {['failed', 'qa_failed'].includes(job.status) && (job.error_message || job.error_code || job.status_message) && (
             <ErrorDisplay
-              errorMessage={job.error_message || job.status_message}
+              errorMessage={availabilityCode ? job.qa_status?.message : (job.error_message || job.status_message)}
               errorStage={job.error_stage}
               errorCategory={job.error_category}
-              errorCode={job.error_code}
+              errorCode={availabilityCode || job.error_code}
               errorDetails={job.error_details}
+              securityBlocked={securityBlocked}
             />
           )}
 
@@ -1062,11 +1163,12 @@ function UploadJobCard({
                         <T>View existing app</T>
                       </a>
                     )}
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
                     <Button
                       size="sm"
                       variant="outline"
                       className="border-accent-cyan/30 text-accent-cyan hover:bg-accent-cyan/10 hover:border-accent-cyan/50 text-xs"
-                      onClick={() => onRedeploy(job, true)}
                       disabled={isRedeploying}
                     >
                       {isRedeploying ? (
@@ -1076,6 +1178,20 @@ function UploadJobCard({
                       )}
                       <T>Deploy as new app anyway</T>
                     </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle><T>Create a second Intune app?</T></AlertDialogTitle>
+                          <AlertDialogDescription>
+                            <T><Var>{job.display_name}</Var> already exists in this tenant. Deploying it again creates a separate app with its own assignments.</T>
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel><T>Keep existing app</T></AlertDialogCancel>
+                          <AlertDialogAction onClick={() => onRedeploy(job, true)}><T>Deploy as new app</T></AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                   </div>
                 </div>
               </div>

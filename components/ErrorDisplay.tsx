@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { T } from 'gt-next';
 import {
   AlertCircle,
   Download,
@@ -38,6 +39,7 @@ interface ErrorDisplayProps {
   errorCategory?: string | null;
   errorCode?: string | null;
   errorDetails?: ErrorDetails | null;
+  securityBlocked?: boolean;
 }
 
 const stageConfig: Record<string, { icon: typeof Download; label: string }> = {
@@ -122,6 +124,7 @@ export function ErrorDisplay({
   errorCategory,
   errorCode,
   errorDetails,
+  securityBlocked = false,
 }: ErrorDisplayProps) {
   // Fallback to basic display if no structured error data
   if (!errorCode && !errorStage && !errorCategory) {
@@ -153,14 +156,39 @@ export function ErrorDisplay({
   }
 
   const qaFailed = errorCode === 'QA_FAILED_EXECUTION_PROFILE';
-  const stage = qaFailed ? { ...stageConfig.validation, label: 'Installation check' } : stageConfig[errorStage || 'unknown'] || stageConfig.unknown;
+  const blockedBeforeTest = qaFailed && securityBlocked;
+  const displayErrorMessage = blockedBeforeTest
+    ? 'A security check stopped this deployment before the installation test ran.' : errorMessage;
+  const architectureUnavailable = errorCode === 'ARCHITECTURE_UNAVAILABLE';
+  const unavailable = errorCode === 'VERSION_UNAVAILABLE' || errorCode === 'PACKAGE_UNAVAILABLE' || architectureUnavailable;
+  const unsupportedDependency = errorCode === 'DEPENDENCY_NOT_SUPPORTED';
+  const terminalManifestFailure = ['MANIFEST_UNAVAILABLE', 'INSTALLER_TYPE_UNAVAILABLE', 'INSTALL_SCOPE_UNAVAILABLE', 'SILENT_INSTALL_UNAVAILABLE'].includes(errorCode || '');
+  const stage = unavailable ? { ...stageConfig.validation, label: architectureUnavailable ? <T>Architecture not available</T> : 'Not available' } : unsupportedDependency ? { ...stageConfig.validation, label: 'Not supported yet' }
+    : qaFailed ? { ...stageConfig.validation, label: blockedBeforeTest ? 'Security check' : <T>Deployment validation</T> } : stageConfig[errorStage || 'unknown'] || stageConfig.unknown;
   const StageIcon = stage.icon;
   // Older QA failures were stored with the installer category, whose hint
-  // describes package creation. The exact QA code identifies the real stage.
+  // describes package creation. The QA code alone does not prove a test ran.
   const hint = qaFailed ? {
-    message: errorMessage?.includes('MANIFEST_CHANGED')
+    message: blockedBeforeTest
+      ? 'A security check stopped this deployment before the installation test ran.'
+      : errorMessage?.includes('MANIFEST_CHANGED')
       ? 'Refresh the app catalog and select the current version. The selected installer no longer matches the trusted manifest, so it was blocked before testing or packaging.'
-      : 'This package did not pass the installation check. Review the failure details above before trying another version or configuration.',
+      : <T>Deployment stopped during validation. Review the details above before trying again.</T>,
+    showReVerify: false,
+  } : unsupportedDependency ? {
+    message: 'This dependency is not supported for automated deployment yet.', showReVerify: false,
+  } : unavailable ? {
+    message: architectureUnavailable
+      ? <T>Automated deployment is not available for this architecture. This request did not run an installation test.</T>
+      : errorCode === 'PACKAGE_UNAVAILABLE'
+      ? 'This app is not available for automated deployment. This request did not run an installation test.'
+      : 'Select an available app version. This request did not run an installation test.',
+    showReVerify: false,
+  } : terminalManifestFailure ? {
+    message: <T>The selected package or installation settings could not be validated. Refresh the app catalog and review your selection before trying again.</T>,
+    showReVerify: false,
+  } : errorCode === 'QA_SECURITY_FLAGGED_CURRENT_VERSION' ? {
+    message: <T>Installer security checks stopped this deployment. Review the security status before trying again.</T>,
     showReVerify: false,
   } : categoryHints[errorCategory || ''];
   const codeMessage = errorCodeMessages[errorCode || ''];
@@ -189,7 +217,7 @@ export function ErrorDisplay({
 
       {/* Main error message */}
       <div className="text-sm text-status-error/90">
-        <p>{codeMessage || errorMessage || 'An error occurred'}</p>
+        <p>{codeMessage || displayErrorMessage || 'An error occurred'}</p>
       </div>
 
       {/* Hash mismatch details */}

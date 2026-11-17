@@ -13,6 +13,7 @@ import { buildCuratedCartItem } from '@/lib/curated-catalog/package';
 import { releaseFixture, signedFixture } from '@/lib/curated-catalog/test-fixtures';
 
 const {
+  notifyPaused,
   getQaResultMock,
   getAppForInstallerMock,
   getVersionInstallerInfoMock,
@@ -22,6 +23,7 @@ const {
   defaultApprovalFailuresMock,
   curatedState,
 } = vi.hoisted(() => ({
+  notifyPaused: vi.fn(),
   curatedState: { envelope: {} as Record<string, unknown>, acceptances: new Set<string>() },
   getQaResultMock: vi.fn(),
   getAppForInstallerMock: vi.fn(),
@@ -39,6 +41,7 @@ vi.mock('@/lib/manifest-api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/manifest-api')>()),
   fetchInstallerManifest: fetchInstallerManifestMock,
 }));
+vi.mock('@/lib/notification-service', () => ({ notifyAutoUpdatePaused: notifyPaused }));
 vi.mock('@/lib/catalog', () => ({
   getCatalogSource: () => ({
     getQaResult: getQaResultMock,
@@ -193,6 +196,38 @@ function makeTrigger(supabaseMock: ReturnType<typeof createSupabaseMock>): AutoU
 }
 
 describe('AutoUpdateTrigger psadtConfig handling', () => {
+  it.each([true, false])('persists the manual carry-over snapshot before dispatch: %s', async carryOverAssignments => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({
+      packaging_jobs: { insertSpy: insert, singleResult: { data: { id: 'snapshot-job' }, error: null } },
+    }));
+    const policy = makePolicy({ assignmentMigration: {
+      carryOverAssignments: !carryOverAssignments, removeAssignmentsFromPreviousApp: false,
+    } });
+    await trigger['createPackagingJob'](policy, UPDATE_INFO, 'snapshot-history', undefined, false, {
+      carryOverAssignments, removeAssignmentsFromPreviousApp: false,
+    });
+    expect(insert.mock.calls[0][0].package_config.assignmentMigration).toEqual({
+      carryOverAssignments, removeAssignmentsFromPreviousApp: false,
+    });
+    expect(policy.deployment_config.assignmentMigration?.carryOverAssignments).toBe(!carryOverAssignments);
+  });
+  it.each([true, false])('routes passed cron work through QA resume while preserving the manual default: %s', async admitViaQaResume => {
+    const insert = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({
+      packaging_jobs: { insertSpy: insert, singleResult: { data: { id: 'synthetic-job' }, error: null } },
+    }));
+    await trigger['createPackagingJob'](makePolicy({ displayName: 'Synthetic App', architecture: 'x64' }), UPDATE_INFO, 'synthetic-history', {
+      state: 'passed', candidateId: null,
+      identity: { executionProfileSha256: 'A'.repeat(64), presentationProfileSha256: 'B'.repeat(64) },
+    }, admitViaQaResume);
+    expect(insert).toHaveBeenCalledWith(expect.objectContaining({
+      status: admitViaQaResume ? 'awaiting_qa' : 'queued',
+      status_message: 'Installation test passed; preparing deployment',
+      execution_profile_sha256: 'A'.repeat(64), is_auto_update: true,
+    }));
+    expect(insert.mock.calls[0][0].qa_completed_at).not.toBeNull();
+  });
   it('holds fixed rules before any database, QA or rate limit work, including manual bypass options', async () => {
     const supabase = createSupabaseMock({});
     const config = zoomConfigForTrigger();
@@ -352,6 +387,40 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
         keyPath: 'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\Vivaldi_Vivaldi',
       })],
     });
+  });
+
+  it('does not inherit another installer family silent switch for a machine MSI', async () => {
+    getAppForInstallerMock.mockResolvedValue({ latest_version: '1.0', name: 'Mixed Installer' });
+    getVersionInstallerInfoMock.mockResolvedValue({
+      installer_url: 'https://example.invalid/setup.exe',
+      installer_sha256: 'A'.repeat(64),
+      installer_type: 'nullsoft',
+      silent_args: '/S',
+      installers: [
+        {
+          Architecture: 'x64',
+          InstallerType: 'nullsoft',
+          InstallerUrl: 'https://example.invalid/setup.exe',
+          InstallerSha256: 'A'.repeat(64),
+        },
+        {
+          Architecture: 'x64',
+          InstallerType: 'wix',
+          Scope: 'machine',
+          InstallerUrl: 'https://example.invalid/setup.msi',
+          InstallerSha256: 'B'.repeat(64),
+          InstallerSwitches: { InstallLocation: 'INSTALLDIR="<INSTALLPATH>"' },
+        },
+      ],
+    });
+
+    const result = await getLatestInstallerInfo({} as never, 'Example.MixedInstaller', 'x64', 'machine');
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('Expected machine MSI resolution');
+    expect(result.info.installerType).toBe('wix');
+    expect(result.info.silentSwitches).toBe('/qn /norestart ALLUSERS=1');
+    expect(result.info.installCommand).not.toMatch(/(^|\s)\/S(\s|$)/i);
   });
 
   it('selects the stored deployment scope when a release has user and machine variants', async () => {
@@ -735,9 +804,10 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
       installerType: 'msi',
       nestedInstallerType: undefined,
       nestedInstallerPath: undefined,
-    }, { skipRateLimits: true });
+    }, { skipRateLimits: true, admitViaQaResume: true });
 
     expect(result).toMatchObject({ success: true, packagingJobId: 'job-camera-hub' });
+    expect(createPackagingJobSpy.mock.calls[0][4]).toBe(true);
     const qaInput = ensureQaDemandMock.mock.calls[0][1] as {
       psadtConfig: string;
     };
@@ -1302,7 +1372,7 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
         user_profiles: { singleResult: { data: { email: 'user@example.com' }, error: null } },
         user_settings: {
           maybeSingleResult: {
-            data: { settings: { supersedePreviousApp: true } },
+            data: { settings: { carryOverAssignments: true, supersedePreviousApp: true } },
             error: null,
           },
         },
@@ -1341,9 +1411,35 @@ describe('AutoUpdateTrigger psadtConfig handling', () => {
         package_config: Record<string, unknown>;
       };
       expect(jobData.package_config.relationships).toEqual(relationships);
+      expect(jobData.package_config.assignmentMigration).toEqual({
+        carryOverAssignments: true,
+        removeAssignmentsFromPreviousApp: false,
+      });
       expect(jobData.package_config.autoSupersede).toBe(true);
       expect(jobData.package_config.sourceIntuneAppId).toBe('prev-app-1');
       expect(jobData.package_config.supersedenceType).toBe('update');
+    });
+
+    it.each([true, false])('preserves old assignments for stored copy choice %s with legacy removal enabled', async (carryOverAssignments) => {
+      const insertSpy = vi.fn();
+      const supabase = createSupabaseMock({
+        user_profiles: { singleResult: { data: { email: 'user@example.com' }, error: null } },
+        user_settings: { maybeSingleResult: { data: { settings: { carryOverAssignments: !carryOverAssignments } }, error: null } },
+        packaging_jobs: { insertSpy, singleResult: { data: { id: 'job-legacy' }, error: null } },
+      });
+      const trigger = makeTrigger(supabase);
+      const policy = makePolicy({ assignmentMigration: {
+        carryOverAssignments,
+        removeAssignmentsFromPreviousApp: true,
+      } });
+      await (trigger as unknown as {
+        createPackagingJob: (p: AppUpdatePolicy, u: typeof UPDATE_INFO, h: string) => Promise<{ id: string }>;
+      }).createPackagingJob(policy, UPDATE_INFO, 'history-legacy');
+      expect(insertSpy.mock.calls[0][0].package_config.assignmentMigration).toEqual({
+        carryOverAssignments,
+        removeAssignmentsFromPreviousApp: false,
+      });
+      expect(policy.deployment_config.assignmentMigration?.removeAssignmentsFromPreviousApp).toBe(true);
     });
 
     it('does not flag auto-supersedence when the user setting is off', async () => {
@@ -1486,5 +1582,51 @@ describe('hosted automatic scope gate', () => {
     const result = await makeTrigger(supabase).triggerAutoUpdate(policy, { ...UPDATE_INFO, latestVersion: '1.0.1' }, { bypassUpdateScope: true });
     expect(result.error).toBe('No deployment configuration saved for this policy');
     expect(result.skipped).not.toBe(true);
+  });
+});
+
+
+describe('manual update failure tracking preserves stored policy choices', () => {
+  it.each(['auto_update', 'notify', 'ignore', 'pin_version'] as const)('only pauses a stored automatic policy: %s', async policyType => {
+    const updateSpy = vi.fn();
+    const trigger = makeTrigger(createSupabaseMock({ app_update_policies: {
+      singleResult: { data: { policy_type: policyType, consecutive_failures: 2 }, error: null }, updateSpy,
+    } }));
+    vi.spyOn(trigger as unknown as { verifyTenantConsent: () => Promise<boolean> }, 'verifyTenantConsent')
+      .mockRejectedValueOnce(new Error('synthetic consent read failure'));
+    const policy = { ...makePolicy({ displayName: 'App' }), consecutive_failures: 0 };
+    const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO,
+      { skipRateLimits: true, skipPriorDeploymentCheck: true });
+    expect(result).toMatchObject({ success: false, error: 'synthetic consent read failure' });
+    expect(updateSpy).toHaveBeenCalledOnce();
+    const change = updateSpy.mock.calls[0][0];
+    expect(change.consecutive_failures).toBe(3);
+    if (policyType === 'auto_update') expect(change.is_enabled).toBe(false);
+    else expect(change).not.toHaveProperty('is_enabled');
+  });
+});
+
+
+describe('trigger pause owner notices', () => {
+  it.each([['auto_update', true, true], ['auto_update', false, false], ['notify', true, false]] as const)('notifies the owner only on an enabled automatic pause: %s/%s', async (policyType, enabled, expected) => {
+    notifyPaused.mockClear();
+    const trigger = makeTrigger(createSupabaseMock({ app_update_policies: { singleResult: { data: { policy_type: policyType, is_enabled: enabled, consecutive_failures: 2, user_id: 'fixture-owner', winget_id: 'Fixture.App', tenant_id: 'fixture-tenant' }, error: null } } }));
+    await (trigger as unknown as { incrementFailureCount: (id: string, error: string) => Promise<void> }).incrementFailureCount('fixture-policy', 'Fixture failure');
+    expect(notifyPaused).toHaveBeenCalledTimes(expected ? 1 : 0);
+    if (expected) expect(notifyPaused).toHaveBeenCalledWith({ userId: 'fixture-owner', policyId: 'fixture-policy', wingetId: 'Fixture.App', tenantId: 'fixture-tenant', failures: 3, lastError: 'Fixture failure' });
+  });
+  it('records a created history row as failed when job creation throws', async () => {
+    const trigger = makeTrigger(createSupabaseMock({}));
+    const policy = { ...makePolicy({ displayName: 'Fixture app' }), consecutive_failures: 0 };
+    vi.spyOn(trigger as never, 'verifyTenantConsent' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensurePsadtConfig' as never).mockResolvedValue(true as never);
+    vi.spyOn(trigger as never, 'ensureCurrentPackageDefaults' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(trigger as never, 'createHistoryRecord' as never).mockResolvedValue({ id: 'fixture-history' } as never);
+    vi.spyOn(trigger as never, 'createPackagingJob' as never).mockRejectedValue(new Error('Fixture job failure') as never);
+    const failed = vi.spyOn(trigger, 'markUpdateFailed').mockResolvedValue();
+    ensureQaDemandMock.mockResolvedValue({ state: 'passed', identity: { executionProfileSha256: 'A'.repeat(64) } });
+    const result = await trigger.triggerAutoUpdate(policy, UPDATE_INFO, { skipRateLimits: true, skipPriorDeploymentCheck: true, bypassUpdateScope: true });
+    expect(result).toMatchObject({ success: false, error: 'Fixture job failure' });
+    expect(failed).toHaveBeenCalledWith('fixture-history', 'Fixture job failure');
   });
 });

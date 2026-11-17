@@ -308,11 +308,22 @@ export const MIGRATIONS: SqliteMigration[] = [
   },
   {
     version: 9,
+    name: 'authenticated callback run ownership',
+    up: db => addColumnIfMissing(db, 'packaging_jobs', 'callback_run_id', 'TEXT'),
+  },
+  {
+    version: 10,
     name: 'packager build, user settings and webhooks',
     up: (db) => {
-      // This was migration 6 on the fork until upstream claimed 6 to 8, so a
-      // fork database reports version 6 without upstream's migration 6 having
-      // run. Create its table here; on every other database it already exists.
+      // This was migration 9 on the fork until upstream claimed 9, so a fork
+      // database reports version 9 without upstream's migration 9 having run.
+      // Add its column here; on every other database it already exists.
+      addColumnIfMissing(db, 'packaging_jobs', 'callback_run_id', 'TEXT');
+
+      // Before that it was migration 6, until upstream claimed 6 to 8, so a
+      // fork database could report version 6 without upstream's migration 6
+      // having run. Create its table here; on every other database it already
+      // exists.
       db.exec(`CREATE TABLE IF NOT EXISTS custom_app_definitions (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,

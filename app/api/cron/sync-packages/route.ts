@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 import { createClient } from '@supabase/supabase-js';
 import {
   classifyWingetSyncRun,
@@ -7,7 +8,6 @@ import {
 } from '@/lib/winget-sync-resolution.mjs';
 import { normalizeInstaller, normalizeManifestInstallers } from '@/lib/manifest-api';
 import { selectAppsToSync } from './select-apps';
-import { isAuthorizedCronRequest } from '@/lib/cron-auth';
 
 const BATCH_SIZE = 10;
 const SYNC_STATUS_ID = 'sync-manifests-hot';
@@ -53,10 +53,11 @@ interface CuratedAppUpdate {
   license?: string;
   updated_at: string;
   upstream_miss_count: number;
+  is_verified?: boolean;
 }
 
 export async function GET(request: Request) {
-  // Verify cron secret
+  // Verify cron secret (Vercel adds this header for cron jobs)
   if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
@@ -139,7 +140,9 @@ export async function GET(request: Request) {
           try {
             const { winget_id, latest_version } = app;
 
-            const previous = process.env.GITHUB_PAT
+            // A blocked app must be fetched in full so a resolving package can
+            // lift its upstream_removed block; a 304 would skip that.
+            const previous = process.env.GITHUB_PAT && !app.upstream_removed_block
               ? previousValidator(previousStatus?.metadata, winget_id, latest_version, Date.now()) : null;
             if (previous) validatorsSent++;
             const listing = await manifestClient.fetchVersionsWithValidator(winget_id, previous?.etag ?? null);
@@ -245,6 +248,21 @@ export async function GET(request: Request) {
 
             const license = localeText(localeManifest?.License);
             if (license) appUpdate.license = license;
+
+            if (app.upstream_removed_block) {
+              // WinGet publishes the package again, so the earlier misses were
+              // transient. Lift the block before re-verifying: the eligibility
+              // trigger keeps is_verified false while any block row exists.
+              const { error: unblockError } = await supabase
+                .from('package_eligibility_blocks')
+                .delete()
+                .eq('winget_id', winget_id)
+                .eq('block_code', 'upstream_removed');
+              if (unblockError) {
+                throw new Error(`eligibility unblock failed: ${unblockError.message}`);
+              }
+              appUpdate.is_verified = true;
+            }
 
             const { error: appUpdateError } = await supabase
               .from('curated_apps')

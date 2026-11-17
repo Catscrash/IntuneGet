@@ -948,6 +948,62 @@ describe('buildQaCatalogTestConfig', () => {
     ]);
   });
 
+  it('tests UniClipboard in user context when its per-user NSIS manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'UniClipboard.UniClipboard',
+        name: 'UniClipboard',
+        publisher: 'UniClipboard',
+        version: '1.5.0',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        AppsAndFeaturesEntries: [{ DisplayName: 'UniClipboard 1.5.0' }],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\UniClipboard_UniClipboard',
+      }),
+    ]);
+  });
+
+  it('tests Orca in user context when its per-user NSIS manifest omits scope', () => {
+    const config = buildQaCatalogTestConfig({
+      app: {
+        wingetId: 'StablyAI.Orca',
+        name: 'Orca',
+        publisher: 'StablyAI',
+        version: '1.4.242',
+      },
+      manifest: {
+        InstallerType: 'nullsoft',
+        AppsAndFeaturesEntries: [{ DisplayName: 'Orca 1.4.242' }],
+      },
+      installer: {
+        Architecture: 'x64',
+        InstallerType: 'nullsoft',
+        InstallerSwitches: { Silent: '/S' },
+      },
+    });
+
+    expect(config.scope).toBe('user');
+    expect(config.detectionRules).toEqual([
+      expect.objectContaining({
+        keyPath:
+          'HKEY_CURRENT_USER\\SOFTWARE\\IntuneGet\\Apps\\StablyAI_Orca',
+      }),
+    ]);
+  });
+
   it('tests zyfun in machine context with Electron Builder all-users mode', () => {
     const config = buildQaCatalogTestConfig({
       app: {

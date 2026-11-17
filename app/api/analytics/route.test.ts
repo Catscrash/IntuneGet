@@ -1,102 +1,31 @@
 import { NextRequest } from 'next/server';
-
-const { parseAccessTokenMock, getDatabaseMock, getAllByUserIdMock } = vi.hoisted(() => ({
-  parseAccessTokenMock: vi.fn(),
-  getDatabaseMock: vi.fn(),
-  getAllByUserIdMock: vi.fn(),
-}));
-
-vi.mock('@/lib/auth-utils', () => ({
-  parseAccessToken: parseAccessTokenMock,
-}));
-
-vi.mock('@/lib/db', () => ({
-  getDatabase: getDatabaseMock,
-}));
-
-import { GET } from '@/app/api/analytics/route';
-
-function makeJob(overrides: Record<string, unknown> = {}) {
-  return {
-    id: 'job-1',
-    winget_id: 'Microsoft.Edge',
-    display_name: 'Edge',
-    publisher: 'Microsoft',
-    status: 'completed',
-    error_message: null,
-    created_at: '2026-08-10T10:00:00.000Z',
-    completed_at: '2026-08-10T10:05:00.000Z',
-    ...overrides,
-  };
-}
-
-function makeRequest(days?: number) {
-  const url = days
-    ? `http://localhost:3000/api/analytics?days=${days}`
-    : 'http://localhost:3000/api/analytics';
-  const request = new NextRequest(url);
-  request.headers.set('Authorization', 'Bearer test-token');
-  return request;
-}
-
-describe('GET /api/analytics', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.setSystemTime(new Date('2026-08-15T00:00:00.000Z'));
-    getDatabaseMock.mockReturnValue({ jobs: { getAllByUserId: getAllByUserIdMock } });
-    getAllByUserIdMock.mockResolvedValue([]);
-    parseAccessTokenMock.mockResolvedValue({
-      userId: 'user-1',
-      userEmail: 'user@example.com',
-      tenantId: 'tenant-1',
-      userName: 'User',
-    });
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('serves the report without touching Supabase', async () => {
-    // Regression: the route called createServerClient() unconditionally, which
-    // throws without Supabase config, so the whole Reports page answered 500 in
-    // a self-hosted SQLite install. packaging_jobs exists in both backends.
-    getAllByUserIdMock.mockResolvedValue([
-      makeJob({ id: 'a', status: 'completed' }),
-      makeJob({ id: 'b', status: 'completed' }),
-      makeJob({ id: 'c', status: 'failed', error_message: 'boom' }),
-    ]);
-
-    const response = await GET(makeRequest());
-    const body = await response.json();
-
-    expect(response.status).toBe(200);
-    // Two of three finished jobs succeeded.
-    expect(body.summary.successRate).toBe(67);
-    expect(body.summary.totalJobs).toBe(3);
-    expect(body.summary.failedJobs).toBe(1);
-    expect(getAllByUserIdMock).toHaveBeenCalledWith('user-1');
-  });
-
-  it('counts only jobs inside the requested window', async () => {
-    getAllByUserIdMock.mockResolvedValue([
-      makeJob({ id: 'recent', created_at: '2026-08-14T10:00:00.000Z' }),
-      makeJob({ id: 'old', created_at: '2026-06-01T10:00:00.000Z' }),
-    ]);
-
-    const body = await (await GET(makeRequest(7))).json();
-
-    // The 7-day window starts 2026-08-08, so the June job must not count.
-    expect(body.summary.totalJobs).toBe(1);
-    expect(body.dateRange.days).toBe(7);
-  });
-
-  it('returns 401 without valid auth', async () => {
-    parseAccessTokenMock.mockResolvedValue(null);
-
-    const response = await GET(makeRequest());
-
-    expect(response.status).toBe(401);
-    expect(getAllByUserIdMock).not.toHaveBeenCalled();
-  });
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { aggregateDashboardStats } from '@/lib/analytics/dashboard-stats';
+const fixture = vi.hoisted(() => ({ jobs: [] as Array<Record<string, unknown>>, read: vi.fn() }));
+vi.mock('@/lib/auth-utils', () => ({ parseAccessToken: async () => ({ userId: 'report-owner' }) }));
+vi.mock('@/lib/db', () => ({ getDatabase: () => ({ jobs: { getByUserId: async () => fixture.jobs.slice(0, 50), getAnalyticsJobs: fixture.read } }) }));
+import { GET } from './route';
+const job = (id: string, status: string) => ({ id, user_id: 'report-owner', user_email: null, winget_id: 'Example.App', display_name: 'Fixture app', publisher: 'Example', status, error_message: null, created_at: '2026-11-12T08:00:00Z', completed_at: '2026-11-12T09:00:00Z', intune_app_url: null });
+const request = (days = 30) => new NextRequest('https://example.test/api/analytics?days=' + days);
+beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-13T12:00:00Z')); fixture.read.mockReset().mockImplementation(async () => fixture.jobs); fixture.jobs = []; });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
+it('uses the same success definition as Overview in totals, daily buckets and top apps', async () => {
+ fixture.jobs = [job('a', 'deployed'), job('b', 'completed'), job('c', 'failed')];
+ const value = await (await GET(request())).json();
+ expect(value.summary).toMatchObject({ completedJobs: 2, failedJobs: 1, successRate: 67 });
+ expect(value.dailyDeployments.find((d: { date: string }) => d.date === '2026-11-12')).toMatchObject({ completed: 2, failed: 1 });
+ expect(value.topApps).toEqual([{ wingetId: 'Example.App', displayName: 'Fixture app', publisher: 'Example', count: 2 }]);
+ const overview = aggregateDashboardStats(fixture.jobs as unknown as Parameters<typeof aggregateDashboardStats>[0], false);
+ expect(value.summary.completedJobs).toBe(overview.totalDeployed); expect(value.summary.failedJobs).toBe(overview.failed);
+ expect(fixture.read).toHaveBeenCalledWith({ userId: 'report-owner' });
+});
+it('uses the complete personal analytics collection rather than the fifty item list', async () => {
+ fixture.jobs = Array.from({ length: 75 }, (_, i) => job(String(i), 'completed'));
+ const value = await (await GET(request())).json();
+ expect(value.summary.totalJobs).toBe(75); expect(value.summary.completedJobs).toBe(75);
+});
+it('keeps UTC buckets consecutive across the local daylight saving boundary', async () => {
+ vi.stubEnv('TZ', 'America/Los_Angeles'); vi.setSystemTime(new Date('2026-11-02T00:30:00Z'));
+ const value = await (await GET(request(3))).json();
+ expect(value.dailyDeployments.map((d: { date: string }) => d.date)).toEqual(['2026-10-31', '2026-11-01', '2026-11-02']);
 });

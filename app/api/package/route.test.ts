@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { STALE_JOB_TIMEOUT_MINUTES, STALE_JOB_ERROR_MESSAGE } from '@/lib/stale-jobs';
 import type { PackagingJob } from '@/lib/db/types';
+import { WorkflowDispatchRateLimitError, WorkflowDispatchUnconfirmedError } from '@/lib/workflow-dispatch-rate-limit';
 
 const {
   getDatabaseMock,
@@ -16,6 +17,7 @@ const {
   checkStoredConsentMock,
   verifyTenantConsentMock,
   isGitHubActionsConfiguredMock,
+  getWorkflowRunMock,
   triggerPackagingWorkflowMock,
   getAppConfigMock,
   getFeatureFlagsMock,
@@ -24,6 +26,7 @@ const {
   ensureQaDemandMock,
   enforceQaGateMock,
   getPackageEligibilityBlocksMock,
+  getPackageCompatibilityBlockMock,
   isSupabaseServerConfiguredMock,
   curatedState,
   actualDispatch,
@@ -45,6 +48,7 @@ const {
   checkStoredConsentMock: vi.fn(),
   verifyTenantConsentMock: vi.fn(),
   isGitHubActionsConfiguredMock: vi.fn(),
+  getWorkflowRunMock: vi.fn(),
   triggerPackagingWorkflowMock: vi.fn(),
   getAppConfigMock: vi.fn(),
   getFeatureFlagsMock: vi.fn(),
@@ -53,6 +57,7 @@ const {
   ensureQaDemandMock: vi.fn(),
   enforceQaGateMock: vi.fn(),
   getPackageEligibilityBlocksMock: vi.fn(),
+  getPackageCompatibilityBlockMock: vi.fn().mockResolvedValue(null),
   isSupabaseServerConfiguredMock: vi.fn(),
 }));
 
@@ -84,7 +89,7 @@ vi.mock('@/lib/msp/consent-verification', () => ({
   verifyTenantConsent: verifyTenantConsentMock,
 }));
 
-vi.mock('@/lib/github-actions', async (original) => { actualDispatch.run = (await original<typeof import('@/lib/github-actions')>()).triggerPackagingWorkflow; return { isGitHubActionsConfigured: isGitHubActionsConfiguredMock, triggerPackagingWorkflow: triggerPackagingWorkflowMock }; });
+vi.mock('@/lib/github-actions', async (original) => { actualDispatch.run = (await original<typeof import('@/lib/github-actions')>()).triggerPackagingWorkflow; return { isGitHubActionsConfigured: isGitHubActionsConfiguredMock, getWorkflowRun: getWorkflowRunMock, triggerPackagingWorkflow: triggerPackagingWorkflowMock }; });
 vi.mock('@/lib/winget-dependencies', () => ({ resolveWingetPackageDependencies: vi.fn(async () => []) }));
 
 vi.mock('@/lib/config', () => ({
@@ -117,6 +122,7 @@ vi.mock('@/lib/package-eligibility', async (importOriginal) => {
   return {
     ...original,
     getPackageEligibilityBlocks: getPackageEligibilityBlocksMock,
+    getPackageCompatibilityBlock: getPackageCompatibilityBlockMock,
   };
 });
 
@@ -256,7 +262,7 @@ describe('GET /api/package (userId listing)', () => {
       error_message: STALE_JOB_ERROR_MESSAGE,
       completed_at: expect.any(String),
       updated_at: expect.any(String),
-    });
+    }, { status: staleJob.status, updated_at: staleJob.updated_at, callback_run_id: null });
     expect(body.jobs).toHaveLength(1);
     expect(body.jobs[0].status).toBe('failed');
     expect(body.jobs[0].error_message).toBe(STALE_JOB_ERROR_MESSAGE);
@@ -278,6 +284,30 @@ describe('GET /api/package (userId listing)', () => {
     expect(response.status).toBe(200);
     expect(updateMock).not.toHaveBeenCalled();
     expect(body.jobs[0].status).toBe('uploading');
+  });
+
+  it.each([null, '43'])('fences read-side stale failure against a callback owner change from %s', async owner => {
+    const staleJob = makeJob({ status: 'packaging', callback_run_id: owner,
+      updated_at: minutesAgo(STALE_JOB_TIMEOUT_MINUTES + 5) });
+    getByUserIdMock.mockResolvedValue([staleJob]);
+    updateMock.mockImplementation(async (_id, patch, conditions) =>
+      Object.hasOwn(conditions, 'callback_run_id') && conditions.callback_run_id !== '44' ? null : { ...staleJob, ...patch });
+    const response = await GET(new NextRequest('http://localhost/api/package'));
+    expect((await response.json()).jobs[0].status).toBe('packaging');
+    expect(updateMock).toHaveBeenCalledWith(staleJob.id, expect.any(Object),
+      { status: staleJob.status, updated_at: staleJob.updated_at, callback_run_id: owner });
+  });
+
+  it('does not heal a stale row while its authenticated owner is running', async () => {
+    const staleJob = makeJob({ status: 'packaging', github_run_id: '42', callback_run_id: '43',
+      updated_at: minutesAgo(STALE_JOB_TIMEOUT_MINUTES + 5) });
+    getByUserIdMock.mockResolvedValue([staleJob]);
+    isGitHubActionsConfiguredMock.mockReturnValueOnce(true);
+    getWorkflowRunMock.mockResolvedValueOnce({ status: 'in_progress' });
+    const response = await GET(new NextRequest('http://localhost/api/package'));
+    expect((await response.json()).jobs[0].status).toBe('packaging');
+    expect(getWorkflowRunMock).toHaveBeenCalledWith(43);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it('does not touch terminal jobs regardless of age', async () => {
@@ -1364,6 +1394,123 @@ describe('POST /api/package (workflow dispatch)', () => {
     }
   );
 
+  it('holds a rejected hosted dispatch for automatic retry instead of reporting a failure', async () => {
+    const row: Record<string, unknown> = { status: 'queued', github_run_id: null, callback_run_id: null, cancelled_at: null, archived_at: null };
+    updateMock.mockImplementationOnce(async (_id, patch, conditions) => {
+      if (!Object.entries(conditions).every(([key, value]) => row[key] === value)) return null;
+      Object.assign(row, patch);
+      return row;
+    });
+    const retryAt = new Date(Date.now() + 120_000).toISOString();
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchRateLimitError(429, retryAt));
+    const body = await (await postSingleItem()).json();
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      status: 'awaiting_qa', completed_at: null, qa_resume_due_at: retryAt,
+      error_details: { workflow_dispatch_rate_limit_attempts: 1 },
+    }), expect.objectContaining({ status: 'queued', github_run_id: null, cancelled_at: null, archived_at: null }));
+    expect(body.jobs).toEqual([expect.objectContaining({ status: 'awaiting_qa' })]);
+    expect(body.errors).toBeUndefined();
+  });
+  it('does not advertise a rate limit hold if a concurrent job update wins', async () => {
+    updateMock.mockResolvedValueOnce(null);
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchRateLimitError(429,
+      new Date(Date.now() + 120_000).toISOString()));
+    const body = await (await postSingleItem()).json();
+    expect(body.jobs).toEqual([]);
+    expect(body.errors).toEqual([{ wingetId: 'Test.App', error: 'Packaging status changed before the retry could be scheduled. Refresh the deployment status.' }]);
+    expect(updateMock).toHaveBeenCalledOnce();
+    expect(updateMock.mock.calls[0][2]).toMatchObject({ status: 'queued', github_run_id: null });
+  });
+  it('preserves the uncertainty code for a custom app dispatch without a confirmed response', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchUnconfirmedError(503));
+    const response = await POST(new NextRequest('http://localhost/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [makeWin32Item({ sourceType: 'custom' })] }),
+    }));
+    const body = await response.json();
+    expect(response.status).toBe(200);
+    expect(body.jobs).toEqual([]);
+    expect(body.errors[0].code).toBe('WORKFLOW_DISPATCH_UNCONFIRMED');
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledOnce();
+  });
+  it('holds a fresh unconfirmed hosted dispatch with an owner null fence', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchUnconfirmedError(503, Date.now(), 'A'.repeat(64)));
+    const body = await (await postSingleItem()).json();
+    expect(body.jobs).toEqual([expect.objectContaining({ status: 'awaiting_qa' })]);
+    expect(body.errors).toBeUndefined();
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ error_code: 'WORKFLOW_DISPATCH_UNCONFIRMED' }),
+      expect.objectContaining({ callback_run_id: null, github_run_id: null, status: 'queued' }));
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(expect.any(Object), undefined,
+      expect.objectContaining({ newJobAdmission: true }));
+  });
+  it('does not fail or hold a fresh dispatch after its callback owner wins', async () => {
+    updateMock.mockImplementationOnce(async (_id, _patch, conditions) => conditions.callback_run_id === null ? null : { status: 'awaiting_qa' });
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchUnconfirmedError(null, Date.now(), 'A'.repeat(64)));
+    const body = await (await postSingleItem()).json();
+    expect(body.jobs).toEqual([]);
+    expect(body.errors[0].code).toBe('WORKFLOW_DISPATCH_UNCONFIRMED');
+    expect(updateMock).toHaveBeenCalledOnce();
+    expect(updateMock.mock.calls[0][1].status).toBe('awaiting_qa');
+  });
+  it('persists request forceCreate only with a pinned unconfirmed hold', async () => {
+    const item = { ...makeWin32Item(), forceCreate: false };
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchUnconfirmedError(503, Date.now(), 'A'.repeat(64)));
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [item], forceCreate: true }),
+    }));
+    expect(await response.json()).toMatchObject({ jobs: [{ status: 'awaiting_qa' }] });
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ package_config: expect.objectContaining({ forceCreate: false }) }));
+    expect(triggerPackagingWorkflowMock.mock.calls[0][0].forceCreate).toBe(true);
+    expect(updateMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      package_config: expect.objectContaining({ forceCreate: true }),
+      error_details: expect.objectContaining({ workflow_dispatch_unconfirmed_identity: 'A'.repeat(64) }),
+    }), expect.objectContaining({ callback_run_id: null }));
+  });
+  it('still reports other dispatched jobs when saving a capacity hold fails', async () => {
+    triggerPackagingWorkflowMock.mockRejectedValueOnce(new WorkflowDispatchRateLimitError(429,
+      new Date(Date.now() + 120_000).toISOString()));
+    updateMock.mockImplementation(async (_id, patch) => {
+      if (patch.status === 'awaiting_qa') throw new Error('private database fault');
+      return patch;
+    });
+    const response = await POST(new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [makeWin32Item(), makeWin32Item({ wingetId: 'Other.App' })] }),
+    }));
+    const body = await response.json();
+    expect(response.status).toBe(200);
+    expect(body.jobs).toEqual([expect.objectContaining({ winget_id: 'Other.App', status: 'packaging' })]);
+    expect(body.errors).toEqual([{ wingetId: 'Test.App',
+      error: 'Packaging could not schedule its automatic retry. Refresh the deployment status.' }]);
+    expect(JSON.stringify(body)).not.toContain('private database fault');
+    });
+
+  it('reports an unreviewed dependency as unsupported without claiming a failed installation test', async () => {
+    ensureQaDemandMock.mockResolvedValueOnce({ state: 'failed', candidateId: null,
+      identity: { executionProfileSha256: 'B'.repeat(64) }, failureSummary: 'This app version is not available for automated deployment.' });
+    getPackageCompatibilityBlockMock.mockResolvedValueOnce({ code: 'unreviewed_dependency',
+      detail: 'WinGet dependency Microsoft.EdgeWebView2Runtime is not in the reviewed redistribution allowlist.' });
+    const body = await (await postSingleItem()).json();
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed',
+      error_code: 'DEPENDENCY_NOT_SUPPORTED', error_category: 'validation', qa_completed_at: null, qa_candidate_id: null,
+      status_message: 'This app requires Microsoft.EdgeWebView2Runtime, which is not supported yet. Automated deployment is blocked.' }));
+    expect(body.jobs[0].status).toBe('failed');
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).toHaveBeenCalledOnce();
+  });
+  it.each(['other block', 'lookup unavailable'])('keeps the existing closed QA result when classification is %s', async kind => {
+    ensureQaDemandMock.mockResolvedValueOnce({ state: 'failed', candidateId: null,
+      identity: { executionProfileSha256: 'B'.repeat(64) }, failureSummary: 'Existing failure summary.' });
+    if (kind === 'lookup unavailable') getPackageCompatibilityBlockMock.mockRejectedValueOnce(new Error('private lookup fault'));
+    else getPackageCompatibilityBlockMock.mockResolvedValueOnce({ code: 'unsupported_dependency_shape', detail: 'Not a supported dependency shape.' });
+    await postSingleItem();
+    expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'qa_failed',
+      error_code: 'QA_FAILED_EXECUTION_PROFILE', error_message: 'Existing failure summary.' }));
+    expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+    expect(ensureQaDemandMock).toHaveBeenCalledOnce();
+  });
+
   it('keeps WORKFLOW_DISPATCH_FAILED for errors that prevent the workflow from starting', async () => {
     triggerPackagingWorkflowMock.mockRejectedValueOnce(
       new Error('Failed to trigger GitHub Actions workflow: 502 Bad Gateway')
@@ -1627,6 +1774,110 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
       expect.objectContaining({
         wingetId: 'jopemachine.Arvis',
+        installScope: 'user',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('uses UniClipboard user scope consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://example.com/uniclipboard-setup.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'UniClipboard.UniClipboard',
+          displayName: 'UniClipboard',
+          version: '1.5.0',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'UniClipboard.UniClipboard',
+        installScope: 'user',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'user' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'user' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'UniClipboard.UniClipboard',
+        installScope: 'user',
+      }),
+      undefined,
+      expect.any(Object)
+    );
+  });
+
+  it('uses Orca user scope consistently for customer PSADT packaging and QA', async () => {
+    getLiveInstallersMock.mockResolvedValueOnce([{
+      architecture: 'x64',
+      url: 'https://example.com/orca-setup.exe',
+      sha256: 'A'.repeat(64),
+      type: 'nullsoft',
+      silentArgs: '/S',
+    }]);
+    const request = new NextRequest('http://localhost:3000/api/package', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: [makeWin32Item({
+          wingetId: 'StablyAI.Orca',
+          displayName: 'Orca',
+          version: '1.4.242',
+          installerType: 'nullsoft',
+          installScope: 'machine',
+        })],
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(enforceInstallerPreflightMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'StablyAI.Orca',
+        installScope: 'user',
+      }),
+      expect.any(Array)
+    );
+    expect(ensureQaDemandMock).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ installScope: 'user' })
+    );
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ install_scope: 'user' })
+    );
+    expect(triggerPackagingWorkflowMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wingetId: 'StablyAI.Orca',
         installScope: 'user',
       }),
       undefined,
@@ -2497,6 +2748,69 @@ describe('POST /api/package (workflow dispatch)', () => {
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
+  it.each(['network_error', 'missing_credentials'] as const)(
+    'records a private stage diagnostic for consent 503: %s', async reason => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        checkStoredConsentMock.mockResolvedValueOnce(false);
+        verifyTenantConsentMock.mockResolvedValueOnce({ verified: false, error: reason });
+        const response = await postSingleItem();
+        expect(response.status).toBe(503);
+        expect(await response.json()).toMatchObject({ retryable: true });
+        expect(log.mock.calls).toEqual([['[package-unavailable]', { stage: 'consent', reason }]]);
+        expect(createMock).not.toHaveBeenCalled();
+        expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      } finally { log.mockRestore(); }
+    },
+  );
+
+  it.each(['manifest', 'installer_preflight'] as const)(
+    'records only a static stage diagnostic for retryable %s 503', async stage => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const error = new InstallerPreflightError('private-code', 'https://private.invalid/?token=private-token', true);
+        if (stage === 'manifest') getLiveInstallersMock.mockRejectedValueOnce(error);
+        else enforceInstallerPreflightMock.mockRejectedValueOnce(error);
+        const response = await postSingleItem();
+        expect(response.status).toBe(503);
+        expect(await response.json()).toMatchObject({ code: 'private-code', retryable: true });
+        expect(log.mock.calls).toEqual([['[package-unavailable]', { stage, reason: 'retryable_installer_validation' }]]);
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(/private|tenant-1|user@example|Test.App|test-token/);
+        expect(createMock).not.toHaveBeenCalled();
+        expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      } finally { log.mockRestore(); warn.mockRestore(); }
+    },
+  );
+
+  it.each(['manifest', 'installer_preflight'] as const)(
+    'does not report a nonretryable %s rejection as a packaging 503', async stage => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const error = new InstallerPreflightError('HASH_MISMATCH', 'Installer remains quarantined', false);
+        if (stage === 'manifest') getLiveInstallersMock.mockRejectedValueOnce(error);
+        else enforceInstallerPreflightMock.mockRejectedValueOnce(error);
+        const response = await postSingleItem();
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ code: 'HASH_MISMATCH', retryable: false });
+        expect(log).not.toHaveBeenCalled();
+        expect(createMock).not.toHaveBeenCalled();
+        expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
+      } finally { log.mockRestore(); warn.mockRestore(); }
+    },
+  );
+
+  it('does not report a normal consent rejection as a packaging 503', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      checkStoredConsentMock.mockResolvedValueOnce(false);
+      verifyTenantConsentMock.mockResolvedValueOnce({ verified: false, error: 'consent_not_granted' });
+      expect((await postSingleItem()).status).toBe(403);
+      expect(log).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+
   it('blocks a quarantined installer before creating a job or dispatching an Action', async () => {
     enforceInstallerPreflightMock.mockRejectedValueOnce(new InstallerPreflightError(
       'HASH_MISMATCH',
@@ -2554,7 +2868,7 @@ describe('POST /api/package (workflow dispatch)', () => {
     const response = await POST(request);
     const body = await response.json();
     expect(response.status).toBe(200);
-    expect(body.jobs[0]).toMatchObject({ status: 'qa_failed' });
+    expect(body.jobs[0]).toMatchObject({ status: 'failed' });
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 
@@ -2578,7 +2892,7 @@ describe('POST /api/package (workflow dispatch)', () => {
     const response = await POST(request);
     const body = await response.json();
     expect(response.status).toBe(200);
-    expect(body.jobs[0]).toMatchObject({ status: 'qa_failed' });
+    expect(body.jobs[0]).toMatchObject({ status: 'failed' });
     expect(triggerPackagingWorkflowMock).not.toHaveBeenCalled();
   });
 

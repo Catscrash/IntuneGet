@@ -18,7 +18,7 @@ vi.mock('@/lib/auth-utils', () => ({
   parseAccessToken: async () => fixture.allowed ? { userId: 'local-webhook-owner' } : null,
 }));
 vi.mock('@/lib/db', () => ({ getDatabase: () => ({ webhooks: fixture.webhooks }) }));
-vi.mock('@/lib/webhooks/egress', () => ({ validateWebhookTarget: fixture.validateWebhookTarget }));
+vi.mock('@/lib/webhooks/destination', () => ({ validateWebhookDestination: fixture.validateWebhookTarget }));
 
 import { GET, POST } from './route';
 
